@@ -892,6 +892,63 @@ impl CaptureWriteQueue {
     }
 }
 
+// CoreAudio driver teardown can block inside AudioOutputUnitStop. Keep the
+// exact stream on a retiring worker and block another in-process capture until
+// it retires, instead of holding WAV finalization hostage to OS teardown.
+#[cfg(target_os = "macos")]
+static INPUT_SHUTDOWNS: std::sync::LazyLock<Arc<std::sync::atomic::AtomicUsize>> =
+    std::sync::LazyLock::new(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+#[cfg(any(target_os = "macos", test))]
+fn retire_resource_with_timeout<T: Send + 'static>(
+    resource: T,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    timeout: std::time::Duration,
+) -> bool {
+    struct RetirementGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for RetirementGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    pending.fetch_add(1, Ordering::AcqRel);
+    let worker = std::thread::spawn(move || {
+        let _retiring = RetirementGuard(pending);
+        drop(resource);
+    });
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    worker.join().is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn retire_capture_resource<T: Send + 'static>(resource: T) {
+    if !retire_resource_with_timeout(
+        resource,
+        Arc::clone(&INPUT_SHUTDOWNS),
+        std::time::Duration::from_secs(2),
+    ) {
+        let message = "Audio capture has stopped, but the input device is still shutting down. Another recording in this process must wait for the device to finish.";
+        eprintln!("[minutes] {message}");
+        tracing::warn!("{message}");
+        crate::logging::append_log(&serde_json::json!({
+            "ts": chrono::Local::now().to_rfc3339(), "level": "warn",
+            "step": "audio_input_shutdown_pending", "message": message,
+        }))
+        .ok();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn retire_capture_resource<T>(resource: T) {
+    drop(resource);
+}
+
 struct CaptureWriterPump {
     queue: Arc<CaptureWriteQueue>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1794,12 +1851,9 @@ fn record_to_wav_dual_source(
         &mut slot_stats,
     )?;
 
-    voice_stream.take();
-    system_stream.take();
-    // Capture is authoritative. Tell the optional live sidecar to abort any
-    // in-flight recognition, then seal the mixed WAV and stems before waiting
-    // for that consumer to retire.
-    stop_flag.store(true, Ordering::Relaxed);
+    // Stop optional recognition before publication. Keep OS teardown after
+    // mixed WAV/stem sealing, just as in the single-source capture path.
+    stop_flag.store(true, Ordering::Release);
 
     // Clear mute state so the next recording starts fresh.
     crate::streaming::clear_mic_mute_for_new_recording();
@@ -1822,7 +1876,10 @@ fn record_to_wav_dual_source(
         .ok();
     }
 
-    let (total_samples, stem_contents) = writers.finalize()?;
+    let finalized = writers.finalize();
+    retire_capture_resource(voice_stream.take());
+    retire_capture_resource(system_stream.take());
+    let (total_samples, stem_contents) = finalized?;
 
     // Say it here, while the audio still exists. The #792 reporter lost three
     // of four meetings in a day to a stem that was ~10% nonzero: the recording
@@ -1916,6 +1973,10 @@ pub fn record_to_wav_with_lifecycle(
 ) -> Result<(), CaptureError> {
     use cpal::traits::DeviceTrait;
 
+    #[cfg(target_os = "macos")]
+    if INPUT_SHUTDOWNS.load(Ordering::Acquire) != 0 {
+        return Err(CaptureError::CaptureOwnerBusy);
+    }
     let capture_plan = resolve_capture_plan(config)?;
     // The capture owner exposes finalized evidence plus one replaceable,
     // in-memory current-speech draft over a transient local relay. The draft
@@ -2205,12 +2266,12 @@ pub fn record_to_wav_with_lifecycle(
     if let Some((_, diagnostics)) = &stream {
         diagnostics.report_pending();
     }
-    drop(stream);
-    // Capture is authoritative. Abort optional recognition immediately, then
-    // seal the WAV before waiting for the sidecar thread to retire.
-    stop_flag.store(true, Ordering::Relaxed);
-
-    writer_pump.finish()?;
+    // Stop callbacks before closing the writer queue. Seal the WAV before
+    // touching OS teardown, which can block inside a driver.
+    stop_flag.store(true, Ordering::Release);
+    let finalized = writer_pump.finish();
+    retire_capture_resource(stream);
+    finalized?;
     let total_samples = sample_count.load(Ordering::Relaxed);
     let duration_secs = total_samples as f64 / 16000.0;
     tracing::info!(
@@ -3493,6 +3554,46 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), samples.len() as u64);
         let reader = hound::WavReader::open(path).unwrap();
         assert_eq!(reader.duration(), samples.len() as u32);
+    }
+
+    #[test]
+    fn blocked_device_retirement_preserves_a_sealed_wav_and_pending_ownership() {
+        struct BlockedDevice(std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockedDevice {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.wav");
+        let samples = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut pump =
+            CaptureWriterPump::start(create_wav_writer(&path).unwrap(), samples, failed, None);
+        pump.queue.push_samples(&vec![0.25; 1600]);
+        pump.finish().unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = Instant::now();
+        assert!(!retire_resource_with_timeout(
+            BlockedDevice(blocked),
+            Arc::clone(&pending),
+            std::time::Duration::from_millis(10),
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 1600);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while pending.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(retire_resource_with_timeout(
+            (),
+            pending,
+            std::time::Duration::from_secs(1),
+        ));
     }
 
     #[test]
