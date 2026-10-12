@@ -1267,16 +1267,18 @@ export async function policySearchMeetings(
     "policy search"
   );
   if (!query) return [];
-  const needle = query.toLowerCase();
   return policyMatchingSnapshotOperation(
     dir,
     includeRestricted,
-    (meeting) =>
-      meeting.frontmatter.title.toLowerCase().includes(needle) ||
-      meeting.body.toLowerCase().includes(needle),
+    (meeting) => reader.lexicalMatch(meeting.frontmatter.title, meeting.body, query) !== null,
     (snapshots) => {
       const results: PolicyVerifiedMeeting[] = [];
-      for (const snapshot of newestPolicySnapshots(snapshots)) {
+      const ranked = snapshots.map((snapshot) => ({ snapshot, score: reader.lexicalMatch(snapshot.meeting.frontmatter.title, snapshot.meeting.body, query)?.score ?? 0 }));
+      ranked.sort((a, b) => reader.compareSearchMatches(
+        { score: a.score, date: a.snapshot.meeting.frontmatter.date, path: a.snapshot.path },
+        { score: b.score, date: b.snapshot.meeting.frontmatter.date, path: b.snapshot.path }
+      ));
+      for (const { snapshot } of ranked) {
         results.push(snapshot.meeting);
         if (results.length >= boundedLimit) break;
       }
@@ -1312,15 +1314,9 @@ function meetingMatchesSince(meeting: PolicyVerifiedMeeting, since?: string): bo
 }
 
 function meetingMatchesPerson(meeting: PolicyVerifiedMeeting, person?: string): boolean {
-  if (!person) return true;
-  const needle = person.trim().toLowerCase();
-  if (!needle) return true;
-  const people = [
-    ...meeting.frontmatter.attendees,
-    ...meeting.frontmatter.people,
-    ...(meeting.frontmatter.attendees_raw || "").split(/[,;\n]/),
-  ];
-  return people.some((entry) => entry.trim().toLowerCase().includes(needle));
+  if (person === undefined) return true;
+  const identity = reader.resolvePersonIdentity([meeting], person);
+  return !!identity && reader.meetingMentionsPerson(meeting, identity);
 }
 
 function normalizedPersonSelector(value?: string): string {
@@ -1374,7 +1370,7 @@ export function policyIntentResults(
     const queryFields = includeMeetingTitleInQuery
       ? [what, who || "", meeting.frontmatter.title]
       : [what, who || ""];
-    if (needle && !queryFields.some((value) => value.toLowerCase().includes(needle))) return false;
+    if (needle && !reader.lexicalMatch("", queryFields.join(" "), query)) return false;
     if (ownerNeedle && !ownerMatchesExactSelector(who, ownerNeedle)) return false;
     results.push(boundedPolicyIntentResult({
       date: meeting.frontmatter.date,
@@ -1539,10 +1535,7 @@ function meetingMatchesToolSearch(
       1
     ).length > 0;
   }
-  const needle = filter.query.trim().toLowerCase();
-  return needle.length > 0 &&
-    (meeting.frontmatter.title.toLowerCase().includes(needle) ||
-      meeting.body.toLowerCase().includes(needle));
+  return reader.lexicalMatch(meeting.frontmatter.title, meeting.body, filter.query) !== null;
 }
 
 export function collectPolicyToolSearchSnapshots(
@@ -1550,23 +1543,34 @@ export function collectPolicyToolSearchSnapshots(
   includeRestricted: boolean,
   filter: PolicyToolSearchFilter
 ): PolicyVerifiedMeetingSnapshot[] {
-  return newestPolicySnapshots(
-    collectPolicyVerifiedMeetingSnapshots(
-      snapshot,
-      includeRestricted,
-      (meeting) => meetingMatchesToolSearch(meeting, filter)
-    )
-  );
+  const matches: PolicyVerifiedMeetingSnapshot[] = [];
+  for (const file of snapshot.files) {
+    if (!isActiveCorpusMeetingPath(file.path, snapshot.canonicalRoot)) continue;
+    const meeting = parsePolicyVerifiedMeeting(file.content, file.path);
+    if (!meeting || (!includeRestricted && meetingSensitivity(meeting) === "restricted")) continue;
+    if (!meetingMatchesToolSearch(meeting, filter)) continue;
+    meeting.retrieval = reader.lexicalMatch(meeting.frontmatter.title, meeting.body, filter.query) ?? undefined;
+    matches.push({ path: file.path, content: file.content, meeting });
+  }
+  return matches.sort((a, b) => reader.compareSearchMatches(
+    { score: a.meeting.retrieval?.score ?? 0, date: a.meeting.frontmatter.date, path: a.path },
+    { score: b.meeting.retrieval?.score ?? 0, date: b.meeting.frontmatter.date, path: b.path }
+  )).slice(0, MCP_POLICY_MEETING_RESULT_MAX);
 }
 
 async function policyToolSearchMeetings(
   dir: string,
   includeRestricted: boolean,
-  filter: PolicyToolSearchFilter
+  filter: PolicyToolSearchFilter,
+  limit: number = MCP_MEETING_RESULT_MAX
 ): Promise<PolicyVerifiedMeeting[]> {
   return withStableCorpusLease(dir, (snapshot) =>
     collectPolicyToolSearchSnapshots(snapshot, includeRestricted, filter)
-      .map((entry) => entry.meeting)
+      .slice(0, limit)
+      .map((entry) => ({ ...entry.meeting, evidence: reader.buildSourceEvidence({
+        path: entry.path, content: entry.content, body: entry.meeting.body,
+        speakerMap: entry.meeting.frontmatter.speaker_map,
+      }, { query: filter.query, limit: 3 }) }))
   );
 }
 
@@ -1949,9 +1953,7 @@ export function researchTopicProjection(
     for (const decision of meeting.frontmatter.decisions) {
       if (
         !needle ||
-        ![decision.text, decision.topic || ""].some((value) =>
-          value.toLowerCase().includes(needle)
-        )
+        !reader.lexicalMatch(decision.topic || "", decision.text, query)
       ) {
         continue;
       }
@@ -1974,7 +1976,7 @@ export function researchTopicProjection(
   const topicCounts = new Map<string, number>();
   for (const meeting of meetings) {
     for (const rawTag of meeting.frontmatter.tags) {
-      if (!needle || !rawTag.toLowerCase().includes(needle)) continue;
+      if (!needle || !reader.lexicalMatch(rawTag, "", query)) continue;
       const topic = boundedMcpField(rawTag) ?? "";
       if (!topic) continue;
       const current = topicCounts.get(topic);
@@ -5384,10 +5386,11 @@ registerDocsAppTool(
         intentKind: intent_kind,
         owner,
         intentsOnly: intents_only,
-      }
+      },
+      intentMode ? MCP_POLICY_MEETING_RESULT_MAX : boundedLimit
     );
 
-      let results: Array<PolicyIntentResult | ReturnType<typeof meetingSearchItem> & { snippet: string }>;
+      let results: Array<PolicyIntentResult | ReturnType<typeof meetingSearchItem> & { snippet: string; evidence?: reader.EvidenceBundle; retrieval?: reader.LexicalMatch }>;
       if (intentMode) {
         results = policyIntentResults(
           meetings,
@@ -5397,11 +5400,13 @@ registerDocsAppTool(
           boundedLimit
         );
       } else {
-        const matches: Array<ReturnType<typeof meetingSearchItem> & { snippet: string }> = [];
+        const matches: Array<ReturnType<typeof meetingSearchItem> & { snippet: string; evidence?: reader.EvidenceBundle; retrieval?: reader.LexicalMatch }> = [];
         for (const meeting of meetings) {
             matches.push({
               ...meetingSearchItem(meeting),
-              snippet: liveMeetingSnippet(meeting.body, query),
+              snippet: meeting.evidence?.segments[0]?.quote ?? liveMeetingSnippet(meeting.body, query),
+              retrieval: meeting.retrieval,
+              evidence: meeting.evidence,
             });
             if (matches.length >= boundedLimit) break;
         }
@@ -5650,6 +5655,17 @@ registerDocsAppTool(
   }
 );
 
+/** Temporal projection consumes only the exact authorized corpus snapshot. */
+export function policyDecisionHistory(snapshot: StableCorpusSnapshot): reader.DecisionHistoryEntry[] {
+  const sources = snapshot.files.flatMap((file) => {
+    if (!isActiveCorpusMeetingPath(file.path, snapshot.canonicalRoot)) return [];
+    const meeting = parsePolicyVerifiedMeeting(file.content, file.path);
+    return !meeting || meetingSensitivity(meeting) === "restricted"
+      ? [] : [{ ...meeting, content: file.content }];
+  });
+  return reader.buildDecisionHistory(sources);
+}
+
 // ── Tool: consistency_report ───────────────────────────────
 
 // ── Tool: get_screen_context ───────────────────────────────
@@ -5828,14 +5844,18 @@ registerDocsAppTool(
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ owner, stale_after_days }) => {
+    const meetingsDir = await getEffectiveMeetingsDir();
     if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: `Consistency reports require the full CLI for structured intent analysis.\n\n${CLI_INSTALL_MSG}` }] };
+      const decisionHistory = await withStableCorpusLease(meetingsDir, policyDecisionHistory);
+      return {
+        content: [{ type: "text" as const, text: `Decision history: ${decisionHistory.length} sourced records. Full stale-commitment analysis requires the Minutes CLI.` }],
+        structuredContent: { decision_conflicts: [], stale_commitments: [], decision_history: decisionHistory, analysis_available: false, view: "report" },
+      };
     }
     const capabilities = await ensureCliCapabilities(["consistency_corpus_root_v1"]);
     if (capabilities.kind !== "report" || !hasFeature(capabilities, "consistency_corpus_root_v1")) {
       throw new Error("Consistency reports require a Minutes CLI that supports the selected meeting folder. Update Minutes, then try again.");
     }
-    const meetingsDir = await getEffectiveMeetingsDir();
     const args = ["consistency", "--dir", meetingsDir, "--stale-after-days", String(stale_after_days)];
     if (owner) args.push("--owner", owner);
 
@@ -5845,6 +5865,8 @@ registerDocsAppTool(
     if (!report || typeof report !== "object") {
       return { content: [{ type: "text" as const, text: stderr || stdout }] };
     }
+
+    const decisionHistory = await withStableCorpusLease(meetingsDir, policyDecisionHistory);
 
     const decisionConflicts = Array.isArray(report.decision_conflicts)
       ? report.decision_conflicts
@@ -5856,7 +5878,7 @@ registerDocsAppTool(
     if (decisionConflicts.length === 0 && staleCommitments.length === 0) {
       return {
         content: [{ type: "text" as const, text: "No consistency issues found." }],
-        structuredContent: { decision_conflicts: [], stale_commitments: [], view: "report" },
+        structuredContent: { decision_conflicts: [], stale_commitments: [], decision_history: decisionHistory, view: "report" },
         _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "report" },
       };
     }
@@ -5887,7 +5909,7 @@ registerDocsAppTool(
 
     return {
       content: [{ type: "text" as const, text: sections.join("\n\n") }],
-      structuredContent: { decision_conflicts: decisionConflicts, stale_commitments: staleCommitments, view: "report" },
+      structuredContent: { decision_conflicts: decisionConflicts, stale_commitments: staleCommitments, decision_history: decisionHistory, view: "report" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "report" },
     };
   }
@@ -6007,15 +6029,15 @@ registerTool(
         MCP_POLICY_MEETING_RESULT_MAX,
         include_restricted
       );
+    const identity = attendee === undefined ? undefined : reader.resolvePersonIdentity(sourceMeetings, attendee);
     const meetings: PolicyVerifiedMeeting[] = [];
     if (needle.length > 0) {
       for (const meeting of sourceMeetings) {
         if (
           (contentType && meeting.frontmatter.type !== contentType) ||
           !meetingMatchesSince(meeting, since) ||
-          !meetingMatchesPerson(meeting, attendee) ||
-          (!meeting.frontmatter.title.toLowerCase().includes(needle) &&
-            !meeting.body.toLowerCase().includes(needle))
+          (attendee !== undefined && (!identity || !reader.meetingMentionsPerson(meeting, identity))) ||
+          !reader.lexicalMatch(meeting.frontmatter.title, meeting.body, query)
         ) {
           continue;
         }
@@ -6139,10 +6161,13 @@ registerDocsAppTool(
         }
       }
 
-      let structuredOut: Record<string, unknown> = structured;
+      let structuredOut: Record<string, unknown> = {
+        ...structured,
+        evidence: reader.buildSourceEvidence({ path: resolved, content: rawContent, body: rawParsed.body, speakerMap: rawParsed.frontmatter.speaker_map }),
+      };
       if (include_restricted && meetingSensitivity(sensitivityParsed) === "restricted") {
         structuredOut = {
-          ...structured,
+          ...structuredOut,
           sensitivity: "restricted",
           sensitivity_override: { applied: true, logged: "durable-jsonl" },
         };

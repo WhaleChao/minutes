@@ -14543,6 +14543,8 @@ mod tests {
         let merged_decisions: Vec<minutes_core::markdown::Decision> = decisions
             .iter()
             .map(|text| minutes_core::markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: (*text).into(),
                 topic: None,
                 authority: None,
@@ -18212,6 +18214,8 @@ mod tests {
                 status: "open".into(),
             }],
             decisions: vec![minutes_core::markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: "Ship the new pricing page".into(),
                 topic: Some("pricing".into()),
                 authority: None,
@@ -18292,6 +18296,8 @@ mod tests {
                 status: "open".into(),
             }],
             decisions: vec![minutes_core::markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: "Ship the new pricing page".into(),
                 topic: Some("pricing".into()),
                 authority: None,
