@@ -146,6 +146,8 @@ See the [security documentation](docs/security/) and
 - [Summarization and automation](docs/architecture/summarization.md)
 - [Configuration](docs/configuration.md)
 - [Architecture and agent development](docs/architecture/README.md)
+- [Evidence, retrieval, and decision-history contracts](docs/architecture/evidence-memory.md)
+- [Recall and speech evaluation](tests/eval/v02/README.md)
 - [Switching from Granola and importing archives](docs/switching-from-granola.md)
 - [Frontmatter schema](docs/architecture/frontmatter-schema.md)
 - [Security](docs/security/)

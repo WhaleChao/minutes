@@ -7576,6 +7576,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
   <script src="vendor/marked.min.js"></script>
 
   <script src="scripts/shortcut-recorder.js"></script>
+  <script src="scripts/recall-contract.js"></script>
+  <script src="scripts/recall-chat.js"></script>
   <script>
     const { invoke } = window.__TAURI__.core;
 
@@ -14478,13 +14480,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     const recallChatInput = document.getElementById('recall-chat-input');
     const recallChatSendBtn = document.getElementById('recall-chat-send');
     const recallProviderNotice = document.getElementById('recall-provider-notice');
-    let currentAssistantBubble = null;
-    let currentAssistantRaw = '';
-    // True once token-level deltas have rendered for the current turn, so the
-    // trailing complete `assistant` message isn't appended as a duplicate.
-    let currentAssistantStreamed = false;
-    let chatListenersRegistered = false;
-    let recallChatStreaming = false;
     let recallReadiness = null;
     let recallSelectedMeetingPath = null;
     let pendingRecallTerminalMeetingPath = null;
@@ -14665,58 +14660,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     }
 
     // Render a safe markdown subset for assistant replies (#404 follow-up).
-    // XSS-safe by construction: fenced code is pulled out and escaped, the rest
-    // is HTML-escaped BEFORE any formatting, and the inline rules only wrap
-    // already-escaped text in a fixed set of safe tags — the model's output can
-    // never introduce an element or attribute. No link hrefs (URLs stay text).
-    // The bubble's `white-space: pre-wrap` handles newlines, paragraphs, and
-    // dash/number list layout, so only inline emphasis + code need handling.
-    // Scroll-anchoring for the chat: auto-scroll while streaming ONLY if the
-    // user is already at the bottom. If they've scrolled up to read (e.g. a
-    // paragraph the coach scripted to say aloud), new content appends silently
-    // and a "jump to latest" pill appears — the tmux-scrollback behavior the
-    // old terminal had (#404 follow-up, coach/live mode).
-    function recallChatNearBottom() {
-      if (!recallChatMessages) return true;
-      return recallChatMessages.scrollHeight - recallChatMessages.scrollTop - recallChatMessages.clientHeight < 48;
-    }
-    function scrollRecallChatToBottom() {
-      if (recallChatMessages) recallChatMessages.scrollTop = recallChatMessages.scrollHeight;
-      const pill = document.getElementById('recall-chat-jump');
-      if (pill) pill.style.display = 'none';
-    }
-    function showRecallChatJump() {
-      const pill = document.getElementById('recall-chat-jump');
-      if (pill) pill.style.display = 'block';
-    }
-
-    // Assistant replies render through renderMarkdownToElement — the same
-    // escape-before-parse path the artifact viewer uses. The hand-rolled regex
-    // renderer this replaced only understood code/bold/italic, so every list
-    // and heading the model produced arrived as literal "- " and "## " text.
-    //
-    // Streaming arrives token-by-token, and each chunk would otherwise reparse
-    // and rebuild the entire accumulated reply — quadratic in the length of the
-    // answer, and it collapses any text selection the user has made mid-stream.
-    // Coalesce to at most one render per animation frame.
-    let assistantRenderFrame = null;
-    function scheduleAssistantBubbleRender(bubble) {
-      if (assistantRenderFrame !== null) return;
-      assistantRenderFrame = requestAnimationFrame(() => {
-        assistantRenderFrame = null;
-        if (!bubble.isConnected) return;
-        renderMarkdownToElement(bubble, currentAssistantRaw);
-      });
-    }
-
-    function flushAssistantBubbleRender(bubble) {
-      if (assistantRenderFrame !== null) {
-        cancelAnimationFrame(assistantRenderFrame);
-        assistantRenderFrame = null;
-      }
-      if (bubble?.isConnected) renderMarkdownToElement(bubble, currentAssistantRaw);
-    }
-
     // That renderer also produces real anchors, which the regex one never did.
     // An un-intercepted click would navigate this webview away from the app
     // shell — there is no back button and no CSP to land on — so chat links
@@ -15207,40 +15150,19 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
     // ── Recall native chat (dev-mode OFF) ──
 
-    /// Insert a one-time welcome bubble when the chat panel is first shown.
-    function showChatWelcome() {
-      if (!recallChatMessages || recallChatMessages.children.length > 0) return;
-      const bubble = document.createElement('div');
-      bubble.className = 'chat-bubble chat-bubble-assistant';
-      bubble.textContent = 'Ask me about this meeting — action items, decisions, key moments from the transcript. I have access to your meeting workspace.';
-      recallChatMessages.appendChild(bubble);
-    }
-
-    /// Reset native chat state when focus switches to a different meeting.
-    ///
-    /// Clears the visible chat bubbles and the backend's turn history so the
-    /// new meeting starts with a clean conversation instead of inheriting
-    /// stale context from whatever meeting was previously focused. Callers
-    /// are responsible for confirming the meeting actually changed before
-    /// calling this — it unconditionally wipes the current conversation.
-    async function resetRecallChat() {
-      if (assistantRenderFrame !== null) {
-        cancelAnimationFrame(assistantRenderFrame);
-        assistantRenderFrame = null;
-      }
-      if (recallChatMessages) recallChatMessages.replaceChildren();
-      currentAssistantBubble = null;
-      currentAssistantRaw = '';
-      currentAssistantStreamed = false;
-      const jumpPill = document.getElementById('recall-chat-jump');
-      if (jumpPill) jumpPill.style.display = 'none';
-      try {
-        await invoke('cmd_recall_chat_clear');
-      } catch (e) {
-        console.error('cmd_recall_chat_clear failed:', e);
-      }
-      showChatWelcome();
-    }
+    // The controller is also exercised by the rendered desktop fixture.
+    const recallChatController = window.MinutesRecallChat.create({
+      messages: recallChatMessages,
+      input: recallChatInput,
+      sendButton: recallChatSendBtn,
+      jumpButton: document.getElementById('recall-chat-jump'),
+      invoke,
+      listen: (name, handler) => currentWindow.listen(name, handler),
+      renderMarkdown: renderMarkdownToElement,
+    });
+    function showChatWelcome() { recallChatController.showWelcome(); }
+    async function resetRecallChat() { await recallChatController.reset(); }
+    async function registerChatListeners() { await recallChatController.register(); }
 
     /// Apply the current mode to the recall panel contents.
     ///
@@ -15291,277 +15213,20 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         // so switching back preserves the agent's context — End Session is the
         // explicit teardown. Any in-flight chat request completes harmlessly.
         recallTerminalContainer.classList.add('hidden');
-        await registerChatListeners();
         if (recallChatPanel) {
           recallChatPanel.style.display = 'flex';
           showChatWelcome();
         }
         recallLoading.classList.remove('active');
-      }
-    }
-
-    // #404: friendly status labels for the read-only Minutes MCP tools the
-    // Recall chat can call, so the pre-answer grounding phase narrates what the
-    // agent is actually doing ("searching your meetings") instead of dead air.
-    const RECALL_TOOL_STATUS = {
-      search_meetings: 'searching your meetings',
-      list_meetings: 'browsing your meetings',
-      get_meeting: 'reading a meeting',
-      research_topic: 'researching a topic',
-      get_person_profile: 'looking up a person',
-      relationship_map: 'mapping relationships',
-      track_commitments: 'checking commitments',
-      get_meeting_insights: 'pulling out insights',
-      consistency_report: 'checking for conflicts',
-      get_agent_annotations: 'reading annotations',
-      read_live_transcript: 'reading the live transcript',
-      activity_summary: 'reviewing recent activity',
-      search_context: 'searching desktop context',
-      get_moment: 'looking up a moment',
-      list_processing_jobs: 'checking processing status',
-      get_status: 'checking status',
-      list_voices: 'checking voices',
-      knowledge_status: 'checking your knowledge base',
-      qmd_collection_status: 'checking your collections',
-    };
-
-    // Update the empty-bubble status label from a claude stream-json chunk's
-    // tool_use blocks. Only while the answer text hasn't started (:empty), so
-    // the narration never overwrites a streaming reply.
-    function updateRecallChatStatus(chunk) {
-      if (!currentAssistantBubble || currentAssistantBubble.textContent.trim()) return;
-      // Local reasoning models can think for hundreds of stream frames before
-      // the first word of the answer (observed: 504 of 508). Without a status
-      // the panel looks hung. Emitted once per turn by the backend.
-      if (chunk && chunk.type === 'thinking') {
-        currentAssistantBubble.dataset.status = 'thinking';
-        return;
-      }
-      if (!chunk || chunk.type !== 'assistant' || !chunk.message || !chunk.message.content) return;
-      for (const part of chunk.message.content) {
-        if (part && part.type === 'tool_use') {
-          const tool = String(part.name || '').replace(/^mcp__[^_]+__/, '');
-          currentAssistantBubble.dataset.status = RECALL_TOOL_STATUS[tool] || 'consulting your memory';
+        // The composer can render while IPC listeners become ready. Send
+        // still awaits registration before dispatching a question.
+        try {
+          await registerChatListeners();
+        } catch (error) {
+          console.error('Recall chat listener setup:', error);
+          setRecallProviderNotice('Chat could not start. Close Recall and reopen it to try again.', 'error');
         }
       }
-    }
-
-    function setRecallChatStreaming(streaming) {
-      recallChatStreaming = streaming;
-      if (recallChatSendBtn) {
-        recallChatSendBtn.disabled = false;
-        recallChatSendBtn.textContent = streaming ? 'Stop' : 'Send';
-        recallChatSendBtn.setAttribute('aria-label', streaming ? 'Stop response' : 'Send message');
-      }
-      if (recallChatInput) {
-        recallChatInput.disabled = streaming;
-        if (!streaming) recallChatInput.focus();
-      }
-    }
-
-    function finishRecallChatUi() {
-      if (currentAssistantBubble) {
-        // A throttled render may still be queued; without this the last chunk
-        // of the reply never reaches the DOM.
-        flushAssistantBubbleRender(currentAssistantBubble);
-        currentAssistantBubble.classList.remove('streaming');
-        currentAssistantBubble = null;
-      }
-      setRecallChatStreaming(false);
-    }
-
-    /// Register one-time Tauri event listeners for recall-chat-chunk and recall-chat-done.
-    async function registerChatListeners() {
-      if (chatListenersRegistered) return;
-      chatListenersRegistered = true;
-
-      await currentWindow.listen('recall-chat-chunk', (event) => {
-        const chunk = event.payload;
-        updateRecallChatStatus(chunk);
-        let text = '';
-        if (chunk && chunk.type === 'stream_event' && chunk.event) {
-          // Token-level streaming (claude --include-partial-messages): render
-          // text as it generates instead of waiting for the whole reply. The
-          // complete `assistant` event that follows is then a duplicate and is
-          // skipped below (currentAssistantStreamed).
-          const ev = chunk.event;
-          if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') {
-            text = ev.delta.text || '';
-            if (text) currentAssistantStreamed = true;
-          }
-        } else if (chunk && chunk.type === 'assistant' && chunk.message && chunk.message.content) {
-          // Complete assistant turn. When token deltas already streamed it in,
-          // its text is a duplicate — skip it (updateRecallChatStatus above
-          // still read any tool_use blocks for the grounding narration). Only
-          // used to render when partial streaming didn't run (fallback).
-          if (!currentAssistantStreamed) {
-            for (const part of chunk.message.content) {
-              if (part.type === 'text') text += part.text;
-            }
-          }
-        } else if (chunk && chunk.type === 'text' && typeof chunk.text === 'string') {
-          // Local providers (Ollama, OpenAI-compatible servers such as LM Studio)
-          // stream plain text deltas rather than Claude's event envelopes. Without
-          // this branch their chunks fall through every case above and the panel
-          // renders nothing at all, even though the model answered correctly.
-          text = chunk.text;
-        } else if (chunk && chunk.type === 'result' && typeof chunk.result === 'string') {
-          // Final result event — use as fallback if the assistant bubble is
-          // still empty. Emptiness is measured by whether anything was
-          // streamed, NOT by textContent: a reply that is only an image
-          // renders to an <img> with no text, and a textContent check would
-          // read that as empty and append the whole reply a second time.
-          const bubbleIsEmpty = !currentAssistantRaw;
-          if (currentAssistantBubble && bubbleIsEmpty) {
-            text = chunk.result;
-          }
-          if (chunk.subtype !== 'success' && currentAssistantBubble && bubbleIsEmpty) {
-            text = chunk.error || chunk.result || 'Claude returned an error.';
-          }
-        }
-        if (text && currentAssistantBubble) {
-          // Capture BEFORE the content grows: was the user already at the bottom?
-          const atBottom = recallChatNearBottom();
-          // Accumulate raw text and re-render markdown each chunk (cheap at
-          // chat length). renderMarkdownToElement escapes before parsing and
-          // builds nodes rather than assigning innerHTML, so the model's
-          // output can never inject HTML (#404 follow-up).
-          currentAssistantRaw += text;
-          scheduleAssistantBubbleRender(currentAssistantBubble);
-          // Only auto-scroll if they were at the bottom — never yank someone off
-          // a paragraph they've scrolled up to read aloud in coach mode. When
-          // scrolled up, surface a "jump to latest" pill instead (#404 follow-up).
-          if (atBottom) {
-            scrollRecallChatToBottom();
-          } else {
-            showRecallChatJump();
-          }
-        }
-      });
-
-      await currentWindow.listen('recall-chat-error', (event) => {
-        // Provider stderr or a terminal error, shown only when the bubble is
-        // still empty. `recall-chat-done` nulls currentAssistantBubble, and the
-        // two events are separate channels with no ordering guarantee, so fall
-        // back to the last assistant bubble in the DOM. Without this an error
-        // that loses the race is dropped and the user sees nothing at all.
-        const stderr = String(event.payload || '');
-        if (!stderr) return;
-        const bubble =
-          currentAssistantBubble ||
-          (recallChatMessages
-            ? recallChatMessages.querySelector('.chat-bubble-assistant:last-of-type')
-            : null);
-        if (!bubble) return;
-        bubble.classList.remove('streaming');
-        if (!bubble.textContent.trim()) {
-          bubble.textContent = stderr;
-          // Marked so a second error event appends a notice under this text
-          // rather than repeating it verbatim.
-          bubble.dataset.errorShown = '1';
-          return;
-        }
-        if (bubble.dataset.errorShown === '1' && !bubble.querySelector('.chat-incomplete-notice')) {
-          return;
-        }
-        // A partial answer is already on screen. Showing nothing here was the
-        // real defect: the backend detects a truncated or failed stream and
-        // refuses to save it, but the panel still rendered whatever arrived and
-        // `recall-chat-done` then cleared the streaming state, so an answer that
-        // stopped mid-sentence looked finished. Append rather than replace, so
-        // the user keeps what the model did say and can see it is incomplete.
-        if (bubble.querySelector('.chat-incomplete-notice')) return;
-        const notice = document.createElement('div');
-        notice.className = 'chat-incomplete-notice';
-        notice.textContent = stderr;
-        bubble.appendChild(notice);
-      });
-
-      await currentWindow.listen('recall-chat-done', () => {
-        finishRecallChatUi();
-      });
-    }
-
-    async function sendRecallChat() {
-      if (!recallChatInput || !recallChatMessages) return;
-      if (recallChatStreaming) return;
-      const text = recallChatInput.value.trim();
-      if (!text) return;
-
-      // Append user bubble
-      const userBubble = document.createElement('div');
-      userBubble.className = 'chat-bubble chat-bubble-user';
-      userBubble.textContent = text;
-      recallChatMessages.appendChild(userBubble);
-
-      // Append empty assistant bubble (filled by streaming chunks). data-status
-      // drives the pre-answer grounding narration (#404); it starts at
-      // "thinking" and updateRecallChatStatus swaps in live MCP tool labels.
-      currentAssistantBubble = document.createElement('div');
-      currentAssistantBubble.className = 'chat-bubble chat-bubble-assistant streaming';
-      currentAssistantBubble.dataset.status = 'thinking';
-      currentAssistantRaw = '';
-      currentAssistantStreamed = false;
-      recallChatMessages.appendChild(currentAssistantBubble);
-      // Sending is a deliberate action — always drop to the bottom + clear the pill.
-      scrollRecallChatToBottom();
-
-      recallChatInput.value = '';
-      setRecallChatStreaming(true);
-
-      try {
-        await invoke('cmd_recall_chat_send', { message: text });
-      } catch (e) {
-        if (currentAssistantBubble) {
-          currentAssistantBubble.classList.remove('streaming');
-          const errMsg = String(e);
-          currentAssistantBubble.textContent = errMsg.includes('claude not found')
-            ? 'Claude Code not found. Install it with: npm install -g @anthropic-ai/claude-code'
-            : 'Error: ' + errMsg;
-          currentAssistantBubble = null;
-        }
-        setRecallChatStreaming(false);
-      }
-    }
-
-    async function cancelRecallChat() {
-      if (!recallChatStreaming) return;
-      if (recallChatSendBtn) recallChatSendBtn.disabled = true;
-      try {
-        await invoke('cmd_recall_chat_cancel');
-      } catch (e) {
-        console.error('cmd_recall_chat_cancel failed:', e);
-        if (recallChatSendBtn) recallChatSendBtn.disabled = false;
-      }
-    }
-
-    if (recallChatSendBtn) {
-      recallChatSendBtn.addEventListener('click', () => {
-        if (recallChatStreaming) {
-          cancelRecallChat();
-        } else {
-          sendRecallChat();
-        }
-      });
-    }
-    // Scroll-anchoring wiring: the pill jumps to latest; scrolling back to the
-    // bottom re-attaches and dismisses the pill (#404 follow-up, coach mode).
-    const recallChatJumpBtn = document.getElementById('recall-chat-jump');
-    if (recallChatJumpBtn) {
-      recallChatJumpBtn.addEventListener('click', scrollRecallChatToBottom);
-    }
-    if (recallChatMessages) {
-      recallChatMessages.addEventListener('scroll', () => {
-        if (recallChatNearBottom() && recallChatJumpBtn) recallChatJumpBtn.style.display = 'none';
-      });
-    }
-    if (recallChatInput) {
-      recallChatInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendRecallChat();
-        }
-      });
     }
 
     // ── Expand / collapse with window resize ──
