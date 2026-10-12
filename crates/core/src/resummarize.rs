@@ -225,7 +225,10 @@ fn action_item_has_user_state(item: &ActionItem) -> bool {
 
 /// Does this decision carry user-curated state worth preserving?
 fn decision_has_user_state(decision: &Decision) -> bool {
-    decision.authority.is_some() || decision.supersedes.is_some()
+    decision.id.is_some()
+        || decision.effective_date.is_some()
+        || decision.authority.is_some()
+        || decision.supersedes.is_some()
 }
 
 fn count_keys<'a, I: Iterator<Item = &'a str>>(
@@ -364,6 +367,8 @@ pub fn merge_decisions(old: &[Decision], new: &[Decision]) -> (Vec<Decision>, Ve
         match old_match {
             Some(old_decision) => {
                 let mut decision = new_decision.clone();
+                decision.id = old_decision.id.clone();
+                decision.effective_date = old_decision.effective_date.clone();
                 decision.authority = old_decision.authority.clone();
                 decision.supersedes = old_decision.supersedes.clone();
                 if old_decision.topic.is_some() {
@@ -972,6 +977,8 @@ mod tests {
 
     fn decision(text: &str, authority: Option<&str>, supersedes: Option<&str>) -> Decision {
         Decision {
+            id: None,
+            effective_date: None,
             text: text.into(),
             topic: None,
             authority: authority.map(String::from),
@@ -1137,6 +1144,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_decisions_preserves_identity_dates_and_unmatched_curated_records() {
+        let mut old = decision("Annual only", None, None);
+        old.id = Some("price-v1".into());
+        old.effective_date = Some("2030-01-01".into());
+        let (matched, _) = merge_decisions(&[old.clone()], &[decision("annual only", None, None)]);
+        assert_eq!(matched[0].id, old.id);
+        assert_eq!(matched[0].effective_date, old.effective_date);
+        let (unmatched, notes) = merge_decisions(&[old], &[decision("Other decision", None, None)]);
+        assert_eq!(unmatched.len(), 2);
+        assert_eq!(unmatched[1].id.as_deref(), Some("price-v1"));
+        assert!(notes
+            .iter()
+            .any(|note| note.disposition == MergeDisposition::KeptUnmatched));
+    }
+
+    #[test]
     fn merge_decisions_keeps_stateful_and_drops_pristine_unmatched() {
         let old = vec![
             decision("Keep me (authority)", Some("high"), None),
@@ -1248,6 +1271,43 @@ mod tests {
             &[],
             &[],
         )
+    }
+
+    #[test]
+    fn applied_resummarize_preserves_declared_decision_identity_and_effective_date() {
+        let dir = TempDir::new().unwrap();
+        let path = write_meeting(&dir);
+        markdown::update_frontmatter(&path, |fm| {
+            fm.decisions.push(Decision {
+                id: Some("ship-v1".into()),
+                effective_date: Some("2030-01-01".into()),
+                text: "Ship it".into(),
+                topic: None,
+                authority: None,
+                supersedes: None,
+            });
+        })
+        .unwrap();
+        let report = resummarize_meeting_with(
+            &path,
+            &test_config(),
+            &ResummarizeOptions {
+                apply: true,
+                ..Default::default()
+            },
+            |_, _, _| Some(good_summary()),
+        )
+        .unwrap();
+        assert!(report.applied);
+        let updated = fs::read_to_string(&path).unwrap();
+        let fm: Frontmatter =
+            serde_yaml::from_str(markdown::split_frontmatter(&updated).0).unwrap();
+        let decision = fm
+            .decisions
+            .iter()
+            .find(|item| item.id.as_deref() == Some("ship-v1"))
+            .unwrap();
+        assert_eq!(decision.effective_date.as_deref(), Some("2030-01-01"));
     }
 
     #[test]

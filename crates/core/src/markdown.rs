@@ -1444,6 +1444,10 @@ pub struct ActionItem {
 ///   a documented supersession rather than an unresolved contradiction.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Decision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_date: Option<String>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
@@ -3547,6 +3551,24 @@ mod tests {
         assert_eq!(health.status, "ok");
         assert_eq!(health.mapped_speakers, 2);
         assert_eq!(health.duration_ms, Some(1234));
+    }
+
+    #[test]
+    fn update_frontmatter_preserves_decision_identity_and_effective_date() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("decision.md");
+        let original = "---\ntitle: Plan\ntype: meeting\ndate: 2026-04-07T10:00:00-07:00\nduration: 0\ndecisions:\n  - id: price-v1\n    text: Annual only\n    topic: pricing\n    effective_date: 2030-01-01\n---\n## Transcript\nOriginal source.\n";
+        std::fs::write(&path, original).unwrap();
+        update_frontmatter(&path, |fm| fm.title = "Updated".into()).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        let (yaml, body) = split_frontmatter(&updated);
+        let fm: Frontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fm.decisions[0].id.as_deref(), Some("price-v1"));
+        assert_eq!(
+            fm.decisions[0].effective_date.as_deref(),
+            Some("2030-01-01")
+        );
+        assert_eq!(body, split_frontmatter(original).1);
     }
 
     #[test]

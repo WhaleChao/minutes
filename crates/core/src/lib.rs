@@ -146,6 +146,7 @@ pub(crate) mod entity_cluster;
 mod entity_resolution_eval;
 pub mod error;
 pub mod events;
+pub mod evidence;
 pub mod ffmpeg;
 pub mod graph;
 pub mod graph_worker;
@@ -187,6 +188,7 @@ pub mod policy_fs;
 pub mod process_trace;
 pub mod resummarize;
 pub mod retention;
+pub mod retrieval;
 // Shared mono-downmix + decimation resampler (used by capture and streaming)
 pub(crate) mod resample;
 pub mod screen;
