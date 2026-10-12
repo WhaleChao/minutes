@@ -3004,6 +3004,21 @@ fn preserve_failed_capture(wav_path: &std::path::Path, config: &Config) -> Optio
     Some(dest)
 }
 
+fn preserve_capture_after_error(
+    wav_path: &std::path::Path,
+    config: &Config,
+    error: &minutes_core::error::CaptureError,
+) -> Option<PathBuf> {
+    if error.storage_is_retiring() {
+        // The timed-out worker still owns this inode. A copy would contain an
+        // unfinished WAV, and removing the source would discard its eventual
+        // final header/tail. Do not issue more I/O against the stalled device.
+        Some(wav_path.to_path_buf())
+    } else {
+        preserve_failed_capture(wav_path, config)
+    }
+}
+
 fn preserve_failed_capture_path(path: &std::path::Path, config: &Config) -> Option<PathBuf> {
     let metadata = path.metadata().ok()?;
     if metadata.len() == 0 {
@@ -3714,8 +3729,40 @@ fn start_native_call_recording(
         }
     });
 
+    // Native capture bypasses record_to_wav, so it must supervise its own
+    // duration/disk policy. Do not infer silence from missing helper telemetry.
+    let mut safety_guard =
+        minutes_core::capture::RecordingSafetyGuard::new(&config.recording, &output_path);
+    let mut safety_stop_warning = None;
     while !stop_flag.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
+        match safety_guard.check_time_and_disk() {
+            minutes_core::capture::SafetyAction::None => {}
+            minutes_core::capture::SafetyAction::Nudge(message)
+            | minutes_core::capture::SafetyAction::Warning(message) => {
+                let notice = OutputNotice {
+                    kind: "warning".into(),
+                    title: "Recording safety warning".into(),
+                    path: output_path.display().to_string(),
+                    detail: message,
+                    job_id: None,
+                };
+                set_latest_output(latest_output, Some(notice.clone()));
+                maybe_show_completion_notification(
+                    app_handle,
+                    completion_notifications_enabled,
+                    &notice,
+                );
+            }
+            minutes_core::capture::SafetyAction::Stop(reason, message) => {
+                tracing::warn!(?reason, "{message}");
+                safety_stop_warning = Some(message);
+                stop_flag.store(true, Ordering::Relaxed);
+                // Use normal helper finalization and processing below. The
+                // guard never abandons or unlinks the captured stems.
+                break;
+            }
+        }
         if let Ok(mut health) = call_capture_health.lock() {
             *health = Some(session.source_health());
         }
@@ -3842,7 +3889,10 @@ fn start_native_call_recording(
             context_session_id.clone(),
             None,
             combine_native_call_warnings(
-                session.capture_warning(),
+                combine_native_call_warnings(
+                    session.capture_warning(),
+                    safety_stop_warning.clone(),
+                ),
                 Some(format!(
                     "Native call capture finalization reported an error: {error}."
                 )),
@@ -3983,7 +4033,7 @@ fn start_native_call_recording(
         recording_finished_at,
         context_session_id.clone(),
         calendar_event,
-        session.capture_warning(),
+        combine_native_call_warnings(session.capture_warning(), safety_stop_warning.clone()),
     ) {
         Ok(job) => {
             processing.store(true, Ordering::Relaxed);
@@ -6541,7 +6591,8 @@ pub fn start_recording(
         }
         Err(e) => {
             recording.store(false, Ordering::Relaxed);
-            let preserved = preserve_failed_capture(&wav_path, &config);
+            let storage_retiring = e.storage_is_retiring();
+            let preserved = preserve_capture_after_error(&wav_path, &config, &e);
             if let Some(session_id) = context_session_id.as_deref() {
                 minutes_core::context_store::mark_capture_session_failed(
                     session_id,
@@ -6552,7 +6603,10 @@ pub fn start_recording(
                 .ok();
             }
             if let Some(saved) = preserved {
-                let detail = match mode {
+                let detail = if storage_retiring {
+                    "Audio storage is still finishing. The original recording remains at this path; wait for storage to recover before retrying processing."
+                } else {
+                    match mode {
                     CaptureMode::Meeting => {
                         "Recording failed before processing, but the captured meeting audio was preserved."
                     }
@@ -6565,6 +6619,7 @@ pub fn start_recording(
                     CaptureMode::LiveTranscript => {
                         "Live transcript failed, but the audio was preserved."
                     }
+                }
                 };
                 let notice = OutputNotice {
                     kind: "preserved-capture".into(),
@@ -14215,10 +14270,16 @@ mod tests {
     /// clean run would certify a turn nobody observed finishing.
     #[test]
     fn only_an_observed_successful_exit_completes_a_turn() {
-        use std::process::Command;
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
 
-        let ok = Command::new("sh").arg("-c").arg("exit 0").status().unwrap();
-        let failed = Command::new("sh").arg("-c").arg("exit 1").status().unwrap();
+        let ok = std::process::ExitStatus::from_raw(0);
+        #[cfg(unix)]
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        #[cfg(windows)]
+        let failed = std::process::ExitStatus::from_raw(1);
 
         assert!(recall_chat_stream_completed(false, Some(ok)));
         assert!(!recall_chat_stream_completed(false, Some(failed)));
@@ -14363,7 +14424,8 @@ mod tests {
         std::env::set_var("HOME", &dir);
         std::env::set_var("USERPROFILE", &dir);
 
-        let result = f(&dir);
+        // Restore process-global test state even when the callback panics.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -14377,7 +14439,10 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
-        result
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn test_app_state() -> AppState {
@@ -16463,6 +16528,30 @@ mod tests {
         assert!(!wav.exists());
         assert!(preserved.exists());
         assert!(preserved.starts_with(config.output_dir.join("failed-captures")));
+    }
+
+    #[test]
+    fn retiring_capture_keeps_original_inode_for_the_final_header_and_tail() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let wav = dir.path().join("current.wav");
+        let mut writer = std::fs::File::create(&wav).unwrap();
+        let preserved = preserve_capture_after_error(
+            &wav,
+            &config,
+            &minutes_core::error::CaptureError::StorageRetiring,
+        );
+        assert_eq!(preserved, Some(wav.clone()));
+        assert!(
+            !config.output_dir.exists(),
+            "retiring storage must not be copied"
+        );
+        std::io::Write::write_all(&mut writer, b"final header and tail").unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read(wav).unwrap(), b"final header and tail");
     }
 
     /// Regression for issue #216: when the native call helper's .mov is moved
@@ -19672,7 +19761,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let path = home.join("meetings/demo.md");
         let displayed = display_path(&path.display().to_string());
-        assert!(displayed.starts_with("~/"));
+        assert!(displayed.starts_with(&format!("~{}", std::path::MAIN_SEPARATOR)));
     }
 
     #[test]

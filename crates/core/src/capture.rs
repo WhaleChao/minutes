@@ -132,7 +132,7 @@ impl RecordingSafetyGuard {
         self.check_silence(current_audio_level, call_app_active)
     }
 
-    /// Check only time cap and disk space (for live transcript mode).
+    /// Check only time cap and disk space (native call capture and live transcript).
     pub fn check_time_and_disk(&mut self) -> SafetyAction {
         if let Some(action) = self.check_disk_space() {
             return action;
@@ -197,7 +197,7 @@ impl RecordingSafetyGuard {
         }
 
         // Warn at 90% of cap
-        let warn_at = self.max_duration_secs * 9 / 10;
+        let warn_at = self.max_duration_secs - self.max_duration_secs.div_ceil(10);
         if elapsed >= warn_at && !self.time_cap_warned {
             self.time_cap_warned = true;
             let remaining_min = (self.max_duration_secs - elapsed) / 60;
@@ -859,22 +859,146 @@ pub fn should_bypass_preflight_block_for_native_call_capture(
 /// Shorter than silence_reminder_secs to enable fast reconnection.
 const DEVICE_CHECK_SILENCE_SECS: u64 = 5;
 
-/// Build a cpal input stream that writes resampled 16kHz mono into the shared WAV writer.
+/// Ten seconds of mono 16 kHz samples, allocated once before capture begins.
+/// A stalled disk may consume this headroom but can never block the realtime
+/// callback or grow memory without a bound. Exhaustion stops capture visibly.
+const CAPTURE_WRITE_QUEUE_SAMPLES: usize = 160_000;
+
+struct CaptureWriteQueue {
+    samples: crossbeam_queue::ArrayQueue<f32>,
+    finished: AtomicBool,
+    overrun: AtomicBool,
+}
+
+impl CaptureWriteQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: crossbeam_queue::ArrayQueue::new(capacity),
+            finished: AtomicBool::new(false),
+            overrun: AtomicBool::new(false),
+        }
+    }
+
+    fn push_samples(&self, samples: &[f32]) {
+        if self.finished.load(Ordering::Acquire) || self.overrun.load(Ordering::Acquire) {
+            return;
+        }
+        for &sample in samples {
+            if self.samples.push(sample).is_err() {
+                self.overrun.store(true, Ordering::Release);
+                return;
+            }
+        }
+    }
+}
+
+struct CaptureWriterPump {
+    queue: Arc<CaptureWriteQueue>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CaptureWriterPump {
+    fn start<W: std::io::Write + std::io::Seek + Send + 'static>(
+        mut writer: hound::WavWriter<W>,
+        sample_count: Arc<std::sync::atomic::AtomicU64>,
+        storage_failed: Arc<AtomicBool>,
+        live_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+    ) -> Self {
+        let queue = Arc::new(CaptureWriteQueue::new(CAPTURE_WRITE_QUEUE_SAMPLES));
+        let worker_queue = Arc::clone(&queue);
+        let thread = std::thread::spawn(move || {
+            let mut batch = [0.0_f32; 1600];
+            loop {
+                let mut count = 0;
+                while count < batch.len() {
+                    let Some(sample) = worker_queue.samples.pop() else {
+                        break;
+                    };
+                    batch[count] = sample;
+                    count += 1;
+                }
+                if count > 0 {
+                    write_capture_samples(
+                        &mut writer,
+                        &batch[..count],
+                        &sample_count,
+                        &storage_failed,
+                    );
+                    if storage_failed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Optional consumer allocation and channel operations also
+                    // run off the realtime callback, after the WAV writer.
+                    if let Some(tx) = &live_tx {
+                        if tx.try_send(batch[..count].to_vec()).is_err() {
+                            SIDECAR_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else if worker_queue.finished.load(Ordering::Acquire) {
+                    break;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            // Finalization can flush a partial BufWriter block to a stalled
+            // filesystem. Keep it inside the same deadline-supervised worker,
+            // rather than reintroducing an unbounded disk write on stop.
+            if let Err(error) = writer.finalize() {
+                storage_failed.store(true, Ordering::Release);
+                tracing::error!(%error, "recording WAV finalization failed");
+            }
+        });
+        Self {
+            queue,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), CaptureError> {
+        self.finish_with_timeout(std::time::Duration::from_secs(2))
+    }
+
+    fn finish_with_timeout(&mut self, timeout: std::time::Duration) -> Result<(), CaptureError> {
+        self.queue.finished.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + timeout;
+            while !thread.is_finished() {
+                if Instant::now() >= deadline {
+                    // A kernel disk write cannot be cancelled safely. Leave its
+                    // exact file handle with the retiring worker; never block
+                    // stop indefinitely or unlink the preserved recording.
+                    return Err(CaptureError::StorageRetiring);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            thread.join().map_err(|_| {
+                CaptureError::Io(std::io::Error::other(
+                    "recording writer stopped unexpectedly; partial audio preserved",
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CaptureWriterPump {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Build a cpal input stream that enqueues resampled 16kHz mono without disk I/O.
 /// Returns the stream handle and the device name string.
 ///
-/// Delegates mono-downmix + decimation to `resample::build_resampled_input_stream`,
-/// then converts f32 samples to i16 for the WAV writer and updates the audio level meter.
+/// Delegates mono-downmix and band-limited resampling to the shared stream
+/// builder, updates the meter, then queues samples for the recording worker.
 fn build_capture_stream(
     device: &cpal::Device,
-    writer: &Arc<std::sync::Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    queue: &Arc<CaptureWriteQueue>,
     stop_flag: &Arc<AtomicBool>,
-    sample_count: &Arc<std::sync::atomic::AtomicU64>,
     err_flag: &Arc<AtomicBool>,
-    live_tx: &Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 ) -> Result<(cpal::Stream, Arc<crate::resample::InputStreamDiagnostics>), CaptureError> {
-    let writer_clone = Arc::clone(writer);
-    let sample_count_clone = Arc::clone(sample_count);
-    let live_tx_clone = live_tx.clone();
+    let queue = Arc::clone(queue);
 
     // Level meter state — updated from the resampled samples (~10x/sec)
     let mut level_accum: f64 = 0.0;
@@ -904,41 +1028,34 @@ fn build_capture_stream(
                 }
             }
 
-            // Write resampled samples to WAV as i16. Batch the sample-count
-            // atomic so we do one fetch_add per callback (~100/sec) instead
-            // of one per sample (~16,000/sec). Only count samples that were
-            // actually written — on a write error we abort the batch and
-            // commit the count of successful writes so far.
-            let mut guard = writer_clone.lock().unwrap();
-            if let Some(ref mut w) = *guard {
-                let mut written: u64 = 0;
-                let mut write_err = false;
-                for &sample in resampled {
-                    let s16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                    if w.write_sample(s16).is_err() {
-                        write_err = true;
-                        break;
-                    }
-                    written += 1;
-                }
-                if written > 0 {
-                    sample_count_clone.fetch_add(written, Ordering::Relaxed);
-                }
-                if write_err {
-                    return;
-                }
-            }
-
-            // Fork samples to live transcript sidecar (non-blocking, drops if full)
-            if let Some(ref tx) = live_tx_clone {
-                if tx.try_send(resampled.to_vec()).is_err() {
-                    SIDECAR_DROPS.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            queue.push_samples(resampled);
         },
     )?;
 
     Ok((stream, stream_config.diagnostics))
+}
+
+/// Latch a recording storage error, even if a later write could succeed.
+/// Count only accepted samples and leave finalization to the capture owner.
+fn write_capture_samples<W: std::io::Write + std::io::Seek>(
+    writer: &mut hound::WavWriter<W>,
+    samples: &[f32],
+    sample_count: &std::sync::atomic::AtomicU64,
+    storage_failed: &AtomicBool,
+) {
+    if storage_failed.load(Ordering::Acquire) {
+        return;
+    }
+    let mut written = 0;
+    for &sample in samples {
+        let sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        if writer.write_sample(sample).is_err() {
+            storage_failed.store(true, Ordering::Release);
+            break;
+        }
+        written += 1;
+    }
+    sample_count.fetch_add(written, Ordering::Relaxed);
 }
 
 /// Try to reconnect to the current default audio device.
@@ -946,11 +1063,9 @@ fn build_capture_stream(
 fn try_reconnect(
     host: &cpal::Host,
     device_override: Option<&str>,
-    writer: &Arc<std::sync::Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    queue: &Arc<CaptureWriteQueue>,
     stop_flag: &Arc<AtomicBool>,
-    sample_count: &Arc<std::sync::atomic::AtomicU64>,
     err_flag: &Arc<AtomicBool>,
-    live_tx: &Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 ) -> Option<(
     cpal::Stream,
     String,
@@ -973,7 +1088,7 @@ fn try_reconnect(
         .description()
         .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string());
 
-    match build_capture_stream(&device, writer, stop_flag, sample_count, err_flag, live_tx) {
+    match build_capture_stream(&device, queue, stop_flag, err_flag) {
         Ok((stream, diagnostics)) => {
             tracing::info!(device = %name, "audio stream reconnected");
             Some((stream, name, diagnostics))
@@ -1014,10 +1129,75 @@ fn wav_spec_16k_mono() -> hound::WavSpec {
 fn create_wav_writer(
     output_path: &Path,
 ) -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, CaptureError> {
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let parent = std::fs::canonicalize(parent)?;
+    let directory = crate::policy_fs::BoundRecoveryDirectory::bind_existing(&parent)?;
+    let name = output_path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "WAV path has no filename")
+    })?;
+    #[cfg(windows)]
+    let created = crate::overlays::create_owner_only_staged_file(&parent.join(name));
+    #[cfg(not(windows))]
+    let created = directory.create_new_exact_file(name);
+    let file = match created {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Accept only a private empty reservation. Tightening a public
+            // reservation now would not revoke readers that opened it earlier.
+            // Never truncate an earlier capture or follow a planted link.
+            let existing = directory.bind_exact_file(name)?;
+            let file = existing.try_clone_exact_file()?;
+            if file.metadata()?.len() != 0 {
+                return Err(CaptureError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "refusing to overwrite an existing recording",
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = file.metadata()?;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600
+                {
+                    return Err(CaptureError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "recording reservation is not private to the current user",
+                    )));
+                }
+            }
+            file
+        }
+        Err(error) => return Err(error.into()),
+    };
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    if file.metadata()?.len() != 0 {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "recording reservation is no longer empty",
+        )));
     }
-    hound::WavWriter::create(output_path, wav_spec_16k_mono())
+    #[cfg(not(windows))]
+    crate::overlays::secure_private_file_handle(&file)?;
+    // Existing bound recovery handles intentionally lack WRITE_DAC and
+    // WRITE_OWNER. Verify their existing DACL instead of widening that shared
+    // capability just to support a recording reservation.
+    #[cfg(windows)]
+    crate::overlays::attest_owner_only_file_handle(&file)?;
+    directory.attest_for_source_cleanup()?;
+    let confirmed = directory.bind_exact_file(name)?;
+    if !crate::policy_fs::open_file_identity_matches(&file, &confirmed.try_clone_exact_file()?) {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "recording destination changed during creation",
+        )));
+    }
+    // Permissions and identity are established before hound writes even its
+    // header. Retain the exact file; no pathname reopen occurs during capture.
+    hound::WavWriter::new(std::io::BufWriter::new(file), wav_spec_16k_mono())
         .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV create: {}", e))))
 }
 
@@ -1179,14 +1359,6 @@ fn finalize_wav_writer(
     writer
         .finalize()
         .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV finalize: {}", e))))
-}
-
-fn set_capture_permissions(_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600)).ok();
-    }
 }
 
 #[cfg(feature = "streaming")]
@@ -1674,12 +1846,6 @@ fn record_to_wav_dual_source(
     let duration_secs = total_samples as f64 / 16000.0;
     let total_slots = slot_stats.both + slot_stats.voice_only + slot_stats.system_only;
 
-    set_capture_permissions(output_path);
-    if let Some(stems) = stem_paths_for(output_path) {
-        set_capture_permissions(&stems.voice);
-        set_capture_permissions(&stems.system);
-    }
-
     drop(live_tx);
     if let Some(handle) = sidecar_handle {
         handle.join().ok();
@@ -1838,10 +2004,10 @@ pub fn record_to_wav_with_lifecycle(
     }
 
     let writer = create_wav_writer(output_path)?;
-    let writer = Arc::new(std::sync::Mutex::new(Some(writer)));
 
     let sample_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let err_flag = Arc::new(AtomicBool::new(false));
+    let storage_failed = Arc::new(AtomicBool::new(false));
 
     // Reset audio level
     AUDIO_LEVEL.store(0, Ordering::Relaxed);
@@ -1850,6 +2016,12 @@ pub fn record_to_wav_with_lifecycle(
     // so agents can see what's being discussed during the recording.
     let (live_tx, sidecar_handle) =
         start_live_sidecar(config, &stop_flag, recording_partial_publisher);
+    let mut writer_pump = CaptureWriterPump::start(
+        writer,
+        Arc::clone(&sample_count),
+        Arc::clone(&storage_failed),
+        live_tx.clone(),
+    );
 
     // Screen context is independent of microphone readiness. Start it before
     // building the audio stream so permission prompts or a slow device cannot
@@ -1865,14 +2037,18 @@ pub fn record_to_wav_with_lifecycle(
     );
 
     // Build initial stream (wrapped in Option for reconnection)
-    let mut stream = Some(build_capture_stream(
-        &device,
-        &writer,
-        &stop_flag,
-        &sample_count,
-        &err_flag,
-        &live_tx,
-    )?);
+    let initial_stream = build_capture_stream(&device, &writer_pump.queue, &stop_flag, &err_flag);
+    let mut stream = Some(match initial_stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            // Sidecars may already be running. Retire them even when the
+            // microphone cannot start. Propagate pending finalization rather
+            // than hiding it behind a device error that permits temp cleanup.
+            stop_flag.store(true, Ordering::Release);
+            writer_pump.finish()?;
+            return Err(error);
+        }
+    });
     tracing::info!("audio capture started");
     emit_recording_started(started_context);
 
@@ -1908,6 +2084,14 @@ pub fn record_to_wav_with_lifecycle(
             // Set the shared flag so everything watching it (screen capture,
             // live sidecar, streams) winds down like on Ctrl+C (#423).
             stop_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+
+        if storage_failed.load(Ordering::Acquire)
+            || writer_pump.queue.overrun.load(Ordering::Acquire)
+        {
+            tracing::error!("recording storage failed; preserving the audio written so far");
+            send_silence_notification_msg("Recording stopped because audio could not be saved. The partial recording has been preserved.");
             break;
         }
 
@@ -1973,11 +2157,9 @@ pub fn record_to_wav_with_lifecycle(
             let reconnected = try_reconnect(
                 host,
                 device_override,
-                &writer,
+                &writer_pump.queue,
                 &stop_flag,
-                &sample_count,
                 &err_flag,
-                &live_tx,
             )
             .or_else(|| {
                 tracing::info!("reconnect failed, retrying in 1s...");
@@ -1985,11 +2167,9 @@ pub fn record_to_wav_with_lifecycle(
                 try_reconnect(
                     host,
                     device_override,
-                    &writer,
+                    &writer_pump.queue,
                     &stop_flag,
-                    &sample_count,
                     &err_flag,
-                    &live_tx,
                 )
             });
 
@@ -2030,6 +2210,7 @@ pub fn record_to_wav_with_lifecycle(
     // seal the WAV before waiting for the sidecar thread to retire.
     stop_flag.store(true, Ordering::Relaxed);
 
+    writer_pump.finish()?;
     let total_samples = sample_count.load(Ordering::Relaxed);
     let duration_secs = total_samples as f64 / 16000.0;
     tracing::info!(
@@ -2038,19 +2219,7 @@ pub fn record_to_wav_with_lifecycle(
         "audio capture stopped"
     );
 
-    // Finalize the WAV file
-    let mut guard = writer.lock().unwrap();
-    if let Some(w) = guard.take() {
-        #[cfg(feature = "streaming")]
-        finalize_wav_writer(w)?;
-        #[cfg(not(feature = "streaming"))]
-        w.finalize()
-            .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV finalize: {}", e))))?;
-    }
-
-    // Set restrictive permissions on the recording (contains sensitive audio)
-    set_capture_permissions(output_path);
-
+    // The supervised writer has already finalized its exact WAV handle.
     drop(live_tx);
     if let Some(handle) = sidecar_handle {
         handle.join().ok();
@@ -2070,6 +2239,11 @@ pub fn record_to_wav_with_lifecycle(
         total_samples, duration_secs, peak_level
     );
 
+    if storage_failed.load(Ordering::Acquire) || writer_pump.queue.overrun.load(Ordering::Acquire) {
+        return Err(CaptureError::Io(std::io::Error::other(
+            "recording storage failed; partial audio preserved",
+        )));
+    }
     if total_samples == 0 {
         return Err(CaptureError::EmptyRecording);
     }
@@ -3171,6 +3345,241 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wav_creation_preserves_existing_nonempty_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.wav");
+        std::fs::write(&path, b"previous recording").unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"previous recording");
+    }
+
+    #[test]
+    fn wav_creation_accepts_an_exclusive_empty_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved.wav");
+        #[cfg(windows)]
+        drop(crate::overlays::create_owner_only_staged_file(&path).unwrap());
+        #[cfg(not(windows))]
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            crate::overlays::secure_private_file_handle(&file).unwrap();
+        }
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(123_i16).unwrap();
+        writer.finalize().unwrap();
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.samples::<i16>().next().unwrap().unwrap(), 123);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_creation_refuses_a_public_empty_reservation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public.wav");
+        std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_is_private_while_recording_and_symlink_destination_is_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let target = dir.path().join("untouched");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link.wav");
+        symlink(&target, &link).unwrap();
+        assert!(create_wav_writer(&link).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+        writer.finalize().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wav_has_owner_only_dacl_before_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        crate::overlays::attest_owner_only_file_handle(&file).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn transient_audio_write_failure_is_latched_and_preserves_sample_count() {
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        struct FailingWriter {
+            cursor: Cursor<Vec<u8>>,
+            writes_left: Arc<AtomicUsize>,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.writes_left.load(Ordering::Relaxed) == 0 {
+                    return Err(std::io::Error::other("injected storage failure"));
+                }
+                self.writes_left.fetch_sub(1, Ordering::Relaxed);
+                self.cursor.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for FailingWriter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+        let writes_left = Arc::new(AtomicUsize::new(usize::MAX));
+        let mut writer = hound::WavWriter::new(
+            FailingWriter {
+                cursor: Cursor::new(Vec::new()),
+                writes_left: Arc::clone(&writes_left),
+            },
+            wav_spec_16k_mono(),
+        )
+        .unwrap();
+        writes_left.store(1, Ordering::Relaxed);
+        let count = AtomicU64::new(0);
+        let failed = AtomicBool::new(false);
+        write_capture_samples(&mut writer, &[0.1, 0.2, 0.3], &count, &failed);
+        assert!(failed.load(Ordering::Acquire));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        writes_left.store(100, Ordering::Relaxed);
+        write_capture_samples(&mut writer, &[0.4], &count, &failed);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "an intermittent failure must not resume silently"
+        );
+    }
+
+    #[test]
+    fn bounded_capture_queue_latches_overrun_without_losing_queued_prefix() {
+        let queue = CaptureWriteQueue::new(3);
+        queue.push_samples(&[1.0, 2.0, 3.0, 4.0]);
+        assert!(queue.overrun.load(Ordering::Acquire));
+        assert_eq!(queue.samples.len(), 3);
+        assert_eq!(queue.samples.pop(), Some(1.0));
+        queue.push_samples(&[5.0]);
+        assert_eq!(queue.samples.pop(), Some(2.0));
+        assert_eq!(queue.samples.pop(), Some(3.0));
+        assert!(queue.samples.is_empty(), "overrun must not silently resume");
+    }
+
+    #[test]
+    fn capture_writer_pump_drains_the_final_tail_before_finalization() {
+        use std::sync::atomic::AtomicU64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut pump =
+            CaptureWriterPump::start(writer, Arc::clone(&count), Arc::clone(&failed), None);
+        let samples = vec![0.25_f32; 32_137];
+        pump.queue.push_samples(&samples);
+        pump.finish().unwrap();
+        assert!(!failed.load(Ordering::Acquire));
+        assert_eq!(count.load(Ordering::Relaxed), samples.len() as u64);
+        let reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.duration(), samples.len() as u32);
+    }
+
+    #[test]
+    fn capture_writer_stop_deadline_does_not_wait_for_a_blocked_worker() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let mut pump = CaptureWriterPump {
+            queue: Arc::new(CaptureWriteQueue::new(1)),
+            thread: Some(handle),
+        };
+        let start = Instant::now();
+        assert!(pump
+            .finish_with_timeout(std::time::Duration::from_millis(10))
+            .unwrap_err()
+            .storage_is_retiring());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(pump.queue.finished.load(Ordering::Acquire));
+        assert!(
+            pump.thread.is_none(),
+            "timeout must not join again during Drop"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn capture_stop_deadline_also_bounds_wav_finalization() {
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+        use std::sync::atomic::AtomicU64;
+        struct BlockedFlush {
+            cursor: Cursor<Vec<u8>>,
+            gate: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for BlockedFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.cursor.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.gate.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        impl Seek for BlockedFlush {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+        let gate = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = hound::WavWriter::new(
+            BlockedFlush {
+                cursor: Cursor::new(Vec::new()),
+                gate: Arc::clone(&gate),
+                entered: entered_tx,
+                release: release_rx,
+            },
+            wav_spec_16k_mono(),
+        )
+        .unwrap();
+        gate.store(true, Ordering::Release);
+        let mut pump = CaptureWriterPump::start(
+            writer,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        pump.queue.finished.store(true, Ordering::Release);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        assert!(pump
+            .finish_with_timeout(std::time::Duration::from_millis(10))
+            .unwrap_err()
+            .storage_is_retiring());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
     fn strip_device_format_suffix_strips_decorated_label() {
         assert_eq!(
             strip_device_format_suffix("Ground Control (16000Hz, 1 ch)"),
@@ -3952,6 +4361,65 @@ mod tests {
             action,
             SafetyAction::Stop(StopReason::TimeCapReached, _)
         ));
+    }
+
+    #[test]
+    fn native_time_and_disk_guard_warns_then_stops_without_silence_inference() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 10,
+            min_disk_space_mb: 0,
+            silence_reminder_secs: 1,
+            silence_auto_stop_secs: 1,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        guard.recording_start = Instant::now() - std::time::Duration::from_secs(9);
+        assert!(matches!(
+            guard.check_time_and_disk(),
+            SafetyAction::Warning(_)
+        ));
+        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
+        assert!(guard.silence_start.is_none());
+        guard.recording_start = Instant::now() - std::time::Duration::from_secs(10);
+        assert!(matches!(
+            guard.check_time_and_disk(),
+            SafetyAction::Stop(StopReason::TimeCapReached, _)
+        ));
+        let unlimited = crate::config::RecordingConfig {
+            max_duration_secs: 0,
+            min_disk_space_mb: 0,
+            ..config
+        };
+        let mut guard = RecordingSafetyGuard::new(&unlimited, Path::new("/tmp/test.wav"));
+        guard.recording_start = Instant::now() - std::time::Duration::from_secs(7201);
+        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
+    }
+
+    #[test]
+    fn native_time_and_disk_guard_stops_for_low_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 0,
+            min_disk_space_mb: u64::MAX,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, dir.path());
+        guard.last_disk_check = Instant::now() - std::time::Duration::from_secs(61);
+        assert!(matches!(
+            guard.check_time_and_disk(),
+            SafetyAction::Stop(StopReason::DiskSpaceLow, _)
+        ));
+    }
+
+    #[test]
+    fn time_cap_warning_handles_large_configured_values() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: u64::MAX,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
     }
 
     #[test]
