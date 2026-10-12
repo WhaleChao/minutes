@@ -21,7 +21,7 @@ import { retireBoundReadersForProcessShutdown } from "./secure-read.js";
 // can never reach the main corpus-lease suite. That containment is
 // structural: no reset seam in production code, nothing exported that could
 // disarm the fail-closed barrier, and nothing here that has to simulate the
-// race. Adding further tests to this file would put them back inside the
+// race. A recovery assertion belongs in its own isolated file, outside the
 // blast radius.
 //
 // The worker route is load-bearing. The raw-error escape this pins lived in
