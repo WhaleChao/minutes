@@ -29,3 +29,7 @@ Artifact publication uses private exclusive staging, durable flush, and no-repla
 Native call capture independently enforces the configured duration cap and disk floor through normal stop/finalization/processing. It warns at 90 percent and retains an auto-stop reason with the capture warnings. Missing helper telemetry is not treated as silence. Helper-stall detection remains a separate qualification.
 
 On macOS, a recording seals its WAV before retiring its input devices. Driver teardown runs on an owned worker with a two-second wait per device. A pending worker retains the exact stream and prevents another in-process capture until it retires. The recording reports pending device shutdown; it does not claim the OS driver has finished stopping. This boundary applies to single-source input and dual-source stream disposal.
+
+## Summary input coverage
+
+Summary processing partitions the whole input into bounded chunks with separate transcript and notes budgets. Bounded subprocess input/output, call counts, and deadlines prevent runaway work. Failure or incomplete coverage cannot silently publish a complete result. Coverage metadata is carried into enrichment and resummarization. Input coverage means bytes were submitted to successful model calls; it does not establish factual accuracy, entailment, or perfect retention by the model. Enrichment checks the expected source before replacing it.
