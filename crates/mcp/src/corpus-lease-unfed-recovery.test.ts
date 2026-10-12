@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { withStableCorpusLease } from "./corpus-lease.js";
 import { retireBoundReadersForProcessShutdown } from "./secure-read.js";
 
-// Keep this recovery case outside the process poisoned by the deadline test.
+// Recovery must run in a separate Vitest process: the deadline refusal test
+// can intentionally poison process-global worker state before this case starts.
 function withCorpus(run: (root: string) => Promise<void>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "minutes-corpus-refusal-"));
   return run(root).finally(async () => {
@@ -15,7 +16,7 @@ function withCorpus(run: (root: string) => Promise<void>): Promise<void> {
   });
 }
 
-describe("stable corpus lease unfed recovery", () => {
+describe("stable corpus lease recovery contract", () => {
   it("keeps working after an unconfirmed kill of a worker that never learned the corpus", async () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "never fed canary");
