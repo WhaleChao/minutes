@@ -4079,8 +4079,11 @@ describe("restricted content policy", () => {
       query: commonToken,
     });
     expect(common).toHaveLength(MCP_POLICY_MEETING_RESULT_MAX);
-    expect(common[0].path).toBe("/bounded-search/05000.md");
-    expect(common.some((entry) => entry.path.endsWith("00000.md"))).toBe(false);
+    // Relevance now precedes recency: the older source has a second literal
+    // occurrence of "synthetic", while equal-score peers keep date ordering.
+    expect(common[0].path).toBe("/bounded-search/00000.md");
+    expect(common[1].path).toBe("/bounded-search/05000.md");
+    expect(common.some((entry) => entry.path.endsWith("00001.md"))).toBe(false);
     expect(common.some((entry) => entry.path.includes("restricted"))).toBe(false);
   }, 15_000);
 
@@ -4156,7 +4159,8 @@ describe("restricted content policy", () => {
     expect(intents).toHaveLength(MCP_INTENT_RESULT_MAX);
     expect(intents.every((intent) => intent.what.length <= 2_048)).toBe(true);
 
-    const research = researchTopicProjection(meetings, long);
+    expect(() => researchTopicProjection(meetings, long)).toThrow(/query exceeds/i);
+    const research = researchTopicProjection(meetings, "xx");
     expect(research.meetings).toHaveLength(MCP_RESEARCH_MEETING_RESULT_MAX);
     expect(research.decisions).toHaveLength(MCP_RESEARCH_DECISION_RESULT_MAX);
     expect(research.openIntents).toHaveLength(MCP_INTENT_RESULT_MAX);

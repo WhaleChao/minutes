@@ -7929,6 +7929,8 @@ pub(crate) fn extract_decisions(summary: &summarize::Summary) -> Vec<markdown::D
             // Try to infer topic from the first few words
             let topic = infer_topic(text);
             markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: text.clone(),
                 topic,
                 authority: None,
@@ -10947,6 +10949,8 @@ mod tests {
             status: "open".into(),
         }];
         let decisions = vec![markdown::Decision {
+            id: None,
+            effective_date: None,
             text: "Launch pricing at monthly billing per month".into(),
             topic: Some("pricing strategy".into()),
             authority: None,
@@ -10999,24 +11003,32 @@ mod tests {
             &[],
             &[
                 markdown::Decision {
+                    id: None,
+                    effective_date: None,
                     text: "Speaker_1 provide speaker roster and contact notes".into(),
                     topic: Some("speaker 1 provide speaker".into()),
                     authority: None,
                     supersedes: None,
                 },
                 markdown::Decision {
+                    id: None,
+                    effective_date: None,
                     text: "Reach out to Cardinal about access".into(),
                     topic: Some("reach out".into()),
                     authority: None,
                     supersedes: None,
                 },
                 markdown::Decision {
+                    id: None,
+                    effective_date: None,
                     text: "Pioneer asked build the custom report after review".into(),
                     topic: Some("pioneer asked build".into()),
                     authority: None,
                     supersedes: None,
                 },
                 markdown::Decision {
+                    id: None,
+                    effective_date: None,
                     text: "LeaderNet 835 reconciliation remains the core workflow".into(),
                     topic: Some("leadernet 835 reconciliation".into()),
                     authority: None,
@@ -11696,6 +11708,8 @@ mod tests {
             &attendees,
             &action_items,
             &[markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: "Speaker_1 provide speaker roster and contact notes".into(),
                 topic: Some("speaker 1 provide speaker".into()),
                 authority: None,
@@ -11775,6 +11789,8 @@ mod tests {
             &["Alex Chen".into()],
             &[],
             &[markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: "Use annual billing for premium users".into(),
                 topic: Some("pricing strategy".into()),
                 authority: None,
@@ -11797,6 +11813,8 @@ mod tests {
             Some("iPhone 16 Pro"),
             &entities,
             &[markdown::Decision {
+                id: None,
+                effective_date: None,
                 text: "Use annual billing for premium users".into(),
                 topic: Some("pricing strategy".into()),
                 authority: None,
