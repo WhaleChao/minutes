@@ -7639,9 +7639,10 @@ fn cmd_devices() -> Result<()> {
         for d in &devices {
             eprintln!("  {}", d);
         }
-        let json = serde_json::to_string_pretty(&devices)?;
-        println!("{}", json);
     }
+    // Headless callers still need valid JSON, not an empty stdout stream.
+    let json = serde_json::to_string_pretty(&devices)?;
+    println!("{}", json);
 
     // Platform-specific virtual audio hints
     #[cfg(target_os = "macos")]
@@ -18335,6 +18336,9 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
     );
     eprintln!();
 
+    // Keep the exact temporary file capability through enrollment. Error
+    // paths preserve it: a timed-out capture writer may still be retiring.
+    let mut captured_clip = None;
     let audio_path = if let Some(path) = file {
         if !path.exists() {
             return Err(anyhow::anyhow!("File not found: {}", path.display()));
@@ -18364,16 +18368,33 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
         );
         eprintln!();
 
-        let tmp_dir = std::env::temp_dir().join("minutes-enroll");
-        std::fs::create_dir_all(&tmp_dir)?;
-        let tmp_path = tmp_dir.join("enroll-sample.wav");
+        let tmp_dir = std::env::temp_dir()
+            .canonicalize()?
+            .join(format!("minutes-enroll-{}", std::process::id()));
+        let directory =
+            minutes_core::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&tmp_dir)?;
+        let reservation = directory.create_random_private_control_file("enroll", &[])?;
+        let mut wav_name = reservation
+            .display_path()
+            .file_name()
+            .context("enrollment reservation has no filename")?
+            .to_os_string();
+        wav_name.push(".wav");
+        let reservation = directory.rename_bound_no_replace(reservation, &wav_name)?;
+        let tmp_path = reservation.display_path().to_path_buf();
+        captured_clip = Some((directory, reservation));
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag_clone = stop_flag.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(duration * 1000));
             flag_clone.store(true, std::sync::atomic::Ordering::Relaxed);
         });
-        minutes_core::capture::record_to_wav(&tmp_path, stop_flag, config)?;
+        minutes_core::capture::record_to_wav(&tmp_path, stop_flag, config).with_context(|| {
+            format!(
+                "Enrollment capture failed; its private sample is retained at {}",
+                tmp_path.display()
+            )
+        })?;
         eprintln!("  \x1b[1;32m✓\x1b[0m Recording captured.");
         tmp_path
     };
@@ -18459,8 +18480,10 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
         eprintln!("  \x1b[2m›\x1b[0m Run \x1b[33mminutes voices\x1b[0m to see your profile");
     }
 
-    if file.is_none() {
-        std::fs::remove_file(&audio_path).ok();
+    if let Some((directory, sample)) = captured_clip {
+        if let Err(error) = directory.remove_owned_private_file(sample) {
+            tracing::warn!(%error, path = %audio_path.display(), "enrollment succeeded but private sample cleanup failed");
+        }
     }
     Ok(())
 }
