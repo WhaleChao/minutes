@@ -33,3 +33,9 @@ On macOS, a recording seals its WAV before retiring its input devices. Driver te
 ## Summary input coverage
 
 Summary processing partitions the whole input into bounded chunks with separate transcript and notes budgets. Bounded subprocess input/output, call counts, and deadlines prevent runaway work. Failure or incomplete coverage cannot silently publish a complete result. Coverage metadata is carried into enrichment and resummarization. Input coverage means bytes were submitted to successful model calls; it does not establish factual accuracy, entailment, or perfect retention by the model. Enrichment checks the expected source before replacing it.
+
+## Desktop boundary and qualification
+
+Recall's streaming controller is extracted from the large page behind a generated runtime/TypeScript contract. Tests render the production DOM, CSS, controller and Markdown renderer with stubbed IPC. They exercise streaming, errors, reset/stop races, unsafe input and responsive layouts. They do not exercise Tauri, macOS permissions, real audio, or OS text insertion. The existing signed development-app acceptance gate still applies. Backend events do not yet carry a turn ID, so a late event from an earlier backend turn cannot always be identified by the client.
+
+See `tests/eval/v02/README.md` for evaluation commands and their limits.

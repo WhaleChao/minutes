@@ -88,6 +88,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - 'tooling/test-coverage.json'
+              - 'scripts/test_coverage.py'
               # The Windows desktop installer job installs the Tauri CLI with this.
               - '.github/scripts/install-tauri-cli.sh'
               # This file defines the Rust jobs and their caches, so editing it
@@ -186,7 +188,7 @@ jobs:
 
       - name: Test PocketStation capture (Windows and Linux)
         if: runner.os == 'Windows' || runner.os == 'Linux'
-        run: cargo test -p minutes-core --no-default-features --features pocketstation-capture --lib -- --test-threads=1 --nocapture
+        run: python scripts/test_coverage.py run pocketstation
         timeout-minutes: 15
 
       - name: Clippy PocketStation capture (Windows and Linux)
@@ -211,7 +213,7 @@ jobs:
         # build above, so this adds little time.
         run: cargo test -p whisper-guard --features whisper --lib -- --test-threads=1
 
-      - name: Test live transcript and streaming whisper (whisper + streaming)
+      - name: Test dictation and live speech (whisper + streaming)
         # live_transcript.rs and streaming_whisper.rs are gated on
         # all(streaming, whisper), so the --no-default-features test run
         # below compiles none of their tests: the whisper-rs abort callback
@@ -219,7 +221,10 @@ jobs:
         # lived in exactly this code and shipped through three releases with
         # green CI. No model is required; tests that need one are #[ignore].
         # whisper-rs is already compiled by the parakeet build above.
-        run: "cargo test -p minutes-core --features streaming --lib -- live_transcript:: streaming_whisper:: --test-threads=1"
+        # Derive the filters from the enabled feature-gated modules; a new
+        # module cannot compile successfully while silently running zero tests.
+        run: python scripts/test_coverage.py run speech
+        timeout-minutes: 10
 
       - name: Ensure cmake for sherpa-rs (Linux)
         if: runner.os == 'Linux'
@@ -241,6 +246,12 @@ jobs:
         run: |
           cargo check -p minutes-core --no-default-features --features diarize,engine-sherpa
           cargo check -p minutes-core --no-default-features --features vad-ort,engine-sherpa
+
+      - name: Test optional engine and streaming-diarization contracts
+        # Loader/IPC and synthetic VAD tests only; no model or audio device.
+        # These dependencies are already compiled by the feature builds above.
+        run: python scripts/test_coverage.py run optional-engines
+        timeout-minutes: 10
 
       - name: Build and test the isolated sherpa plugin
         # Every platform, not just macOS: the plugin declares per-target sherpa
@@ -306,7 +317,7 @@ jobs:
         # streaming only" and then never executed. That covered the dual-source
         # chunking invariants in streaming.rs and the mic-mute tests. Run the
         # same suite once more with the feature on.
-        run: cargo test -p minutes-core --no-default-features --features streaming --lib -- --test-threads=1 --nocapture
+        run: python scripts/test_coverage.py run streaming
         timeout-minutes: 15
 
       - name: Copilot attach, routing, and window-contract tests
@@ -344,7 +355,15 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p minutes-core --no-default-features --test integration -- --test-threads=1
         timeout-minutes: 10
-        continue-on-error: true
+
+      - name: Upload executed feature-test inventory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-test-inventory-${{ runner.os }}
+          path: target/test-coverage/*.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Clippy (macOS only — full workspace)
         if: runner.os == 'macOS'
@@ -630,8 +649,36 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install MCP dependencies
-        run: node scripts/install_mcp_dependencies.mjs
+      - name: Install Rust for process-level MCP contracts
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install audio headers for the model-free CLI
+        timeout-minutes: 20
+        run: .github/scripts/apt-install.sh libasound2-dev libpipewire-0.3-dev libspa-0.2-dev
+
+      - name: Cache MCP contract CLI build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-process-contracts
+
+      - name: Build actual CLI for process-level MCP contracts
+        run: cargo build -p minutes-cli --no-default-features
+        timeout-minutes: 15
+
+      - name: Install and build SDK, then install MCP dependencies
+        # The SDK suite also runs when MCP deliberately pins a different
+        # published SDK version, so install its own dependencies explicitly.
+        run: |
+          npm --prefix crates/sdk ci
+          npm --prefix crates/sdk run build
+          node scripts/install_mcp_dependencies.mjs --sdk-ready
+
+      - name: Test memory evaluation metrics and harness
+        run: python3 -m unittest discover -s tests/eval/v02 -p 'test_*.py' -v
+
+      - name: SDK full unit suite
+        run: node scripts/run_corpus_test_harness.mjs npm --prefix crates/sdk test
+        timeout-minutes: 10
 
       - name: TypeScript check
         working-directory: crates/mcp
@@ -657,6 +704,28 @@ jobs:
         working-directory: crates/mcp
         run: npm run build
 
+      - name: MCP process, transport and first-recall integration contracts
+        working-directory: crates/mcp
+        env:
+          MINUTES_MCP_AUTO_SETUP: '0'
+        run: node ../../scripts/run_corpus_test_harness.mjs npm run test:integration
+        timeout-minutes: 10
+
+      - name: Evaluate memory contracts through actual MCP stdio
+        # Public deterministic fixtures are a conformance gate, not a
+        # production-quality or state-of-the-art benchmark claim.
+        run: python3 tests/eval/v02/mcp_eval.py --cli target/debug/minutes --sizes 100 --repeats 1 --output tests/eval/results/mcp-v02.json
+        timeout-minutes: 10
+
+      - name: Upload memory conformance report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: memory-conformance-mcp
+          path: tests/eval/results/mcp-v02.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Install mcpb CLI
         run: npm install -g @anthropic-ai/mcpb
 
@@ -668,6 +737,48 @@ jobs:
 
       - name: Handshake smoke test
         run: ./scripts/smoke_mcpb_handshake.sh minutes.mcpb
+
+  desktop_recall:
+    name: Desktop Recall Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install SDK toolchain for typed Recall boundary
+        run: npm --prefix crates/sdk ci
+
+      - name: Check generated Recall contract and typed decoder
+        run: |
+          node scripts/check_recall_chunk_contract.mjs
+          node crates/sdk/node_modules/typescript/bin/tsc -p tauri/tsconfig.recall.json
+
+      - name: Install pinned browser harness
+        run: |
+          node -e "require('node:fs').mkdirSync('target/recall-browser', { recursive: true }); require('node:fs').writeFileSync('target/recall-browser/package.json', JSON.stringify({ private: true }))"
+          npm --prefix target/recall-browser install --no-save --package-lock=false --no-audit --no-fund playwright@1.62.1
+          node target/recall-browser/node_modules/playwright/cli.js install --with-deps chromium --only-shell
+        timeout-minutes: 10
+
+      - name: Test Recall in Chromium with the production DOM and renderer
+        # Tauri IPC is stubbed; native permissions and capture remain a
+        # separate signed-desktop acceptance gate.
+        env:
+          MINUTES_DESKTOP_SCREENSHOT: target/desktop-contracts/recall.png
+        run: node scripts/desktop/recall-rendered.test.mjs
+        timeout-minutes: 5
+
+      - name: Upload rendered Recall evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-recall-rendered
+          path: target/desktop-contracts/recall.png
+          if-no-files-found: warn
+          retention-days: 14
 
   # The lockfile is generated from a clean tree with Node 22/npm 10 so its v3
   # package graph retains every platform-specific optional dependency.
@@ -764,6 +875,17 @@ jobs:
       - name: Test CI rust filter guard
         run: node --test scripts/check_ci_rust_filter.test.mjs
 
+      - name: Install workflow parser for feature-test coverage audit
+        run: python -m pip install --quiet pyyaml
+
+      - name: Verify executing feature-test coverage and negative controls
+        run: |
+          python scripts/test_test_coverage.py
+          python scripts/test_coverage.py check
+
+      - name: Test local and published SDK install policies
+        run: node --test scripts/install_mcp_dependencies.test.mjs
+
       - name: Test Windows CPU-baseline release guard
         run: node --test scripts/check_windows_cpu_baseline.test.mjs
 
@@ -822,6 +944,12 @@ jobs:
 
       - name: Test design-token checker
         run: node --test scripts/check_design_tokens.test.mjs
+
+      - name: Test shipped dictation controllers
+        run: |
+          node scripts/test_dictation_readiness.mjs
+          node scripts/test_dictation_overlay.mjs
+          node scripts/test_dictation_history.mjs
 
   skills_compiler:
     name: Skills Compiler
