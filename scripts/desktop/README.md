@@ -25,7 +25,7 @@ node scripts/desktop/recall-rendered.test.mjs
 
 The explicit runtime directory prevents npm from resolving a parent package and changing shared user dependencies when this repository has no root package manifest.
 
-The browser fixture imports the actual Recall panel DOM and CSS from `index.html`, the production controller, and the complete existing Markdown renderer block. Only Tauri commands/events are stubbed. Assertions cover provider dialects, partial/completed reply deduplication, tool/thinking status, malformed frames, unsafe Markdown, errors racing with render/done, scroll anchoring, Stop, reset, failed send, listener rollback/disposal, and narrow/wide composer geometry. Renderer extraction uses explicit source markers and fails if they disappear.
+The browser fixture imports the actual Recall panel DOM and CSS from `index.html`, the production controller, and the complete existing Markdown renderer block. Streaming commands/events are stubbed. Shell transition tests also stub window sizing and persistence. Additional geometry cases import the list and document panes and execute the production responsive policy, covering layout without the isolated panel override. Assertions cover provider dialects, partial/completed reply deduplication, tool/thinking status, malformed frames, unsafe Markdown, errors racing with render/done, scroll anchoring, Stop, reset, failed send, listener rollback/disposal, and narrow/wide composer geometry. Renderer extraction uses explicit source markers and fails if they disappear.
 
 ## Event contract
 
@@ -39,6 +39,6 @@ The contract checker verifies freshness, exhaustive decoder cases, loaded shell 
 
 ## What this does not verify
 
-This fixture proves browser rendering and interaction for the isolated native chat surface. It does not prove full-window integration, WebKit parity, actual provider IPC, recording, TCC permissions, global shortcuts, OS focus/insertion, or signed app installation. `docs/checklists/pre-commit.md` still requires the signed development app click-test on macOS before committing these UI changes. This work can be reviewed as an uncommitted patch while that gate is pending.
+This fixture proves browser rendering and interaction for native Chat, production layout geometry, and collapsed-panel focus behavior. It does not prove the complete app initialization, WebKit parity, actual provider IPC, recording, TCC permissions, global shortcuts, OS focus/insertion, or signed app installation. `docs/checklists/pre-commit.md` still requires the signed development app click-test on macOS before committing these UI changes. This work can be reviewed as an uncommitted patch while that gate is pending.
 
 The existing event protocol has no frontend turn identifier: the controller can ignore stale command promise failures after a reset, but cannot distinguish a late event from an old backend turn after a new turn has started. Backend turn cancellation remains authoritative. Adding event IDs requires a coordinated backend protocol change, not an invented frontend guarantee.
