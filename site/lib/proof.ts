@@ -6,5 +6,5 @@
 
 export const GITHUB_STARS = "1,545";
 export const GITHUB_FORKS = "168";
-export const GITHUB_CONTRIBUTORS = "34";
+export const GITHUB_CONTRIBUTORS = "33";
 export const NPM_MONTHLY_DOWNLOADS = "2,985";
