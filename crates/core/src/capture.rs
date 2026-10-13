@@ -134,16 +134,27 @@ impl RecordingSafetyGuard {
 
     /// Check only time cap and disk space (native call capture and live transcript).
     pub fn check_time_and_disk(&mut self) -> SafetyAction {
-        if let Some(action) = self.check_disk_space() {
+        self.check_time_and_disk_at(Instant::now())
+    }
+
+    fn check_time_and_disk_at(&mut self, now: Instant) -> SafetyAction {
+        if let Some(action) = self.check_disk_space_at(now) {
             return action;
         }
-        if let Some(action) = self.check_time_cap() {
+        if let Some(action) = self.check_time_cap_elapsed(
+            now.saturating_duration_since(self.recording_start)
+                .as_secs(),
+        ) {
             return action;
         }
         SafetyAction::None
     }
 
     fn check_disk_space(&mut self) -> Option<SafetyAction> {
+        self.check_disk_space_at(Instant::now())
+    }
+
+    fn check_disk_space_at(&mut self, now: Instant) -> Option<SafetyAction> {
         if self.min_disk_space_mb == 0 {
             return None;
         }
@@ -154,10 +165,10 @@ impl RecordingSafetyGuard {
             _ => std::time::Duration::from_secs(60),
         };
 
-        if self.last_disk_check.elapsed() < check_interval {
+        if now.saturating_duration_since(self.last_disk_check) < check_interval {
             return None;
         }
-        self.last_disk_check = Instant::now();
+        self.last_disk_check = now;
 
         match available_disk_space_mb(&self.output_path) {
             Some(available_mb) => {
@@ -179,11 +190,13 @@ impl RecordingSafetyGuard {
     }
 
     fn check_time_cap(&mut self) -> Option<SafetyAction> {
+        self.check_time_cap_elapsed(self.recording_start.elapsed().as_secs())
+    }
+
+    fn check_time_cap_elapsed(&mut self, elapsed: u64) -> Option<SafetyAction> {
         if self.max_duration_secs == 0 {
             return None;
         }
-
-        let elapsed = self.recording_start.elapsed().as_secs();
 
         if elapsed >= self.max_duration_secs {
             let hours = self.max_duration_secs / 3600;
@@ -4474,16 +4487,19 @@ mod tests {
             ..Default::default()
         };
         let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
-        guard.recording_start = Instant::now() - std::time::Duration::from_secs(9);
+        let warning_at = guard.recording_start + std::time::Duration::from_secs(9);
         assert!(matches!(
-            guard.check_time_and_disk(),
+            guard.check_time_and_disk_at(warning_at),
             SafetyAction::Warning(_)
         ));
-        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
-        assert!(guard.silence_start.is_none());
-        guard.recording_start = Instant::now() - std::time::Duration::from_secs(10);
         assert!(matches!(
-            guard.check_time_and_disk(),
+            guard.check_time_and_disk_at(warning_at),
+            SafetyAction::None
+        ));
+        assert!(guard.silence_start.is_none());
+        let expired_at = guard.recording_start + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            guard.check_time_and_disk_at(expired_at),
             SafetyAction::Stop(StopReason::TimeCapReached, _)
         ));
         let unlimited = crate::config::RecordingConfig {
@@ -4492,8 +4508,11 @@ mod tests {
             ..config
         };
         let mut guard = RecordingSafetyGuard::new(&unlimited, Path::new("/tmp/test.wav"));
-        guard.recording_start = Instant::now() - std::time::Duration::from_secs(7201);
-        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
+        let much_later = guard.recording_start + std::time::Duration::from_secs(7201);
+        assert!(matches!(
+            guard.check_time_and_disk_at(much_later),
+            SafetyAction::None
+        ));
     }
 
     #[test]
@@ -4505,9 +4524,9 @@ mod tests {
             ..Default::default()
         };
         let mut guard = RecordingSafetyGuard::new(&config, dir.path());
-        guard.last_disk_check = Instant::now() - std::time::Duration::from_secs(61);
+        let disk_check_at = guard.last_disk_check + std::time::Duration::from_secs(61);
         assert!(matches!(
-            guard.check_time_and_disk(),
+            guard.check_time_and_disk_at(disk_check_at),
             SafetyAction::Stop(StopReason::DiskSpaceLow, _)
         ));
     }
