@@ -6164,7 +6164,7 @@
   <div class="split-handle" id="split-handle"></div>
 
   <!-- ── Recall panel (right side, embedded terminal) ── -->
-  <div class="recall-panel" id="recall-panel">
+  <div class="recall-panel" id="recall-panel" aria-hidden="true" inert>
     <div class="recall-header" data-tauri-drag-region>
       <div class="recall-header-info" data-tauri-drag-region>
         <div class="recall-phase-dot" id="recall-dot" aria-label="Phase: Recall" data-tauri-drag-region></div>
@@ -15267,6 +15267,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
       applyRecallRatio(getStoredRecallRatio());
       recallPanel.classList.add('expanded');
+      recallPanel.removeAttribute('inert');
+      recallPanel.setAttribute('aria-hidden', 'false');
       splitHandle.classList.add('visible');
       assistantBtn.setAttribute('aria-expanded', 'true');
       recallExpanded = true;
@@ -15293,6 +15295,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       expandAnimating = true;
 
       recallPanel.classList.remove('expanded');
+      recallPanel.setAttribute('inert', '');
+      recallPanel.setAttribute('aria-hidden', 'true');
       splitHandle.classList.remove('visible');
       assistantBtn.setAttribute('aria-expanded', 'false');
 

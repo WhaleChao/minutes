@@ -24,12 +24,14 @@ assert.ok(rendererStart > 0 && rendererEnd > rendererStart, 'Production Markdown
 const css = [...source.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map(match => match[1]).join('\n');
 const links = [...source.matchAll(/<link[^>]+rel="stylesheet"[^>]*>/g)].map(match => match[0]).join('\n');
 const fixture = `<!doctype html><html data-platform="linux"><head><meta charset="utf-8">${links}<style>${css}
-.recall-panel.expanded { width: 100%; position: absolute; inset: 0; }
-</style></head><body>
+.fixture-isolated .recall-panel.expanded { width: 100%; position: absolute; inset: 0; }
+</style></head><body class="fixture-isolated">
 <script>const source = ${JSON.stringify(source).replace(/</g, '\\u003c')};
 const original = new DOMParser().parseFromString(source, 'text/html');
 document.body.append(document.importNode(original.getElementById('recall-panel'), true));
 document.getElementById('recall-panel').classList.add('expanded');
+document.getElementById('recall-panel').removeAttribute('inert');
+document.getElementById('recall-panel').setAttribute('aria-hidden', 'false');
 document.getElementById('recall-chat-panel').style.display = 'flex';
 </script>
 <script src="/vendor/marked.min.js"></script><script src="/scripts/recall-contract.js"></script><script src="/scripts/recall-chat.js"></script>
@@ -167,6 +169,74 @@ try {
     await page.setViewportSize({width, height:720});
     const box = await page.locator('#recall-chat-input').boundingBox();
     assert.ok(box && box.width > 100 && box.x >= 0 && box.x + box.width <= width && box.y + box.height <= 720, `composer fits ${width}px viewport`);
+  }
+  // Use the actual shell transitions to exclude collapsed controls from both
+  // keyboard focus and accessibility, while preserving the unsent draft.
+  const transitionsStart = source.indexOf('    async function expandRecallPanel() {');
+  const transitionsEnd = source.indexOf('    async function toggleRecallPanel()', transitionsStart);
+  const transitions = await page.evaluate(async code => {
+    let recallExpanded = true, expandAnimating = false, userExplicitlyCollapsed = false;
+    const recallPanel = document.getElementById('recall-panel');
+    const splitHandle = document.createElement('div');
+    const assistantBtn = document.createElement('button');
+    const recallNudge = document.createElement('span');
+    const currentWindow = { isFullscreen: async () => true };
+    const EXPANDED_WIDTH = 960, COLLAPSED_WIDTH = 520;
+    const applyRecallWindowLayout = async () => {};
+    const applyRecallRatio = () => {}, getStoredRecallRatio = () => 0.5;
+    const persistRecallWorkspaceState = () => {};
+    const recallDevMode = false;
+    const applyRecallMode = () => {};
+    const registerChatListeners = async () => {};
+    const input = document.getElementById('recall-chat-input');
+    input.value = 'Unsent draft';
+    input.focus();
+    const { expandRecallPanel, collapseRecallPanel } = eval('(function(){' + code
+      + ';return {expandRecallPanel,collapseRecallPanel};})()');
+    await collapseRecallPanel();
+    await new Promise(done => setTimeout(done, 150));
+    input.focus();
+    const hidden = recallPanel.getAttribute('aria-hidden') === 'true' && recallPanel.inert;
+    const cannotFocus = document.activeElement !== input;
+    await expandRecallPanel();
+    input.focus();
+    return { hidden, cannotFocus, restored: document.activeElement === input
+      && !recallPanel.inert && recallPanel.getAttribute('aria-hidden') === 'false',
+      draft: input.value };
+  }, source.slice(transitionsStart, transitionsEnd));
+  assert.deepEqual(transitions, { hidden: true, cannotFocus: true, restored: true, draft: 'Unsent draft' });
+
+  // The isolated streaming fixture must not mask the real sidebar/document
+  // flex layout. Reuse the production shell and its responsive policy here.
+  const policyStart = source.indexOf('    const SIDEBAR_AUTO_COLLAPSE_WIDTH =');
+  const policyEnd = source.indexOf('    syncNarrowLayout();', policyStart);
+  assert.ok(policyStart > 0 && policyEnd > policyStart, 'Production responsive policy markers exist');
+  await page.evaluate(code => {
+    const original = new DOMParser().parseFromString(source, 'text/html');
+    const panel = document.getElementById('recall-panel');
+    for (const selector of ['.app-left', '#btn-sidebar-expand', '#split-handle']) {
+      document.body.insertBefore(document.importNode(original.querySelector(selector), true), panel);
+    }
+    const documentPane = document.importNode(original.getElementById('md-viewer'), true);
+    documentPane.classList.add('active');
+    document.body.append(documentPane);
+    document.documentElement.dataset.platform = 'macos';
+    document.body.className = 'doc-open';
+    let sidebarAutoCollapsed = false;
+    let userExpandedSidebarThisSession = false;
+    const sidebarCollapseButton = document.getElementById('btn-sidebar-collapse');
+    window.fixture.syncLayout = eval('(function(){' + code + ';return syncNarrowLayout;})()');
+  }, source.slice(policyStart, policyEnd));
+  for (const width of [960, 1100, 640]) {
+    await page.setViewportSize({ width, height: 780 });
+    await page.evaluate(() => window.fixture.syncLayout());
+    await page.waitForTimeout(200); // Wait for the shipped sidebar transition.
+    const pane = await page.locator('#recall-panel').boundingBox();
+    const composer = await page.locator('#recall-chat-input').boundingBox();
+    assert.ok(pane && pane.width >= 280 && pane.x + pane.width <= width + 1,
+      `Recall pane retains usable width beside a document at ${width}px`);
+    assert.ok(composer && composer.width > 150 && composer.x + composer.width <= width + 1,
+      `production-shell composer fits ${width}px viewport`);
   }
   if (process.env.MINUTES_DESKTOP_SCREENSHOT) {
     mkdirSync(dirname(resolve(process.env.MINUTES_DESKTOP_SCREENSHOT)), {recursive:true});
