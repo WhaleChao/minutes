@@ -1729,6 +1729,26 @@ pub fn rewrite_with_retry_path_guarded(
     )
 }
 
+pub(crate) fn rewrite_without_retry_path_guarded(
+    path: &Path,
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    expected_current: &str,
+) -> Result<WriteResult, MarkdownError> {
+    rewrite_with_retry_policy(
+        path,
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        None,
+        true,
+        Some(expected_current),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rewrite_with_retry_policy(
     path: &Path,

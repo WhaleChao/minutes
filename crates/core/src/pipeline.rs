@@ -196,6 +196,34 @@ fn detect_summarization_warnings(
     warnings
 }
 
+/// Coverage survives both Markdown rendering and machine-readable degradation.
+/// Complete means every source chunk was delivered, not that extraction is perfect.
+fn format_summary_with_coverage(
+    summary: &summarize::Summary,
+    coverage: Option<&summarize::SummaryCoverage>,
+) -> String {
+    let mut text = summarize::format_summary(summary);
+    if let Some(coverage) = coverage {
+        text.push_str("\n\n> ");
+        text.push_str(&coverage.message());
+        text.push('\n');
+    }
+    text
+}
+
+fn detect_summary_coverage_warning(
+    coverage: Option<&summarize::SummaryCoverage>,
+) -> Option<ProcessingWarning> {
+    coverage
+        .filter(|coverage| !coverage.complete)
+        .map(|coverage| ProcessingWarning {
+            step: "summarize".into(),
+            reason: "summary_coverage_incomplete".into(),
+            timeout_secs: None,
+            message: Some(coverage.message()),
+        })
+}
+
 /// Records a [`ProcessingWarning`] when the configured batch transcription
 /// engine is not the one that actually produced the transcript.
 ///
@@ -5054,6 +5082,35 @@ where
             "live capability does not match transcript provenance",
         ));
     }
+    // Bind enrichment to the exact artifact that was created. A user edit
+    // before or during a provider call must not be overwritten by stale state.
+    let canonical_root = config.output_dir.canonicalize()?;
+    let original =
+        markdown::read_stable_active_markdown(&artifact.write_result.path, &canonical_root)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact unavailable or changed before enrichment",
+                )
+            })?;
+    let expected = markdown::render_markdown(
+        &artifact.frontmatter,
+        &artifact.transcript,
+        None,
+        context.user_notes.as_deref(),
+        if descriptor_authorized {
+            None
+        } else {
+            Some(audio_path)
+        },
+    )?;
+    if original.content != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact changed before enrichment; existing edits were preserved",
+        )
+        .into());
+    }
     let diagnostic_audio_path = if descriptor_authorized {
         Path::new("authorized-audio")
     } else {
@@ -5181,20 +5238,22 @@ where
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
     let mut raw_summary: Option<summarize::Summary> = None;
+    let mut summary_coverage: Option<summarize::SummaryCoverage> = None;
     let summary = if config.summarization.engine != "none" {
         on_progress(PipelineStage::Summarizing);
         // Notes are passed separately so the agent path can byte-budget them
         // apart from the transcript and keep the screenshot coverage bound
         // derived from transcript text only.
-        summarize::summarize_with_template(
+        let report = summarize::summarize_with_template_report(
             &transcript,
             context.user_notes.as_deref(),
             &screen_files,
             config,
             context.template.as_ref(),
             Some(&audio_log_target),
-        )
-        .map(|summary| {
+        );
+        summary_coverage = report.coverage;
+        report.summary.map(|summary| {
             let summary_chars = summary_signal_chars(&summary);
 
             let actions_started = std::time::Instant::now();
@@ -5238,7 +5297,7 @@ where
             );
 
             summary_participants = summary.participants.clone();
-            let formatted = summarize::format_summary(&summary);
+            let formatted = format_summary_with_coverage(&summary, summary_coverage.as_ref());
             raw_summary = Some(summary);
             formatted
         })
@@ -5430,6 +5489,9 @@ where
         config.summarization.agent_timeout_secs,
         summarization_attempted,
     );
+    if let Some(warning) = detect_summary_coverage_warning(summary_coverage.as_ref()) {
+        summarization_warnings.push(warning);
+    }
     if let Some(warning) = collapse_warning {
         summarization_warnings.push(warning);
     }
@@ -5474,21 +5536,23 @@ where
         merge_recording_health(recording_health, frontmatter.recording_health);
 
     let mut result = if descriptor_authorized {
-        markdown::rewrite_without_retry_path(
+        markdown::rewrite_without_retry_path_guarded(
             &artifact.write_result.path,
             &frontmatter,
             &transcript,
             summary.as_deref(),
             context.user_notes.as_deref(),
+            &original.content,
         )?
     } else {
-        markdown::rewrite_with_retry_path(
+        markdown::rewrite_with_retry_path_guarded(
             &artifact.write_result.path,
             &frontmatter,
             &transcript,
             summary.as_deref(),
             context.user_notes.as_deref(),
             Some(audio_path),
+            &original.content,
         )?
     };
     apply_title_generation(
@@ -5873,6 +5937,7 @@ where
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
     let mut raw_summary: Option<summarize::Summary> = None;
+    let mut summary_coverage: Option<summarize::SummaryCoverage> = None;
     // Skip summarization when the all-noise gate replaced the transcript body:
     // the LLM has nothing to summarize, and we'd just burn tokens / surface
     // a hallucinated summary on top of a hallucinated transcript.
@@ -5886,15 +5951,16 @@ where
         // passed separately so the agent path can byte-budget them apart from
         // the transcript and keep the screenshot coverage bound derived from
         // transcript text only.
-        summarize::summarize_with_template(
+        let report = summarize::summarize_with_template_report(
             &transcript,
             user_notes.as_deref(),
             &screen_files,
             config,
             template,
             Some(&audio_log_target),
-        )
-        .map(|s| {
+        );
+        summary_coverage = report.coverage;
+        report.summary.map(|s| {
             let summary_chars = summary_signal_chars(&s);
 
             let actions_started = std::time::Instant::now();
@@ -5944,7 +6010,7 @@ where
                     "extracted participants from summary"
                 );
             }
-            let formatted = summarize::format_summary(&s);
+            let formatted = format_summary_with_coverage(&s, summary_coverage.as_ref());
             raw_summary = Some(s);
             formatted
         })
@@ -6167,6 +6233,9 @@ where
         config.summarization.agent_timeout_secs,
         summarization_attempted,
     );
+    if let Some(warning) = detect_summary_coverage_warning(summary_coverage.as_ref()) {
+        summarization_warnings.push(warning);
+    }
     if let Some(warning) = collapse_warning {
         summarization_warnings.push(warning);
     }
@@ -8539,6 +8608,83 @@ pub fn run_post_record_hook(config: &Config, transcript_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_coverage_persists_and_marks_incomplete_work() {
+        let mut coverage = summarize::SummaryCoverage {
+            complete: true,
+            transcript_bytes: 120_000,
+            notes_bytes: 2_000,
+            source_chunks: 3,
+            completed_chunks: 3,
+            detail: "All source chunks delivered.".into(),
+        };
+        let summary = summarize::Summary {
+            text: String::new(),
+            key_points: vec!["Meeting point".into()],
+            decisions: vec![],
+            action_items: vec![],
+            open_questions: vec![],
+            commitments: vec![],
+            participants: vec![],
+        };
+        let rendered = format_summary_with_coverage(&summary, Some(&coverage));
+        assert!(rendered.contains("Meeting point"));
+        assert!(rendered.contains("Agent input coverage: complete"));
+        assert!(rendered.contains("120000 transcript bytes"));
+        assert!(detect_summary_coverage_warning(Some(&coverage)).is_none());
+        coverage.complete = false;
+        coverage.completed_chunks = 1;
+        coverage.detail = "source chunk 2/3 failed".into();
+        let warning = detect_summary_coverage_warning(Some(&coverage)).unwrap();
+        assert_eq!(warning.reason, "summary_coverage_incomplete");
+        assert!(warning.message.unwrap().contains("source chunk 2/3 failed"));
+    }
+
+    #[test]
+    fn enrichment_preserves_edits_before_and_during_summarization() {
+        for edit_during_summary in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let audio_path = dir.path().join("recording.wav");
+            std::fs::write(&audio_path, vec![0u8; 64_044]).unwrap();
+            let mut config = Config {
+                output_dir: dir.path().join("meetings"),
+                ..Config::default()
+            };
+            config.transcription.min_words = 1;
+            config.summarization.engine = "unknown-test-engine".into();
+            config.diarization.engine = "none".into();
+            let context = BackgroundPipelineContext::default();
+            let artifact = write_transcript_artifact(
+                &audio_path,
+                ContentType::Meeting,
+                Some("Revision guard"),
+                &config,
+                &context,
+                None,
+                "[0:00] We agreed to deliver the report on Friday.\n".into(),
+                crate::transcribe::FilterStats::default(),
+                0,
+            )
+            .unwrap();
+            let path = artifact.write_result.path.clone();
+            let edited = format!(
+                "{}\nHuman edit must survive.\n",
+                std::fs::read_to_string(&path).unwrap()
+            );
+            if !edit_during_summary {
+                std::fs::write(&path, &edited).unwrap();
+            }
+            let result =
+                enrich_transcript_artifact(&audio_path, &artifact, &config, &context, |stage| {
+                    if edit_during_summary && matches!(stage, PipelineStage::Summarizing) {
+                        std::fs::write(&path, &edited).unwrap();
+                    }
+                });
+            assert!(result.is_err(), "must refuse to replace a changed artifact");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), edited);
+        }
+    }
 
     #[test]
     fn apple_speech_preference_resolves_through_closed_product_gate() {
