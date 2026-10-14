@@ -17,7 +17,6 @@ use tauri::{
 #[used]
 static PARAKEET_FEATURE_SENTINEL: &[u8] = b"transcribe_parakeet parakeet_helper\0";
 
-mod assistant_skills;
 mod call_capture;
 mod call_detect;
 #[cfg(target_os = "macos")]

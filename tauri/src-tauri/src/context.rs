@@ -4,6 +4,9 @@ use minutes_core::search::{self, SearchFilters};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "assistant_skills.rs"]
+pub(crate) mod assistant_skills;
+
 pub const ACTIVE_MEETING_FILE: &str = "CURRENT_MEETING.md";
 /// General meeting-directory context for a Terminal session that opened
 /// without a selected meeting. Written only after the provider is verified
@@ -180,7 +183,7 @@ fn sync_assistant_skill_mirrors(workspace: &Path) -> Result<(), String> {
     replace_dir_contents(&opencode_root.join("skills"), &bundle.opencode_skills)?;
     replace_dir_contents(&opencode_root.join("commands"), &bundle.opencode_commands)?;
 
-    crate::assistant_skills::sync_claude_skills(workspace, &bundle.agents_skills.join("minutes"))?;
+    assistant_skills::sync_claude_skills(workspace, &bundle.agents_skills.join("minutes"))?;
 
     Ok(())
 }
@@ -929,7 +932,7 @@ mod tests {
             .exists());
         assert_eq!(
             fs::read_to_string(
-                crate::assistant_skills::claude_skill_directory(&workspace)
+                assistant_skills::claude_skill_directory(&workspace)
                     .join(".claude/skills/minutes-prep/SKILL.md")
             )
             .unwrap(),
