@@ -180,6 +180,8 @@ fn sync_assistant_skill_mirrors(workspace: &Path) -> Result<(), String> {
     replace_dir_contents(&opencode_root.join("skills"), &bundle.opencode_skills)?;
     replace_dir_contents(&opencode_root.join("commands"), &bundle.opencode_commands)?;
 
+    crate::assistant_skills::sync_claude_skills(workspace, &bundle.agents_skills.join("minutes"))?;
+
     Ok(())
 }
 
@@ -225,8 +227,8 @@ pub fn create_workspace(config: &Config) -> Result<PathBuf, String> {
     // trees so Recall sees the same Minutes lifecycle skills as the repo.
     sync_assistant_skill_mirrors(&workspace)?;
 
-    // .claude is still user-owned. We keep the existing symlink layout
-    // intact and only refresh the app-managed .agents/.opencode mirrors.
+    // .claude stays user-owned, including legacy global-config symlinks.
+    // Claude loads the managed skill pack via --add-dir at terminal spawn.
 
     // git init on the assistant workspace (idempotent) so agent CLIs discover
     // repo-scoped instruction files like CLAUDE.md and AGENTS.md.
@@ -925,5 +927,13 @@ mod tests {
         assert!(workspace
             .join(".opencode/commands/minutes-prep.md")
             .exists());
+        assert_eq!(
+            fs::read_to_string(
+                crate::assistant_skills::claude_skill_directory(&workspace)
+                    .join(".claude/skills/minutes-prep/SKILL.md")
+            )
+            .unwrap(),
+            "codex prep"
+        );
     }
 }

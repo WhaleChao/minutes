@@ -9978,7 +9978,11 @@ pub fn spawn_terminal(
         let agent_name = agent_override.unwrap_or(&config.assistant.agent);
         let agent_bin = resolve_agent_binary(agent_name).map_err(|err| err.user_message())?;
 
-        let agent_args = filtered_agent_args(agent_name, &config.assistant.agent_args);
+        let agent_args = crate::assistant_skills::terminal_args(
+            agent_name,
+            filtered_agent_args(agent_name, &config.assistant.agent_args),
+            &workspace,
+        );
 
         manager.spawn(
             crate::pty::SpawnConfig {
