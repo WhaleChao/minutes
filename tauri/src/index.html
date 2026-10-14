@@ -14684,6 +14684,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     let recallChatMeetingPath = null;
 
     function applySidebarCollapsed(collapsed, { explicit = false } = {}) {
+      // Never hide the sole pane, including when restoring an old preference.
+      collapsed = collapsed && hasVisibleSecondaryPane();
       // Pin the collapsed (fixed-position) chevron to the exact spot the button
       // occupies while expanded, so collapsing only rotates it — no vertical
       // jump. Measure the in-flow rect BEFORE the pane collapses; on expand,
@@ -14720,6 +14722,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       applySidebarCollapsed(!document.body.classList.contains('sidebar-collapsed'), { explicit: true });
     }
 
+    function hasVisibleSecondaryPane() {
+      // Read rendered pane state instead of later-initialized Recall variables.
+      return !!document.querySelector('#recall-panel.expanded, #md-viewer.active');
+    }
+
     const storedSidebarCollapsed = localStorage.getItem('minutes.sidebarCollapsed') === 'true';
     applySidebarCollapsed(storedSidebarCollapsed);
 
@@ -14738,16 +14745,29 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       const threshold = docOpen ? DOC_OPEN_COLLAPSE_WIDTH : SIDEBAR_AUTO_COLLAPSE_WIDTH;
       const width = window.innerWidth;
       const pinnedCollapsed = localStorage.getItem('minutes.sidebarCollapsed') === 'true';
-      if (width < threshold && !userExpandedSidebarThisSession && !pinnedCollapsed) {
+      const secondaryPaneVisible = hasVisibleSecondaryPane();
+      sidebarCollapseButton.disabled = !secondaryPaneVisible;
+      if (!secondaryPaneVisible) {
+        // Launching narrow or closing the final secondary pane must always
+        // reveal Meetings. Retain the saved preference for the next split view.
+        sidebarAutoCollapsed = false;
+        applySidebarCollapsed(false);
+        sidebarCollapseButton.title = 'Open another pane to collapse the list';
+      } else if (pinnedCollapsed) {
+        sidebarAutoCollapsed = false;
+        applySidebarCollapsed(true);
+      } else if (width < threshold && !userExpandedSidebarThisSession) {
         if (!document.body.classList.contains('sidebar-collapsed')) {
           sidebarAutoCollapsed = true;
-          document.body.classList.add('sidebar-collapsed');
-          sidebarCollapseButton.classList.add('is-collapsed');
+          applySidebarCollapsed(true);
         }
       } else if (width >= threshold && sidebarAutoCollapsed) {
         sidebarAutoCollapsed = false;
-        document.body.classList.remove('sidebar-collapsed');
-        sidebarCollapseButton.classList.remove('is-collapsed');
+        applySidebarCollapsed(false);
+      }
+      if (secondaryPaneVisible) {
+        sidebarCollapseButton.title = document.body.classList.contains('sidebar-collapsed')
+          ? 'Expand list pane' : 'Collapse list pane';
       }
       // A manual expand overrides the policy only while the window is still
       // narrow. Once it is wide again the override has done its job; the next
@@ -15267,6 +15287,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
       applyRecallRatio(getStoredRecallRatio());
       recallPanel.classList.add('expanded');
+      syncNarrowLayout();
       recallPanel.removeAttribute('inert');
       recallPanel.setAttribute('aria-hidden', 'false');
       splitHandle.classList.add('visible');
@@ -15295,6 +15316,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       expandAnimating = true;
 
       recallPanel.classList.remove('expanded');
+      syncNarrowLayout();
       recallPanel.setAttribute('inert', '');
       recallPanel.setAttribute('aria-hidden', 'true');
       splitHandle.classList.remove('visible');
