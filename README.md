@@ -153,6 +153,7 @@ See the [security documentation](docs/security/) and
 - [Security](docs/security/)
 - [Personas](docs/personas.md)
 - [Native call capture recovery](docs/native-capture-recovery.md) (`minutes recover-stem`)
+- [Opt-in automatic call recording](docs/call-auto-record.md) for Teams and Zoom desktop on macOS
 - [MCP tools](https://useminutes.app/docs/mcp/tools)
 - [Error reference](https://useminutes.app/docs/errors)
 - [Agent index](https://useminutes.app/llms.txt)

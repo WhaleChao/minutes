@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minutes_core::config::{CallDetectionConfig, Config};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+
+#[path = "call_auto_record.rs"]
+mod auto_record;
 
 fn log_call_detect_event(
     level: &str,
@@ -292,6 +295,12 @@ struct RunningProcess {
 }
 
 fn process_name_matches_config_app(config_app: &str, process_name: &str) -> bool {
+    // Teams changed its executable name; preserve existing configurations.
+    if minutes_core::config::auto_record_app_id(config_app) == Some("MSTeams")
+        && minutes_core::config::auto_record_app_id(process_name) == Some("MSTeams")
+    {
+        return true;
+    }
     let config_lower = config_app.to_lowercase();
     let process_lower = process_name.to_lowercase();
     // Exact match (most common) or the config name is a prefix/suffix of
@@ -464,6 +473,7 @@ impl CallDetector {
             // Initial delay to let the app finish launching
             std::thread::sleep(Duration::from_secs(5));
 
+            let mut automatic_starts = auto_record::AutomaticStarts::default();
             loop {
                 let config = self.reload_config();
                 if !config.enabled {
@@ -513,7 +523,22 @@ impl CallDetector {
                     input_attribution_available,
                 ) {
                     MinutesAudioPollPolicy::Detect => {}
-                    MinutesAudioPollPolicy::SkipForRecording => continue,
+                    MinutesAudioPollPolicy::SkipForRecording => {
+                        // Remember calls already covered by a manual recording.
+                        // Stopping that recording must not authorize an auto-start.
+                        if config.auto_record {
+                            match self.detect_active_call(&config) {
+                                DetectActiveCallResult::Detected { process_name, .. } => {
+                                    automatic_starts.observe(&process_name, Instant::now(), true);
+                                }
+                                DetectActiveCallResult::None => {
+                                    automatic_starts.observe_no_call(Instant::now())
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
                     MinutesAudioPollPolicy::SkipKeepingActiveCall => {
                         if !self.note_self_audio_skip() {
                             log_call_detect_event(
@@ -538,6 +563,47 @@ impl CallDetector {
                         display_name,
                         process_name,
                     } => {
+                        // One attempt per observed call, including failed or blocked
+                        // starts. Reminders and manual Stop must never restart it.
+                        let should_attempt = automatic_starts.observe(
+                            &process_name,
+                            Instant::now(),
+                            config.auto_record_enabled_for(&process_name),
+                        );
+                        if should_attempt {
+                            let state = app.state::<crate::commands::AppState>();
+                            match crate::commands::start_automatic_call_recording(
+                                app.clone(),
+                                &state,
+                                &process_name,
+                            ) {
+                                Ok(()) => {
+                                    log_call_detect_event(
+                                        "info",
+                                        "auto_record_requested",
+                                        Some(&display_name),
+                                        Some(&process_name),
+                                        serde_json::json!({"source": "native_app_input", "capture": "native_only"}),
+                                    );
+                                    self.note_active_call(&process_name, &display_name);
+                                    continue;
+                                }
+                                Err(reason) => {
+                                    log_call_detect_event(
+                                        "warn",
+                                        "auto_record_skipped",
+                                        Some(&display_name),
+                                        Some(&process_name),
+                                        serde_json::json!({"source": "native_app_input", "reason": reason}),
+                                    );
+                                    crate::commands::show_user_notification(
+                                        &app,
+                                        "Automatic recording did not start",
+                                        &reason,
+                                    );
+                                }
+                            }
+                        }
                         // Call came back (same app): if the previous call
                         // already fired a countdown that the user dismissed
                         // with "Keep recording", clear the latch so a later
@@ -633,6 +699,7 @@ impl CallDetector {
                         );
                     }
                     DetectActiveCallResult::None => {
+                        automatic_starts.observe_no_call(Instant::now());
                         // A countdown already in flight owns the lifecycle.
                         // Without this guard any atomics flip mid-countdown
                         // (recording transiently going false, started_by
@@ -1830,12 +1897,49 @@ fn find_mic_check_binary() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn teams_executable_alias_requires_its_own_input_family() {
+        let processes = vec![
+            RunningProcess {
+                pid: 10,
+                ppid: 1,
+                name: "MSTeams".into(),
+            },
+            RunningProcess {
+                pid: 11,
+                ppid: 10,
+                name: "TeamsAudioHelper".into(),
+            },
+            RunningProcess {
+                pid: 20,
+                ppid: 1,
+                name: "Dictation".into(),
+            },
+        ];
+        assert!(native_app_has_active_input(
+            "Microsoft Teams",
+            &processes,
+            &HashSet::from([11])
+        ));
+        assert!(!native_app_has_active_input(
+            "Microsoft Teams",
+            &processes,
+            &HashSet::from([20])
+        ));
+        assert!(!process_name_matches_config_app(
+            "Microsoft Teams",
+            "MSTeams impostor"
+        ));
+    }
+
     fn test_call_detection_config(apps: Vec<String>) -> CallDetectionConfig {
         CallDetectionConfig {
             enabled: true,
             poll_interval_secs: 1,
             cooldown_minutes: 5,
             apps,
+            auto_record: false,
+            auto_record_apps: vec!["MSTeams".into(), "zoom.us".into()],
             stop_when_call_ends: false,
             call_end_stop_countdown_secs: 30,
         }

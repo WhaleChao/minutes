@@ -108,6 +108,8 @@ pub struct AppState {
     /// on the call detection banner. Scopes `stop_when_call_ends` so manual
     /// `cmd_start_recording` sessions are never auto-stopped.
     pub recording_started_by_call_detect: Arc<AtomicBool>,
+    /// App that authorized this automatic native recording, cleared on every exit.
+    pub auto_record_app: Arc<Mutex<Option<String>>>,
     /// Set by the frontend's "Keep recording" button during an auto-stop
     /// countdown. Read by the countdown thread in `call_detect.rs` to bail
     /// out before calling stop.
@@ -3563,6 +3565,7 @@ fn start_native_call_recording(
     mode: CaptureMode,
     config: &Config,
     requested_title: Option<String>,
+    automatic_app: Option<&str>,
 ) -> Result<(), String> {
     minutes_core::pid::create().map_err(|error| error.to_string())?;
     // Re-check sensitive exclusivity with the PID (the atomic anchor) held;
@@ -3654,6 +3657,19 @@ fn start_native_call_recording(
     crate::sync_tray_state(app_handle);
     minutes_core::notes::save_recording_start().ok();
     maybe_save_and_show_recording_consent(app_handle, mode, config);
+    if let Some(process_name) = automatic_app {
+        minutes_core::logging::log_step(
+            "call_detect",
+            "",
+            0,
+            serde_json::json!({
+                "action": "auto_record_started", "process_name": process_name,
+                "source": "native_app_input", "path": output_path,
+            }),
+        );
+        show_user_notification(app_handle, "Automatic call recording started", &format!("Recording {process_name} with microphone and Mac audio. Stop at any time in Minutes."));
+        crate::show_main_window(app_handle);
+    }
     // Native capture writes audio to per-source stems instead of handing samples
     // to the recording path, so the live sidecar had no source and live
     // consumers received nothing during a call (#576). Tail the stems and feed
@@ -4654,7 +4670,9 @@ fn reserve_recording_launch(state: &AppState) -> Result<(), String> {
     state
         .starting
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-        .map(|_| ())
+        .map(|_| {
+            *state.auto_record_app.lock().unwrap() = None;
+        })
         .map_err(|_| "Already recording".into())
 }
 
@@ -6234,6 +6252,7 @@ fn scan_recovery_items_with_ffmpeg_availability(
 pub struct CallDetectSessionHandles {
     pub started_by_call_detect: Arc<AtomicBool>,
     pub countdown_cancel: Arc<AtomicBool>,
+    pub auto_record_app: Arc<Mutex<Option<String>>>,
 }
 
 /// RAII guard that clears the call-detect session flags when dropped.
@@ -6259,6 +6278,7 @@ impl Drop for CallDetectSessionGuard {
         // observe cancellation and own the state transition; otherwise the
         // detector can see `call_ended` followed by a premature `cleared`.
         self.handles.countdown_cancel.store(true, Ordering::Relaxed);
+        *self.handles.auto_record_app.lock().unwrap() = None;
     }
 }
 
@@ -6287,6 +6307,7 @@ pub fn start_recording(
     crate::dictation_experience::stop_mic_test();
     // Drop on any exit path (early returns, panic, normal exit) clears the
     // session flags so a subsequent manual recording isn't auto-stopped.
+    let automatic_app = call_detect_session.auto_record_app.lock().unwrap().clone();
     let _session_guard = CallDetectSessionGuard::new(call_detect_session);
     let mut config = Config::load();
     if let Some(language) = language_override {
@@ -6336,6 +6357,14 @@ pub fn start_recording(
             call_capture::availability(),
             call_capture::CallCaptureAvailability::Available { .. }
         );
+    // Recheck inside the worker: availability can change after reservation.
+    if automatic_app.is_some() && !native_call_capture_available {
+        let error = "Automatic recording requires native call capture. Open Minutes to check capture access.";
+        set_recording_start_error(&latest_output, error);
+        show_user_notification(&app_handle, "Automatic recording did not start", error);
+        starting.store(false, Ordering::Relaxed);
+        return;
+    }
     if let Some(reason) = &preflight.blocking_reason {
         if !should_bypass_preflight_block_for_native_call_capture(
             &preflight,
@@ -6375,11 +6404,24 @@ pub fn start_recording(
             mode,
             &config,
             requested_title.clone(),
+            automatic_app.as_deref(),
         ) {
             Ok(()) => {
                 return;
             }
             Err(error) => {
+                if automatic_app.is_some() {
+                    let detail = format!("Automatic native call recording failed: {error}");
+                    set_recording_start_error(&latest_output, &detail);
+                    show_user_notification(
+                        &app_handle,
+                        "Automatic recording did not start",
+                        &detail,
+                    );
+                    starting.store(false, Ordering::Relaxed);
+                    recording.store(false, Ordering::Relaxed);
+                    return;
+                }
                 eprintln!("Native call recording unavailable, falling back: {}", error);
                 minutes_core::logging::log_error(
                     "desktop_native_call_start",
@@ -6777,6 +6819,7 @@ fn spawn_reserved_recording(
     let call_detect_session = CallDetectSessionHandles {
         started_by_call_detect: state.recording_started_by_call_detect.clone(),
         countdown_cancel: state.call_end_countdown_cancel.clone(),
+        auto_record_app: state.auto_record_app.clone(),
     };
     let app_done = app.clone();
     mark_activation_first_recording_started(&activation_progress);
@@ -7102,6 +7145,42 @@ pub fn handle_dictation_shortcut_event(
     }
 }
 
+/// Backend-owned auto-start works even when the main webview is hidden.
+/// Consent Require remains a manual action; no modal confirmation is inferred.
+pub fn start_automatic_call_recording(
+    app: tauri::AppHandle,
+    state: &AppState,
+    process_name: &str,
+) -> Result<(), String> {
+    let config = Config::load_strict().map_err(|e| e.to_string())?;
+    if !config.call_detection.auto_record_enabled_for(process_name) {
+        return Err("Automatic recording is off for this app.".into());
+    }
+    if desktop_recording_consent_required(CaptureMode::Meeting, &config, false).is_some() {
+        return Err("Confirm recording consent in Minutes to start this call.".into());
+    }
+    let plan = cmd_live_capture_plan();
+    if !plan.both_sides {
+        return Err(plan
+            .reason
+            .unwrap_or_else(|| "Native call capture is unavailable.".into()));
+    }
+    prepare_cmd_recording_launch(state, true)?;
+    *state.auto_record_app.lock().unwrap() = Some(process_name.to_string());
+    spawn_reserved_recording(
+        app,
+        state,
+        CaptureMode::Meeting,
+        Some(RecordingIntent::Call),
+        false,
+        None,
+        None,
+        None,
+        None,
+    );
+    Ok(())
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_start_recording(
@@ -7421,6 +7500,7 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
         "updateState": update_state,
         "latestOutput": latest_output,
         "callCaptureHealth": call_capture_health,
+        "autoRecordApp": if recording || starting { state.auto_record_app.lock().ok().and_then(|value| value.clone()) } else { None },
         "configWarning": Config::load_strict().err().map(|error| {
             let defaults = Config::default();
             serde_json::json!({
@@ -13081,6 +13161,8 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "apps": config.call_detection.apps,
             "google_meet_enabled": call_detection_has_sentinel(&config, "google-meet"),
             "teams_web_enabled": call_detection_has_sentinel(&config, "teams-web"),
+            "auto_record": config.call_detection.auto_record,
+            "auto_record_apps": config.call_detection.auto_record_apps,
             "stop_when_call_ends": config.call_detection.stop_when_call_ends,
             "call_end_stop_countdown_secs": config.call_detection.call_end_stop_countdown_secs,
         },
@@ -13463,6 +13545,24 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
         }
         ("call_detection", "teams_web_enabled") => {
             set_call_detection_sentinel(&mut config, "teams-web", value == "true");
+        }
+        ("call_detection", "auto_record") => {
+            config.call_detection.auto_record = value
+                .parse::<bool>()
+                .map_err(|_| "auto_record must be true or false")?;
+        }
+        ("call_detection", "auto_record_apps") => {
+            let names: Vec<String> = serde_json::from_str(&value)
+                .map_err(|_| "auto_record_apps must be a JSON array")?;
+            let mut apps = Vec::new();
+            for name in names {
+                let id = minutes_core::config::auto_record_app_id(&name)
+                    .ok_or("Auto-record supports Teams and Zoom desktop only.")?;
+                if !apps.iter().any(|app| app == id) {
+                    apps.push(id.to_string());
+                }
+            }
+            config.call_detection.auto_record_apps = apps;
         }
         ("call_detection", "stop_when_call_ends") => {
             config.call_detection.stop_when_call_ends = value == "true";
@@ -14519,6 +14619,7 @@ mod tests {
             palette_reopen_pending: Arc::new(AtomicBool::new(false)),
             pending_meeting_prompts: Arc::new(Mutex::new(HashMap::new())),
             recording_started_by_call_detect: Arc::new(AtomicBool::new(false)),
+            auto_record_app: Arc::new(Mutex::new(None)),
             call_end_countdown_cancel: Arc::new(AtomicBool::new(false)),
             call_end_countdown_active: Arc::new(AtomicBool::new(false)),
             call_end_countdown_terminal_state: Arc::new(AtomicU8::new(0)),
@@ -17978,6 +18079,23 @@ mod tests {
         assert_eq!(notice.title, "Recording not started");
         assert_eq!(notice.path, "");
         assert_eq!(notice.detail, "ScreenCaptureKit tap unavailable");
+    }
+
+    #[test]
+    fn automatic_recording_metadata_clears_on_early_exit() {
+        let app = Arc::new(Mutex::new(Some("MSTeams".into())));
+        let started = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = CallDetectSessionGuard::new(CallDetectSessionHandles {
+                started_by_call_detect: started.clone(),
+                countdown_cancel: cancel.clone(),
+                auto_record_app: app.clone(),
+            });
+        }
+        assert!(app.lock().unwrap().is_none());
+        assert!(!started.load(Ordering::Relaxed));
+        assert!(cancel.load(Ordering::Relaxed));
     }
 
     #[test]
