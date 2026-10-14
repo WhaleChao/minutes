@@ -45,6 +45,7 @@ fn log_call_detect_event(
 /// State for the call detection background loop.
 pub struct CallDetector {
     config: Mutex<CallDetectionConfig>,
+    input_cache: Mutex<Option<CachedAudioInput>>,
     /// Last observed active call session. We still re-arm on call end/start,
     /// but we also re-notify the same active app after a short interval so
     /// back-to-back meetings and sticky Zoom states don't go silent forever.
@@ -402,6 +403,7 @@ impl CallDetector {
     pub fn new(config: CallDetectionConfig) -> Self {
         Self {
             config: Mutex::new(config),
+            input_cache: Mutex::new(None),
             active_call: Mutex::new(None),
             browser_probe_next_allowed_at: Mutex::new(None),
             browser_probe_backoff_until: Mutex::new(HashMap::new()),
@@ -461,12 +463,15 @@ impl CallDetector {
         );
 
         std::thread::spawn(move || {
+            let mut input_probe = AudioInputProbe::default();
             // Initial delay to let the app finish launching
             std::thread::sleep(Duration::from_secs(5));
 
             loop {
                 let config = self.reload_config();
                 if !config.enabled {
+                    *self.input_cache.lock().unwrap() = None;
+                    input_probe.client = None;
                     if let Some(previous) = self.clear_active_call() {
                         log_call_detect_event(
                             "info",
@@ -503,8 +508,19 @@ impl CallDetector {
                 // the other side (#1110). Keep detecting when input attribution
                 // can rule out Minutes' own audio, and never drop a call that
                 // was detected before the session started.
-                let input_attribution_available =
-                    minutes_audio_active && !is_recording && active_input_process_pids().is_some();
+                // Skip owned recordings before collecting any CoreAudio state.
+                if is_recording && !(started_by_call_detect && config.stop_when_call_ends) {
+                    continue;
+                }
+                let processes = running_processes();
+                let input = call_input_snapshot(
+                    &config,
+                    &processes,
+                    &mut self.input_cache.lock().unwrap(),
+                    Instant::now(),
+                    |attribution| input_probe.sample(attribution),
+                );
+                let input_attribution_available = input.active_input_pids.is_some();
                 match decide_minutes_audio_poll_policy(
                     is_recording,
                     minutes_audio_active,
@@ -533,7 +549,7 @@ impl CallDetector {
                 }
                 self.reset_self_audio_skip();
 
-                match self.detect_active_call(&config) {
+                match self.detect_active_call(&config, &processes, &input) {
                     DetectActiveCallResult::Detected {
                         display_name,
                         process_name,
@@ -882,20 +898,21 @@ impl CallDetector {
     }
 
     /// Check if any configured call app is active.
-    fn detect_active_call(&self, config: &CallDetectionConfig) -> DetectActiveCallResult {
-        let processes = running_processes();
-        let active_input_pids = active_input_process_pids();
-        let mic_live = active_input_pids
-            .as_ref()
-            .map(|pids| !pids.is_empty())
-            .unwrap_or_else(is_mic_in_use);
+    fn detect_active_call(
+        &self,
+        config: &CallDetectionConfig,
+        processes: &[RunningProcess],
+        input: &AudioInputSnapshot,
+    ) -> DetectActiveCallResult {
+        let mic_live = input.mic_live;
+        let active_input_pids = input.active_input_pids.as_ref();
         let mic_just_activated = self.note_mic_state(mic_live);
 
         self.detect_active_call_from_process_snapshot(
             config,
             mic_live,
-            &processes,
-            active_input_pids.as_ref(),
+            processes,
+            active_input_pids,
             mic_just_activated,
             |detector, running, has_google_meet, has_teams_web| {
                 if has_google_meet || has_teams_web {
@@ -908,8 +925,8 @@ impl CallDetector {
                             browser_hit_has_active_input(
                                 browser,
                                 mic_live,
-                                Some(processes.as_slice()),
-                                active_input_pids.as_ref(),
+                                Some(processes),
+                                active_input_pids,
                             )
                         },
                     ))
@@ -1752,58 +1769,213 @@ fn process_snapshots_from_ps_output(text: &str) -> Vec<RunningProcess> {
         .collect()
 }
 
-/// Check if any audio input is currently being used.
-///
-/// Uses a pre-compiled Swift helper that queries CoreAudio process input
-/// activity and falls back to scanning input-capable devices. This catches
-/// call apps that capture from a non-default input route.
-///
-/// Falls back to an inline `swift` invocation if the helper binary is missing.
-fn is_mic_in_use() -> bool {
-    // Try the pre-compiled helper first (fast: ~5ms)
-    let helper = find_mic_check_binary();
-    if let Some(path) = &helper {
-        if let Ok(out) = std::process::Command::new(path).output() {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                return text == "1";
-            }
+/// Device state plus bounded attribution, shared by self-audio and detection.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioInputSnapshot {
+    mic_live: bool,
+    device_active: Option<bool>,
+    active_input_pids: Option<HashSet<u32>>,
+}
+
+impl AudioInputSnapshot {
+    fn inactive() -> Self {
+        Self {
+            mic_live: false,
+            device_active: Some(false),
+            // No candidate app needs attribution. This also lets a vanished
+            // call clear normally while Minutes is holding the microphone.
+            active_input_pids: Some(HashSet::new()),
         }
-    }
-
-    // Fallback: inline swift (slower: ~200ms, but always works)
-    let output = std::process::Command::new("swift")
-        .arg("-e")
-        .arg(include_str!("mic_check.swift"))
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "1",
-        _ => false,
     }
 }
 
-fn active_input_process_pids() -> Option<HashSet<u32>> {
-    let helper = find_mic_check_binary()?;
-    let out = std::process::Command::new(helper)
-        .arg("--active-input-pids")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+// Attribution can provoke TCC checks for every CoreAudio process object.
+// Keep device checks on the configured cadence, but bound that expensive
+// query to once per five seconds for an unchanged app process family.
+const INPUT_ATTRIBUTION_INTERVAL: Duration = Duration::from_secs(5);
+
+struct CachedAudioInput {
+    candidates: Vec<RunningProcess>,
+    sampled_at: Instant,
+    input: AudioInputSnapshot,
+}
+
+fn call_candidate_processes(
+    config: &CallDetectionConfig,
+    processes: &[RunningProcess],
+) -> Vec<RunningProcess> {
+    let mut pids = HashSet::new();
+    for app in &config.apps {
+        if !matches!(app.as_str(), "google-meet" | "teams-web") {
+            pids.extend(native_app_candidate_process_pids(app, processes));
+        }
+    }
+    if config
+        .apps
+        .iter()
+        .any(|app| matches!(app.as_str(), "google-meet" | "teams-web"))
+    {
+        let lower: Vec<String> = processes.iter().map(|p| p.name.to_lowercase()).collect();
+        for browser in browsers_to_probe(&lower) {
+            pids.extend(native_app_candidate_process_pids(
+                browser.app_name,
+                processes,
+            ));
+        }
+    }
+    let mut candidates: Vec<_> = processes
+        .iter()
+        .filter(|p| pids.contains(&p.pid))
+        .cloned()
+        .collect();
+    candidates.sort_by_key(|p| p.pid);
+    candidates
+}
+
+fn call_input_snapshot(
+    config: &CallDetectionConfig,
+    processes: &[RunningProcess],
+    cache: &mut Option<CachedAudioInput>,
+    now: Instant,
+    probe: impl FnOnce(bool) -> Option<AudioInputSnapshot>,
+) -> AudioInputSnapshot {
+    let candidates = call_candidate_processes(config, processes);
+    if candidates.is_empty() {
+        *cache = None;
+        return AudioInputSnapshot::inactive();
+    }
+    let attribution_due = cache.as_ref().is_none_or(|cached| {
+        cached.candidates != candidates
+            || now.duration_since(cached.sampled_at) >= INPUT_ATTRIBUTION_INTERVAL
+    });
+    let sampled = probe(attribution_due);
+    if attribution_due {
+        let input = sampled.unwrap_or_default();
+        *cache = (input.device_active != Some(false)).then(|| CachedAudioInput {
+            candidates,
+            sampled_at: now,
+            input: input.clone(),
+        });
+        return input;
+    }
+    if sampled
+        .as_ref()
+        .is_some_and(|input| input.device_active == Some(false))
+    {
+        // A definitely idle device ends a call immediately and invalidates
+        // attribution. The next active input gets a fresh sample, even
+        // inside the five-second window.
+        *cache = None;
+        return AudioInputSnapshot::inactive();
+    }
+    // Unknown device state does not invent a call end. Reuse only the
+    // bounded, unchanged-family sample, then retry attribution when due.
+    cache.as_ref().unwrap().input.clone()
+}
+
+/// A persistent CoreAudio client avoids the TCC checks caused by initializing
+/// a fresh helper every second. Requests and replies remain bounded: a stuck
+/// helper is killed after two seconds and a later poll may start a new one.
+#[derive(Default)]
+struct AudioInputProbe {
+    client: Option<AudioInputClient>,
+}
+
+struct AudioInputClient {
+    child: std::process::Child,
+    replies: std::sync::mpsc::Receiver<std::io::Result<String>>,
+}
+
+impl Drop for AudioInputClient {
+    fn drop(&mut self) {
+        // Only the child we spawned is in scope. Close stdin on app exit and
+        // kill on explicit disable, timeout, malformed reply, or transport EOF.
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+impl AudioInputProbe {
+    fn sample(&mut self, attribution: bool) -> Option<AudioInputSnapshot> {
+        let result = self.request(attribution);
+        if result.is_none() {
+            self.client = None;
+        }
+        result
     }
 
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut pids = HashSet::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    fn request(&mut self, attribution: bool) -> Option<AudioInputSnapshot> {
+        use std::io::Write;
+        if self.client.is_none() {
+            self.client = Some(AudioInputClient::spawn()?);
         }
-        let pid = trimmed.parse().ok()?;
-        pids.insert(pid);
+        let client = self.client.as_mut()?;
+        let stdin = client.child.stdin.as_mut()?;
+        stdin
+            .write_all(if attribution { b"full\n" } else { b"device\n" })
+            .ok()?;
+        stdin.flush().ok()?;
+        let line = client
+            .replies
+            .recv_timeout(Duration::from_secs(2))
+            .ok()?
+            .ok()?;
+        if attribution {
+            serde_json::from_str(&line).ok()
+        } else {
+            match line.trim() {
+                "0" => Some(AudioInputSnapshot::inactive()),
+                "1" => Some(AudioInputSnapshot {
+                    mic_live: true,
+                    device_active: Some(true),
+                    active_input_pids: None,
+                }),
+                // Unknown device state preserves only the bounded previous
+                // attribution sample, and does not restart a healthy helper.
+                "unknown" => Some(AudioInputSnapshot::default()),
+                _ => None,
+            }
+        }
     }
-    Some(pids)
+}
+
+impl AudioInputClient {
+    fn spawn() -> Option<Self> {
+        let mut command = if let Some(helper) = find_mic_check_binary() {
+            std::process::Command::new(helper)
+        } else {
+            let mut command = std::process::Command::new("swift");
+            command
+                .arg("-e")
+                .arg(include_str!("mic_check.swift"))
+                .arg("--");
+            command
+        };
+        command.arg("--serve-call-input");
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_command(command: &mut std::process::Command) -> Option<Self> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let (sender, replies) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(Self { child, replies })
+    }
 }
 
 /// Find the pre-compiled mic_check binary.
@@ -2489,10 +2661,312 @@ mod tests {
     }
 
     #[test]
+    fn no_candidate_never_probes_core_audio() {
+        let config = test_call_detection_config(vec!["zoom.us".into(), "google-meet".into()]);
+        for processes in [
+            vec![],
+            vec![process(1, 0, "com.apple.FaceTime.FTConversationService")],
+            vec![process(2, 0, "SafariBookmarksSyncAgent")],
+            vec![process(3, 0, "zoomish"), process(4, 0, "dictation-tool")],
+        ] {
+            let input = call_input_snapshot(&config, &processes, &mut None, Instant::now(), |_| {
+                panic!("unexpected audio probe")
+            });
+            assert!(!input.mic_live);
+            assert_eq!(input.active_input_pids, Some(HashSet::new()));
+        }
+    }
+
+    #[test]
+    fn browsers_only_trigger_audio_probe_for_enabled_web_providers() {
+        let chrome = vec![process(1, 0, "Google Chrome")];
+        let native_only = test_call_detection_config(vec!["zoom.us".into()]);
+        call_input_snapshot(&native_only, &chrome, &mut None, Instant::now(), |_| {
+            panic!("web detection is disabled")
+        });
+        for provider in ["google-meet", "teams-web"] {
+            let config = test_call_detection_config(vec![provider.into()]);
+            let calls = std::cell::Cell::new(0);
+            let input = call_input_snapshot(&config, &chrome, &mut None, Instant::now(), |_| {
+                calls.set(calls.get() + 1);
+                Some(AudioInputSnapshot::inactive())
+            });
+            assert_eq!(calls.get(), 1);
+            assert!(!input.mic_live);
+        }
+    }
+
+    #[test]
+    fn one_audio_probe_is_shared_with_live_and_native_detection() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let detector = CallDetector::new(config.clone());
+        let processes = vec![process(1, 0, "zoom.us"), process(2, 1, "audio-child")];
+        let calls = std::cell::Cell::new(0);
+        let input = call_input_snapshot(&config, &processes, &mut None, Instant::now(), |_| {
+            calls.set(calls.get() + 1);
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: Some(HashSet::from([2])),
+            })
+        });
+        assert_eq!(
+            decide_minutes_audio_poll_policy(
+                false,
+                true,
+                false,
+                false,
+                input.active_input_pids.is_some()
+            ),
+            MinutesAudioPollPolicy::Detect
+        );
+        assert_eq!(
+            detector.detect_active_call(&config, &processes, &input),
+            DetectActiveCallResult::Detected {
+                display_name: "Zoom".into(),
+                process_name: "zoom.us".into()
+            }
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_device_sample_ends_detection_without_reusing_old_attribution() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let detector = CallDetector::new(config.clone());
+        let processes = vec![process(1, 0, "zoom.us")];
+        let active = AudioInputSnapshot {
+            mic_live: true,
+            device_active: Some(true),
+            active_input_pids: Some(HashSet::from([1])),
+        };
+        assert!(matches!(
+            detector.detect_active_call(&config, &processes, &active),
+            DetectActiveCallResult::Detected { .. }
+        ));
+        assert_eq!(
+            detector.detect_active_call(&config, &processes, &AudioInputSnapshot::inactive()),
+            DetectActiveCallResult::None
+        );
+    }
+
+    #[test]
+    fn failed_attribution_does_not_retry_or_validate_native_app() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let detector = CallDetector::new(config.clone());
+        let processes = vec![process(1, 0, "zoom.us")];
+        let calls = std::cell::Cell::new(0);
+        let input = call_input_snapshot(&config, &processes, &mut None, Instant::now(), |_| {
+            calls.set(calls.get() + 1);
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: None,
+            })
+        });
+        assert_eq!(
+            decide_minutes_audio_poll_policy(
+                false,
+                true,
+                false,
+                false,
+                input.active_input_pids.is_some()
+            ),
+            MinutesAudioPollPolicy::SkipKeepingActiveCall
+        );
+        assert_eq!(
+            detector.detect_active_call(&config, &processes, &input),
+            DetectActiveCallResult::None
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unchanged_family_limits_attribution_to_once_per_five_seconds() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let processes = vec![process(1, 0, "zoom.us")];
+        let mut cache = None;
+        let now = Instant::now();
+        let mut full_queries = 0;
+        for seconds in 0..11 {
+            let input = call_input_snapshot(
+                &config,
+                &processes,
+                &mut cache,
+                now + Duration::from_secs(seconds),
+                |attribution| {
+                    if attribution {
+                        full_queries += 1;
+                    }
+                    Some(AudioInputSnapshot {
+                        mic_live: true,
+                        device_active: Some(true),
+                        active_input_pids: attribution.then(|| HashSet::from([1])),
+                    })
+                },
+            );
+            assert_eq!(input.active_input_pids, Some(HashSet::from([1])));
+        }
+        assert_eq!(full_queries, 3);
+    }
+
+    #[test]
+    fn changed_call_family_refreshes_but_unrelated_process_does_not() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let mut processes = vec![process(1, 0, "zoom.us")];
+        let mut cache = None;
+        let now = Instant::now();
+        call_input_snapshot(&config, &processes, &mut cache, now, |full| {
+            assert!(full);
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: Some(HashSet::from([1])),
+            })
+        });
+        processes.push(process(2, 0, "another-tool"));
+        call_input_snapshot(&config, &processes, &mut cache, now, |full| {
+            assert!(!full);
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: None,
+            })
+        });
+        processes.push(process(3, 1, "audio-child"));
+        call_input_snapshot(&config, &processes, &mut cache, now, |full| {
+            assert!(full);
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: Some(HashSet::from([3])),
+            })
+        });
+    }
+
+    #[test]
+    fn device_idle_invalidates_attribution_and_next_input_refreshes_immediately() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let processes = vec![process(1, 0, "zoom.us")];
+        let mut cache = None;
+        let now = Instant::now();
+        for active in [true, false, true] {
+            let had_cache = cache.is_some();
+            let input = call_input_snapshot(&config, &processes, &mut cache, now, |full| {
+                assert_eq!(full, !had_cache);
+                Some(if active {
+                    AudioInputSnapshot {
+                        mic_live: true,
+                        device_active: Some(true),
+                        active_input_pids: full.then(|| HashSet::from([1])),
+                    }
+                } else {
+                    AudioInputSnapshot::inactive()
+                })
+            });
+            assert_eq!(input.mic_live, active);
+            assert_eq!(cache.is_some(), active);
+        }
+        // An initially idle device also leaves no stale attribution behind.
+        cache = None;
+        call_input_snapshot(&config, &processes, &mut cache, now, |_| {
+            Some(AudioInputSnapshot::inactive())
+        });
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn unknown_device_state_keeps_only_a_bounded_sample_and_app_exit_clears_it() {
+        let config = test_call_detection_config(vec!["zoom.us".into()]);
+        let processes = vec![process(1, 0, "zoom.us")];
+        let mut cache = None;
+        let now = Instant::now();
+        call_input_snapshot(&config, &processes, &mut cache, now, |_| {
+            Some(AudioInputSnapshot {
+                mic_live: true,
+                device_active: Some(true),
+                active_input_pids: Some(HashSet::from([1])),
+            })
+        });
+        assert!(
+            call_input_snapshot(&config, &processes, &mut cache, now, |full| {
+                assert!(!full);
+                None
+            })
+            .mic_live
+        );
+        assert!(
+            !call_input_snapshot(
+                &config,
+                &processes,
+                &mut cache,
+                now + INPUT_ATTRIBUTION_INTERVAL,
+                |full| {
+                    assert!(full);
+                    None
+                }
+            )
+            .mic_live
+        );
+        call_input_snapshot(&config, &[], &mut cache, now, |_| panic!("no call app"));
+        assert!(cache.is_none());
+    }
+
+    #[cfg(unix)]
+    fn transport_probe(script: &str) -> AudioInputProbe {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        AudioInputProbe {
+            client: AudioInputClient::spawn_command(&mut command),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_helper_reuses_one_process_for_multiple_requests() {
+        let mut probe = transport_probe(
+            r#"while read mode; do
+            if [ "$mode" = full ]; then
+                printf '%s\n' '{"mic_live":true,"device_active":true,"active_input_pids":[42]}'
+            else printf '1\n'; fi
+        done"#,
+        );
+        let pid = probe.client.as_ref().unwrap().child.id();
+        for attribution in [true, false, true] {
+            let input = probe.sample(attribution).unwrap();
+            assert!(input.mic_live);
+            assert_eq!(input.active_input_pids.is_some(), attribution);
+            assert_eq!(probe.client.as_ref().unwrap().child.id(), pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_input_helper_is_killed_and_reaped_after_deadline() {
+        let mut probe = transport_probe("exec sleep 30");
+        let pid = probe.client.as_ref().unwrap().child.id();
+        let start = Instant::now();
+        assert!(probe.sample(true).is_none());
+        assert!(probe.client.is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_input_reply_and_transport_eof_discard_client() {
+        for script in ["read mode; printf 'bad-json\\n'; exec sleep 30", "exit 0"] {
+            let mut probe = transport_probe(script);
+            assert!(probe.sample(true).is_none());
+            assert!(probe.client.is_none());
+        }
+    }
+
+    #[test]
     fn mic_check_does_not_panic() {
         // Just verify the function returns without crashing.
         // Will return false unless something is using the mic right now.
-        let _result = is_mic_in_use();
+        let _result = AudioInputProbe::default().sample(true);
     }
 
     #[test]
