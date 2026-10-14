@@ -161,6 +161,10 @@ jobs:
             target
           key: ${{ runner.os }}-${{ steps.runner-image.outputs.scope }}-cargo-noincr-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Test macOS call-detection device and attribution boundary
+        if: runner.os == 'macOS'
+        run: python3 scripts/test_mic_check.py
+
       - name: Build core (no whisper)
         run: cargo build -p minutes-core --no-default-features
 

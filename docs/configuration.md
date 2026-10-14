@@ -134,7 +134,7 @@ keep_after_summary = false # Delete screenshots after summarization (default: cl
 
 [call_detection]
 enabled = true            # macOS-only today
-poll_interval_secs = 1
+poll_interval_secs = 1     # device/app checks; input attribution refreshes every 5s
 cooldown_minutes = 5
 # Default apps stay conservative:
 # apps = ["zoom.us", "Microsoft Teams", "Webex"]
