@@ -188,11 +188,14 @@ try {
     const recallDevMode = false;
     const applyRecallMode = () => {};
     const registerChatListeners = async () => {};
+    const syncNarrowLayout = () => window.fixture.syncLayout?.();
     const input = document.getElementById('recall-chat-input');
     input.value = 'Unsent draft';
     input.focus();
     const { expandRecallPanel, collapseRecallPanel } = eval('(function(){' + code
       + ';return {expandRecallPanel,collapseRecallPanel};})()');
+    window.fixture.openRecall = expandRecallPanel;
+    window.fixture.closeRecall = collapseRecallPanel;
     await collapseRecallPanel();
     await new Promise(done => setTimeout(done, 150));
     input.focus();
@@ -208,7 +211,7 @@ try {
 
   // The isolated streaming fixture must not mask the real sidebar/document
   // flex layout. Reuse the production shell and its responsive policy here.
-  const policyStart = source.indexOf('    const SIDEBAR_AUTO_COLLAPSE_WIDTH =');
+  const policyStart = source.indexOf('    function applySidebarCollapsed(');
   const policyEnd = source.indexOf('    syncNarrowLayout();', policyStart);
   assert.ok(policyStart > 0 && policyEnd > policyStart, 'Production responsive policy markers exist');
   await page.evaluate(code => {
@@ -225,7 +228,9 @@ try {
     let sidebarAutoCollapsed = false;
     let userExpandedSidebarThisSession = false;
     const sidebarCollapseButton = document.getElementById('btn-sidebar-collapse');
-    window.fixture.syncLayout = eval('(function(){' + code + ';return syncNarrowLayout;})()');
+    const policy = eval('(function(){' + code + ';return {syncNarrowLayout,applySidebarCollapsed};})()');
+    window.fixture.syncLayout = policy.syncNarrowLayout;
+    window.fixture.collapseSidebar = policy.applySidebarCollapsed;
   }, source.slice(policyStart, policyEnd));
   for (const width of [960, 1100, 640]) {
     await page.setViewportSize({ width, height: 780 });
@@ -238,6 +243,82 @@ try {
     assert.ok(composer && composer.width > 150 && composer.x + composer.width <= width + 1,
       `production-shell composer fits ${width}px viewport`);
   }
+  // A secondary pane is required before hiding the primary Meetings pane.
+  // Use the shipped policy and Recall transitions, including persisted state,
+  // rather than a parallel model of the responsive rules.
+  await page.evaluate(() => window.fixture.closeRecall());
+  await page.waitForTimeout(150);
+  await page.evaluate(() => {
+    document.getElementById('md-viewer').classList.remove('active');
+    document.body.classList.remove('doc-open', 'sidebar-collapsed');
+    document.getElementById('recall-panel').classList.remove('expanded');
+    localStorage.removeItem('minutes.sidebarCollapsed');
+  });
+  const primaryVisible = async () => {
+    assert.equal(await page.locator('#btn-record').isVisible(), true, 'primary recording control remains visible');
+    assert.equal(await page.locator('#btn-assistant').isVisible(), true, 'Recall remains reachable from primary pane');
+    assert.equal(await page.evaluate(() => document.body.classList.contains('sidebar-collapsed')), false);
+    const solePane = await page.evaluate(() => !document.querySelector('#recall-panel.expanded, #md-viewer.active'));
+    if (solePane) {
+      const box = await page.locator('#btn-record').boundingBox();
+      const width = await page.evaluate(() => window.innerWidth);
+      assert.ok(box && box.x >= 0 && box.x + box.width <= width, 'primary recording control fits the narrow window');
+      assert.equal(await page.locator('#btn-sidebar-collapse').isDisabled(), true, 'sole pane cannot be collapsed');
+    }
+  };
+  for (const width of [460, 560, 700, 900]) {
+    await page.setViewportSize({ width, height: 780 });
+    await page.evaluate(() => window.fixture.syncLayout());
+    await primaryVisible();
+  }
+  await page.setViewportSize({ width: 560, height: 780 });
+  await page.evaluate(() => window.fixture.collapseSidebar(true, { explicit: true }));
+  await primaryVisible();
+  await page.evaluate(() => {
+    localStorage.setItem('minutes.sidebarCollapsed', 'true');
+    window.fixture.collapseSidebar(true); // Saved collapse on startup.
+    window.fixture.syncLayout();
+  });
+  await primaryVisible();
+  assert.equal(await page.evaluate(() => localStorage.getItem('minutes.sidebarCollapsed')), 'true', 'saved preference survives while the sole pane stays usable');
+  await page.evaluate(() => window.fixture.openRecall());
+  assert.equal(await page.evaluate(() => document.body.classList.contains('sidebar-collapsed')), true, 'saved collapse applies when Recall becomes visible');
+  assert.equal(await page.locator('#recall-panel').isVisible(), true);
+  await page.evaluate(() => window.fixture.closeRecall());
+  await page.waitForTimeout(150);
+  await primaryVisible(); // Actual close handler, without a resize event.
+  await page.evaluate(() => {
+    document.getElementById('md-viewer').classList.add('active');
+    document.body.classList.add('doc-open');
+    window.fixture.syncLayout();
+  });
+  assert.equal(await page.evaluate(() => document.body.classList.contains('sidebar-collapsed')), true);
+  assert.equal(await page.locator('#md-viewer').isVisible(), true, 'document may replace the list');
+  await page.evaluate(() => {
+    document.getElementById('md-viewer').classList.remove('active');
+    document.body.classList.remove('doc-open');
+    window.fixture.syncLayout(); // Same call made by the document close path.
+  });
+  await primaryVisible();
+  await page.evaluate(() => {
+    localStorage.removeItem('minutes.sidebarCollapsed');
+    document.getElementById('recall-panel').classList.add('expanded');
+    window.fixture.syncLayout();
+  });
+  // A prior manual expansion is respected until the window becomes wide.
+  await page.setViewportSize({ width: 900, height: 780 });
+  await page.evaluate(() => window.fixture.syncLayout());
+  await page.setViewportSize({ width: 560, height: 780 });
+  await page.evaluate(() => window.fixture.syncLayout());
+  assert.equal(await page.evaluate(() => document.body.classList.contains('sidebar-collapsed')), true, 'automatic narrow collapse still works with Recall visible');
+  await page.evaluate(() => window.fixture.collapseSidebar(false, { explicit: true }));
+  await page.evaluate(() => window.fixture.syncLayout());
+  await primaryVisible(); // Manual expansion still overrides narrow policy.
+  await page.evaluate(() => {
+    document.getElementById('recall-panel').classList.remove('expanded');
+    window.fixture.syncLayout();
+  });
+  await primaryVisible();
   if (process.env.MINUTES_DESKTOP_SCREENSHOT) {
     mkdirSync(dirname(resolve(process.env.MINUTES_DESKTOP_SCREENSHOT)), {recursive:true});
     await page.screenshot({path:resolve(process.env.MINUTES_DESKTOP_SCREENSHOT)});
