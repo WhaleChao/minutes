@@ -7179,9 +7179,25 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
+            <div class="about-controls-copy">Record detected calls automatically</div>
+            <div class="about-controls-meta">Opt in to recording your microphone and Mac audio for selected desktop apps. Requires call detection and native capture access. Stop at any time. If consent confirmation is required, start manually.</div>
+          </div>
+          <button class="btn btn-secondary btn-sm toggle-btn" id="settings-call-auto-record">Off</button>
+        </div>
+        <div class="about-controls">
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Apps to record automatically</div>
+            <div class="about-controls-meta">Other apps and browser calls keep their manual start.</div>
+            <div class="about-controls-copy"><label><input type="checkbox" id="settings-call-auto-teams"> Microsoft Teams desktop</label></div>
+            <div class="about-controls-copy"><label><input type="checkbox" id="settings-call-auto-zoom"> Zoom desktop</label></div>
+            <div class="about-controls-meta" id="settings-call-auto-status" role="status"></div>
+          </div>
+        </div>
+        <div class="about-controls">
+          <div class="about-controls-group">
             <div class="about-controls-copy">Stop when call ends</div>
             <div class="about-controls-meta">When the detected call app exits mid-recording, show a countdown prompt
-              with Stop now and Keep recording. Only applies to recordings started from the call-detection banner.</div>
+              with Stop now and Keep recording. Applies to automatic recordings and recordings started from the call-detection banner.</div>
           </div>
           <button class="btn btn-secondary btn-sm toggle-btn" id="settings-call-detection-stop-when-call-ends">Off</button>
         </div>
@@ -8640,7 +8656,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           recordingBar.classList.remove('active');
           processingBar.classList.add('active');
           processingBar.classList.remove('has-jobs');
-          processingTitle.textContent = activeCallSession && !activeCallSession.dismissed
+          processingTitle.textContent = status.autoRecordApp ? `Starting automatic ${status.autoRecordApp} recording` : activeCallSession && !activeCallSession.dismissed
             ? 'Starting call recording'
             : currentProcessingTitle(mode).replace('Processing', 'Starting');
           processingStage.textContent = activeCallSession && !activeCallSession.dismissed
@@ -8660,6 +8676,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           const callHealth = status.callCaptureHealth;
           statusPill.textContent = stopRequested ? 'stopping' : (mode === 'quick-thought' ? 'quick thought' : 'recording');
           const statusBits = [];
+          if (status.autoRecordApp) statusBits.push(`Auto-record: ${status.autoRecordApp}`);
           if (queueCount > 0) {
             statusBits.push(`${queueCount} background job${queueCount === 1 ? '' : 's'}`);
           }
@@ -12700,6 +12717,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           setSettingsToggle('settings-call-detection-google-meet', Boolean(s.call_detection.google_meet_enabled));
           setSettingsToggle('settings-call-detection-teams-web', Boolean(s.call_detection.teams_web_enabled));
           setSettingsToggle('settings-call-detection-stop-when-call-ends', Boolean(s.call_detection.stop_when_call_ends));
+          setSettingsToggle('settings-call-auto-record', Boolean(s.call_detection.auto_record));
+          const automaticApps = s.call_detection.auto_record_apps || [];
+          document.getElementById('settings-call-auto-teams').checked = automaticApps.some(name => ['msteams', 'microsoft teams', 'microsoft teams (work or school)'].includes(name.toLowerCase()));
+          document.getElementById('settings-call-auto-zoom').checked = automaticApps.some(name => name.toLowerCase() === 'zoom.us');
+          document.getElementById('settings-call-auto-status').textContent = !s.call_detection.enabled ? 'Enable call detection to use automatic recording.' : automaticApps.length ? 'Automatic starts are visible in the recording bar and activity log.' : 'No apps selected. Automatic recording will stay off for all apps.';
           document.getElementById('settings-call-detection-countdown-secs').value = String(s.call_detection.call_end_stop_countdown_secs ?? 30);
         }
         // Dictation settings
@@ -13649,6 +13671,30 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       await invoke('cmd_set_setting', { section: 'call_detection', key: 'teams_web_enabled', value: String(next) });
       setSettingsToggle('settings-call-detection-teams-web', next);
     });
+    document.getElementById('settings-call-auto-record').addEventListener('click', async () => {
+      try {
+        const s = await invoke('cmd_get_settings');
+        await invoke('cmd_set_setting', { section: 'call_detection', key: 'auto_record', value: String(!s.call_detection.auto_record) });
+        setSettingsToggle('settings-call-auto-record', !s.call_detection.auto_record);
+        await loadSettings();
+      } catch (e) {
+        document.getElementById('settings-call-auto-status').textContent = String(e);
+      }
+    });
+    for (const id of ['settings-call-auto-teams', 'settings-call-auto-zoom']) {
+      document.getElementById(id).addEventListener('change', async () => {
+        const apps = [];
+        if (document.getElementById('settings-call-auto-teams').checked) apps.push('MSTeams');
+        if (document.getElementById('settings-call-auto-zoom').checked) apps.push('zoom.us');
+        try {
+          await invoke('cmd_set_setting', { section: 'call_detection', key: 'auto_record_apps', value: JSON.stringify(apps) });
+          await loadSettings();
+        } catch (e) {
+          document.getElementById('settings-call-auto-status').textContent = String(e);
+        }
+      });
+    }
+
     document.getElementById('settings-call-detection-stop-when-call-ends').addEventListener('click', async () => {
       const s = await invoke('cmd_get_settings');
       const next = !Boolean(s.call_detection.stop_when_call_ends);

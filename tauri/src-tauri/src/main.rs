@@ -2135,6 +2135,7 @@ fn main() {
             palette_reopen_pending: palette_reopen_pending.clone(),
             pending_meeting_prompts: Arc::new(Mutex::new(HashMap::new())),
             recording_started_by_call_detect: recording_started_by_call_detect.clone(),
+            auto_record_app: Arc::new(Mutex::new(None)),
             call_end_countdown_cancel: call_end_countdown_cancel.clone(),
             call_end_countdown_active: call_end_countdown_active.clone(),
             call_end_countdown_terminal_state: call_end_countdown_terminal_state.clone(),

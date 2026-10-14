@@ -902,6 +902,10 @@ pub struct CallDetectionConfig {
     pub poll_interval_secs: u64,
     pub cooldown_minutes: u64,
     pub apps: Vec<String>,
+    /// Opt in to native call recording without clicking the detection banner.
+    pub auto_record: bool,
+    /// Desktop app names eligible for auto-record. An empty list starts nothing.
+    pub auto_record_apps: Vec<String>,
     /// When a call that the detector started a recording for ends, show a
     /// countdown banner that auto-stops the recording. Default: false.
     /// Named for the behavior (an assistive prompt, not a silent hard stop);
@@ -1475,6 +1479,28 @@ impl Default for AssistantConfig {
     }
 }
 
+/// Known desktop apps supported by automatic native recording. Browser sentinels
+/// and unknown process names never gain automatic recording authority.
+pub fn auto_record_app_id(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "msteams" | "microsoft teams" | "microsoft teams (work or school)" => Some("MSTeams"),
+        "zoom.us" => Some("zoom.us"),
+        _ => None,
+    }
+}
+
+impl CallDetectionConfig {
+    pub fn auto_record_enabled_for(&self, app: &str) -> bool {
+        self.enabled
+            && self.auto_record
+            && auto_record_app_id(app).is_some_and(|id| {
+                self.auto_record_apps
+                    .iter()
+                    .any(|allowed| auto_record_app_id(allowed) == Some(id))
+            })
+    }
+}
+
 impl Default for CallDetectionConfig {
     fn default() -> Self {
         Self {
@@ -1482,6 +1508,8 @@ impl Default for CallDetectionConfig {
             poll_interval_secs: 1,
             cooldown_minutes: 5,
             apps: vec!["zoom.us".into(), "Microsoft Teams".into(), "Webex".into()],
+            auto_record: false,
+            auto_record_apps: vec!["MSTeams".into(), "zoom.us".into()],
             stop_when_call_ends: false,
             call_end_stop_countdown_secs: 30,
         }
@@ -3207,6 +3235,38 @@ backend = "parakeet"
     }
 
     // ── Call detection: stop-when-call-ends opt-in ────────────
+
+    #[test]
+    fn auto_record_requires_opt_in_and_a_supported_selected_app() {
+        let mut config = CallDetectionConfig::default();
+        assert!(!config.auto_record_enabled_for("MSTeams"));
+        config.auto_record = true;
+        assert!(config.auto_record_enabled_for("Microsoft Teams"));
+        assert!(config.auto_record_enabled_for("zoom.us"));
+        for app in ["teams-web", "google-meet", "WhatsApp", "MSTeams impostor"] {
+            config.auto_record_apps.push(app.into());
+            assert!(!config.auto_record_enabled_for(app));
+        }
+        config.auto_record_apps.clear();
+        assert!(!config.auto_record_enabled_for("MSTeams"));
+        config.auto_record_apps.push("MSTeams".into());
+        config.enabled = false;
+        assert!(!config.auto_record_enabled_for("MSTeams"));
+    }
+
+    #[test]
+    fn auto_record_old_config_stays_off_and_explicit_empty_list_round_trips() {
+        let old: CallDetectionConfig = toml::from_str("enabled = true").unwrap();
+        assert!(!old.auto_record);
+        let selected: CallDetectionConfig =
+            toml::from_str("auto_record = true\nauto_record_apps = []").unwrap();
+        assert!(selected.auto_record);
+        assert!(selected.auto_record_apps.is_empty());
+        let again: CallDetectionConfig =
+            toml::from_str(&toml::to_string(&selected).unwrap()).unwrap();
+        assert!(again.auto_record);
+        assert!(again.auto_record_apps.is_empty());
+    }
 
     #[test]
     fn stop_when_call_ends_is_off_by_default() {
