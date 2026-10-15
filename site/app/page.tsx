@@ -118,7 +118,9 @@ const capabilityColumns = [
   },
 ] as const;
 
-// Public product documentation spot-checked October 7, 2026. See linked comparisons.
+// Homepage storage and agent-access rows spot-checked October 14, 2026.
+// Sources: granola.ai/security, docs.granola.ai/help-center/sharing/integrations/mcp,
+// otter.ai/pricing, anarlog.so/security and github.com/fastrepl/anarlog.
 const comparisons = [
   ["Product", "Hosted meeting notepad", "Hosted meeting assistant", "Local meeting notepad", "Local conversation memory"],
   ["Agent access", "Hosted MCP", "Hosted MCP and integrations", "CLI + MCP", `Files + ${MINUTES_MCP_TOOL_COUNT} MCP tools`],
@@ -376,7 +378,7 @@ export default function Home() {
 
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
-          detects stalled native call capture, adds oversized audio recovery, and retries watched-folder imports.{" "}
+          adds opt-in Teams and Zoom call recording, restores bundled Claude skills, and keeps narrow windows usable.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
