@@ -9,6 +9,18 @@ spec.loader.exec_module(runner)
 
 
 class ScoringTests(unittest.TestCase):
+    def test_large_assignment_matches_small_exact_solver_and_supports_64_labels(self):
+        import random
+        from metrics import _max_assignment, _hungarian_assignment
+        random.seed(1149)
+        for size in range(1, 9):
+            weights = [[random.random() for _ in range(size)] for _ in range(size)]
+            self.assertAlmostEqual(_max_assignment(weights), _hungarian_assignment(weights))
+        weights = [[2. if column == (row + 1) % 64 else 1. for column in range(64)] for row in range(64)]
+        self.assertEqual(_max_assignment(weights), 128.)
+        with self.assertRaises(ValueError):
+            _max_assignment([[0.] * 66 for _ in range(66)])
+
     def test_unknown_cannot_be_mapped_into_a_reference_identity(self):
         reference = [{'start': 0, 'end': 4, 'speaker': 'person'}]
         hypothesis = {'segments': [{'start': 0, 'end': 4, 'speaker': 'UNKNOWN'}]}

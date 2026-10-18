@@ -7,6 +7,7 @@ on:
       - 'crates/core/src/diarize*'
       - 'crates/core/examples/diarize_file.rs'
       - 'tests/eval/diarization/**'
+      - 'tests/eval/v02/metrics.py'
       - '.github/workflows/diarization-quality.yml'
   workflow_dispatch:
     inputs:
