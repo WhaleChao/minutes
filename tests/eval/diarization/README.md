@@ -66,3 +66,52 @@ Its first candidate missed the unchanged five-point improvement gate (4.38 point
 Those recordings are now development data, not an untouched holdout. The current
 global clustering candidate was frozen before evaluating EN2002a/EN2002b. Both
 new recordings share speakers; this does not establish broad population quality.
+
+## Full native pipeline comparison
+
+`full-native-ami.json` freezes a second experiment against released 0.30.4:
+the unmodified `speakrs` CPU example at `af8013f`, with its explicit local
+safetensors/PLDA bundle at `67f963b`. It uses three distinct AMI development
+groups (IS1008a, TS3004a, IB4001), including an unstructured meeting. These are
+fresh to this comparison, not a claim of never-before-project scoring or model
+training independence. The old PR71 benchmark omitted source filenames, so its
+possible overlap cannot be ruled out. No thresholds or speaker counts are tuned
+from this experiment's predictions.
+
+Build both offline probes with Rust 1.95.0 and optimized release profiles.
+Build the pinned upstream example with `--no-default-features --features cpu`
+so its automatic download feature is absent. Keep it outside the Minutes
+dependency graph. Models are downloaded explicitly; their converted card points
+to upstream terms but has no independent license declaration. This is evaluation
+only, not authorization to redistribute models or reuse voice profiles.
+
+```bash
+python3 tests/eval/diarization/fetch_full_pipeline.py \
+  --manifest tests/eval/diarization/full-native-ami.json --directory /owned/full-native
+python3 tests/eval/diarization/full_pipeline.py \
+  --manifest tests/eval/diarization/full-native-ami.json \
+  --audio-directory /owned/full-native/audio \
+  --baseline /owned/minutes/target/release/examples/diarize_file \
+  --candidate /owned/speakrs/target/release/examples/diarize_wav \
+  --baseline-models /owned/full-native/baseline-models \
+  --candidate-models /owned/full-native/candidate-models \
+  --output /owned/new-results
+```
+
+This runner currently supports POSIX hosts. It bounds each admitted file to one
+hour and each worker to 15 minutes, gives it a separate process group, removes
+provider environment variables, applies a kernel output-file size limit, and
+kills the group on cancellation or sampled RSS excess. The 4GiB RSS watchdog is
+sampled, not a kernel memory reservation; `wait4` separately reports the actual
+child peak. Thread environment settings are hints, not an equal-work guarantee.
+Raw predictions/errors remain local; engine/model/input hashes bind the report.
+
+The gate retains a five-point weighted DER gain, at most three points of
+per-recording regression and RTF at most0.25. It also requires speaker count
+within one of reference on each file, no count-error regression, and peak RSS
+at most4GiB. A pass only qualifies this comparison. Speaker-attributed word
+error, multilingual/short-turn coverage, named profiles, Intel/Windows native
+behavior, concurrent live latency and installed capture remain separate gates.
+
+See the [historical rationale and live-path audit](../../../docs/investigations/diarization-history-and-live-latency-2026-10-18.md)
+before treating every merge as a bug or moving refinement into the live loop.
