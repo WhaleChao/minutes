@@ -48,6 +48,14 @@ The upstream pyannote.audio-only `exclusive_speaker_diarization` reconciliation
 is not part of these two ONNX exports, so Minutes continues to use its own
 segment clustering and transcript reconciliation.
 
+The Community-1 path preserves raw overlapping speaker tracks. Saved-meeting
+transcripts use an exclusive view that abstains during ambiguous overlap.
+`minutes transcribe --diarize` applies the same conservative rule in text and
+JSON: an ASR interval intersecting different speakers, whether simultaneous or
+sequential, receives `UNKNOWN`. An interval with no speaker evidence has no
+speaker label. A long ASR segment is not assigned to its first intersecting
+speaker just because that observation appears first in the raw result.
+
 Voice profiles are isolated by embedding model id in `voices.db`. Community-1
 embeddings are never silently compared with profiles enrolled using CAM++;
 enroll a new profile under the active model set if voice matching is needed.

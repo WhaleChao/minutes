@@ -75,6 +75,14 @@ clock fix. A development fixture regressed with the new track path under CAM++,
 so it is not enabled for that model. Neither the model default nor recognition
 thresholds change. This is not the complete upstream Community-1/VBx pipeline.
 
+CLI renderer qualification also covers a separate alignment boundary: an ASR
+segment can span simultaneous voices or consecutive turns. Both text and JSON
+must return UNKNOWN when their interval intersects different raw speaker labels,
+independent of raw segment order. Tests cover overlap, sequential turns, one
+supported voice, absent evidence, invalid intervals and unchanged words.
+This renderer correction does not change model predictions or the paired DER
+results below.
+
 ## Evaluation and admission
 
 The first development set consists of direct Apple TTS WAVs: two Dutch voices
