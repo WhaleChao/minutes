@@ -150,3 +150,26 @@ model-calibrated PLDA/VBx against this portable ONNX path, plus the separate
 streaming challenger. Evaluate speaker-count error, short-turn coverage and
 named-identity false positives alongside DER on new consented/licensed voices.
 These now-seen meetings cannot become a fresh holdout through another rerun.
+
+## First candidate for the next comparison
+
+The June entity-resolution plan already identified `speakrs`; refresh that lead
+before implementing another clustering stack ourselves. Its
+[current source, pinned to af8013f](https://github.com/avencera/speakrs/tree/af8013f95a53a37a554d8abc6e4ae2ab9a614be6),
+checked October 18, describes a full Community-1-style pipeline with overlapping
+windows, activity reconstruction, PLDA and VBx. Version 0.7 offers native CPU and
+CoreML backends. Its Apache-2.0 implementation is a more direct candidate for
+Minutes than a Python service or an Apple-only replacement. Native CPU uses a
+different local weights bundle, so the existing ONNX pair is not a drop-in input.
+Its author-reported benchmark scores are not reproduced Minutes results.
+
+First compare this candidate against 0.30.3 on fresh licensed or consented
+recordings, with the dataset, model hashes and admission thresholds frozen
+before scoring. Report speaker-count error, short-turn coverage, overlap,
+misses/false alarms/confusion and named-identity false positives, plus runtime,
+peak memory and cancellation. Verify Windows and Intel behavior rather than
+inferring support from the CPU backend name. Keep downloads explicit, audit
+model redistribution/attribution, and preserve model-specific voice profiles.
+If it passes, integrate behind an opt-in engine and qualify installed-app/CLI
+parity before considering a default change. Recording and WAV preservation
+remain isolated from this optional processing.
