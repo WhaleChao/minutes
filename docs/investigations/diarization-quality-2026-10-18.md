@@ -83,6 +83,15 @@ supported voice, absent evidence, invalid intervals and unchanged words.
 This renderer correction does not change model predictions or the paired DER
 results below.
 
+The downstream audit also distinguishes explicit UNKNOWN evidence from an absent
+observation. Saved-meeting onset/dominance heuristics preserve the former,
+including UNKNOWN reached through the existing boundary tolerance. Enrollment
+refuses inconsistent speaker counts or multiple embeddings before touching the
+voice-profile database. CLI renderer and enrollment contracts run explicitly on
+all three main CI platforms. The model workflow keeps the immutable clock-fixed
+comparator after the new pipeline lands; its already-seen meetings are regression
+controls, not a new holdout for these downstream corrections.
+
 ## Evaluation and admission
 
 The first development set consists of direct Apple TTS WAVs: two Dutch voices

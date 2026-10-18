@@ -13694,6 +13694,26 @@ life (qmd://life/)
     }
 
     #[test]
+    fn enrollment_embedding_requires_one_consistent_speaker() {
+        use minutes_core::diarize::DiarizationResult;
+        let mut result = DiarizationResult {
+            num_speakers: 1,
+            ..Default::default()
+        };
+        result.speaker_embeddings.insert("A".into(), vec![1.0; 256]);
+        assert_eq!(enrollment_embedding(&result).unwrap(), &[1.0; 256]);
+        result.num_speakers = 2;
+        assert!(enrollment_embedding(&result).is_err());
+        result.num_speakers = 1;
+        result.speaker_embeddings.insert("B".into(), vec![1.0; 256]);
+        assert!(enrollment_embedding(&result).is_err());
+        result.speaker_embeddings.clear();
+        assert!(enrollment_embedding(&result).is_err());
+        result.num_speakers = 0;
+        assert!(enrollment_embedding(&result).is_err());
+    }
+
+    #[test]
     fn transcribe_without_diarization_preserves_text_and_skips_the_engine() {
         let result = transcribe_render_fixture();
         let output = format_transcribe_result(&result, false, false, &Config::default(), || {
@@ -18429,6 +18449,21 @@ fn persist_identity_name(name: &str, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn enrollment_embedding(result: &minutes_core::diarize::DiarizationResult) -> Result<&[f32]> {
+    match (
+        result.num_speakers,
+        result.speaker_embeddings.len(),
+        result.speaker_embeddings.values().next(),
+    ) {
+        (1, 1, Some(embedding)) => Ok(embedding.as_slice()),
+        _ => anyhow::bail!(
+            "Could not isolate one consistent speaker for enrollment. No profile was changed. \
+             Record a clear sample with only you speaking, then try again. \
+             For help: https://github.com/silverstein/minutes/discussions"
+        ),
+    }
+}
+
 fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()> {
     use minutes_core::voice;
 
@@ -18572,29 +18607,11 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
         ));
     }
 
-    if result.num_speakers > 1 {
-        tracing::warn!(
-            speakers = result.num_speakers,
-            "multiple speakers detected during enrollment — picking an arbitrary one"
-        );
-        eprintln!(
-            "  ⚠ Detected {} voices — the enrolled profile may not be yours.",
-            result.num_speakers
-        );
-        eprintln!("  For best results, re-run in a quiet room with just you speaking.");
-    }
-
     eprintln!("  \x1b[2mComputing voice profile...\x1b[0m");
 
-    // Enrollment expects a single speaker, so just grab the first available
-    // embedding. When multiple speakers are detected the choice is arbitrary
-    // (HashMap order), but the user is warned above to re-record solo.
-    let (_, embedding) = result
-        .speaker_embeddings
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Diarization produced no speaker embeddings."))?;
-    let embedding = embedding.clone();
+    // Refuse ambiguity before opening the profile database. A warning cannot
+    // make an arbitrary HashMap entry a safe identity for the user's voice.
+    let embedding = enrollment_embedding(&result)?.to_vec();
 
     // Step 5: Save
     let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;

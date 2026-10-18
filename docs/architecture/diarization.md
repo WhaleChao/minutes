@@ -56,6 +56,12 @@ sequential, receives `UNKNOWN`. An interval with no speaker evidence has no
 speaker label. A long ASR segment is not assigned to its first intersecting
 speaker just because that observation appears first in the raw result.
 
+Explicit UNKNOWN observations also survive the saved-meeting onset and
+dominant-speaker heuristics. Those heuristics can fill missing timing evidence;
+they cannot turn an ambiguous or insufficient observation into a known voice.
+CLI enrollment requires one consistent speaker and one embedding before opening
+the profile database. An ambiguous sample leaves existing voice profiles intact.
+
 Voice profiles are isolated by embedding model id in `voices.db`. Community-1
 embeddings are never silently compared with profiles enrolled using CAM++;
 enroll a new profile under the active model set if voice matching is needed.
