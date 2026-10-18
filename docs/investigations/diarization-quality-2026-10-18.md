@@ -180,7 +180,7 @@ Minutes than a Python service or an Apple-only replacement. Native CPU uses a
 different local weights bundle, so the existing ONNX pair is not a drop-in input.
 Its author-reported benchmark scores are not reproduced Minutes results.
 
-First compare this candidate against 0.30.3 on fresh licensed or consented
+First compare this candidate against 0.30.4 on fresh licensed or consented
 recordings, with the dataset, model hashes and admission thresholds frozen
 before scoring. Report speaker-count error, short-turn coverage, overlap,
 misses/false alarms/confusion and named-identity false positives, plus runtime,
@@ -190,3 +190,12 @@ model redistribution/attribution, and preserve model-specific voice profiles.
 If it passes, integrate behind an opt-in engine and qualify installed-app/CLI
 parity before considering a default change. Recording and WAV preservation
 remain isolated from this optional processing.
+
+Score the words assigned to each speaker as well as raw speaker time. Add
+cpWER/tcpWER with declared normalization and timing policy, and preserve
+structured word/segment timestamps for safe alignment. The
+[CHiME-7/8 review](https://arxiv.org/abs/2507.18161v2) shows that convincing
+summaries can conceal substantial speaker-attributed transcription errors.
+Summary quality alone cannot qualify Minutes. An ASR interval spanning several
+voices must abstain until its words can be assigned with adequate timing
+evidence; assigning the whole sentence to its first speaker is insufficient.
