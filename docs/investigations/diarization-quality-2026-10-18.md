@@ -118,3 +118,35 @@ A model-default change needs broader, separately collected consented/licensed
 human speech across languages, devices, cross-talk, short interjections, similar
 voices, and headphone capture. It also needs native latency/memory and named
 recognition qualification. No current result establishes that promotion.
+
+## Observed local admission result
+
+The frozen global candidate passed the unchanged regression gate on EN2002a and
+EN2002b. The source was built before rebasing the implementation onto main;
+its frozen Rust file hashes match original commit
+dfa3c3c2459dda9a40a9c2b1c93a93322bcd2735. The baseline is clock-fixed
+d67b0f7e101969f370e23acfdbe98d6a40898bde. Exact executable/model hashes and
+harness timings are retained in the run receipt. The hosted workflow qualifies
+the actual release candidate independently of these historical local binaries.
+
+| Complete recording | Baseline DER | Global candidate DER | Candidate RTF | Candidate clusters / reference people |
+| --- | ---: | ---: | ---: | ---: |
+| EN2002a, 35.7 minutes | 59.60% | 38.72% | 0.063 | 17 / 4 |
+| EN2002b, 29.8 minutes | 59.17% | 43.84% | 0.052 | 14 / 4 |
+| Weighted by reference speaker-time | 59.42% | 40.94% | | |
+
+The gain is 18.47 percentage points; neither file regressed. The earlier scorer
+refused more than twelve labels, so the first scoring attempt stopped. Its
+replacement uses exact bitmask assignment for small matrices and bounded cubic
+Hungarian assignment above twelve, up to 65 labels (64 runtime speakers plus
+abstention). It is checked against the small exact solver and a 64-label known
+assignment. No audio, model, predictions or gate thresholds were changed to
+resolve that scoring limitation.
+
+These results expose serious remaining gaps rather than establish SOTA: speaker
+counting is fragmented and substantial speech lacks reliable identity evidence.
+The next useful comparison is full upstream window reconstruction and
+model-calibrated PLDA/VBx against this portable ONNX path, plus the separate
+streaming challenger. Evaluate speaker-count error, short-turn coverage and
+named-identity false positives alongside DER on new consented/licensed voices.
+These now-seen meetings cannot become a fresh holdout through another rerun.

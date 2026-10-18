@@ -58,12 +58,18 @@ jobs:
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libclang-dev cmake pkg-config
+      - name: Select the required Speech SDK on Intel macOS
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Scope compiled artifacts to the runner image
+        id: build-scope
+        run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             baseline -> target
             candidate -> target
-          key: diarization-quality-${{ runner.arch }}
+          key: diarization-quality-${{ runner.arch }}-${{ steps.build-scope.outputs.scope }}
       - uses: actions/cache@v6
         with:
           path: fixtures
