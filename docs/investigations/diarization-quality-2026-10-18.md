@@ -1,0 +1,120 @@
+# Diarization quality: October 18, 2026
+
+Minutes must preserve what people said, separate their voices over a complete
+recording, and abstain when there is insufficient evidence for a name. Capture
+and the original WAV remain independent of optional diarization.
+
+## What the research changes
+
+The most useful reference for our current local engine is the
+[pyannote powerset paper](https://arxiv.org/abs/2310.13025) and the
+[current upstream pipeline](https://github.com/pyannote/pyannote-audio/blob/main/src/pyannote/audio/pipelines/speaker_diarization.py).
+Powerset classes represent individual speakers and pairs speaking together.
+Upstream retains those local masks, extracts per-speaker embeddings, clusters
+across windows, and reconstructs speech activity. Local speaker indices are
+permutation invariant: channel 1 in one window is not a persistent identity.
+The upstream extractor can exclude overlapping frames from embedding evidence.
+
+[Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+is an open, offline pipeline with improved speaker counting and an additional
+exclusive diarization output for alignment with transcript timestamps. Its
+published benchmarks cover the complete upstream pipeline, including VBx/PLDA
+clustering; using its exported segmentation and embedding networks in Minutes
+does not reproduce that pipeline or inherit its scores. The model card uses
+zero collar and includes overlap. Its CC-BY-4.0 weights require attribution;
+the original download also has an access acknowledgement. Our existing ONNX
+exports are a separately distributed conversion, not a new upstream runtime.
+
+[Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization),
+released September 23, 2026, is a serious streaming challenger. It supports up
+to eight speakers and carries speaker information between chunks with an
+arrival-order cache. Its recommended lowest input buffering is 320 ms; that
+is not end-to-end latency. It has a different architecture and OpenMDW-1.1
+license, and does not replace Minutes' named voice embeddings. A native port
+would need measured CPU/Apple Silicon/Intel/Windows behavior, cancellation,
+long-call identity continuity, and a separate voice-recognition policy. It is
+not a drop-in replacement justified by a leaderboard number.
+
+[Precision-3](https://www.pyannote.ai/blog/precision-3), released in September
+2026, is a useful commercial reference, with frame-level speaker probabilities
+and sensitivity controls. API/on-premise availability does not make it an
+open-source, offline, redistributable Minutes default. No meeting audio is
+sent to a provider by this work.
+
+## Defects in our pipeline
+
+The old ONNX integration collapsed all non-silent classes into a speech boolean.
+It merged regions across short pauses before embedding extraction and could
+assign an embedding from the beginning of a long, mixed region to every voice
+inside that region. A separate frame-clock error accumulated across ten-second
+windows. Repetition cleanup could also delete distinct numbered utterances.
+The clock and cleanup defects are fixed separately in #1152 and #1151.
+
+## Implementation decision
+
+Community-1 receives a speaker-aware path:
+
+- Decode all seven powerset classes into three local activity tracks per window.
+- Keep paired speaker activity during overlap in the raw diarization result.
+- Extract embeddings from that speaker's exclusive frames, bounded by a ten-second
+  model window. Require 1.5 seconds of clean speech for identity evidence.
+- Cluster all reliable observations globally by merging the most similar
+  compatible centroids first, weighted by clean speech duration. Different
+  local voices in one window cannot collapse through transitive merging.
+- Short or overlap-only tracks remain UNKNOWN; they do not inherit another
+  person's identity because that person happened to speak nearby.
+- Transcript alignment uses an exclusive view. Ambiguous simultaneous voices
+  remain UNKNOWN rather than arbitrarily attributing their words to one person.
+- Keep model-specific voice-profile compatibility, cancellation, finite output
+  validation, the two-hour audio budget, 100,000 region budget, and 64-result-cluster cap. Global clustering permits at most 2,160 observations
+  and 2,160 squared queued pairs, using fallible queue allocation and cancellation
+  during construction and merging.
+
+Legacy CAM++ retains its existing speech-region compatibility path plus the
+clock fix. A development fixture regressed with the new track path under CAM++,
+so it is not enabled for that model. Neither the model default nor recognition
+thresholds change. This is not the complete upstream Community-1/VBx pipeline.
+
+## Evaluation and admission
+
+The first development set consists of direct Apple TTS WAVs: two Dutch voices
+with 350 ms and 1.5 s gaps, two English voices, and three English voices with
+some overlap. These test turn preservation and timing, not human conversational
+quality. Known voice schedules have approximate energy-trimmed boundaries.
+The first 300 seconds of AMI ES2004a is also development data.
+
+The first admission used full AMI IS1009a and TS3003a Array1-01 meetings.
+An online clustering candidate improved weighted DER by 4.38 points, below the
+predeclared five-point minimum; IS1009a improved from 44.60% to 33.10% and
+TS3003a regressed from 27.08% to 27.53%. It was rejected. These recordings are
+now development data. The replacement uses bounded, cancellable global centroid
+agglomeration, addressing the general arrival-order defect without threshold
+tuning. A regression with three acoustic vectors demonstrates that an early
+ambiguous voice must join its strongest compatible observation rather than the
+first acceptable template.
+
+The global candidate is frozen before evaluating AMI EN2002a and EN2002b, from
+a different speaker group. These two recordings share speakers with each other;
+they are not independent population samples. The gate thresholds below remain
+unchanged. Audio and annotations are
+[openly licensed CC-BY-4.0 by the AMI project](https://groups.inf.ed.ac.uk/ami/).
+Use the only-words RTTMs from pyannote/AMI-diarization-setup commit
+67c2d539286e89f68952d5dcf83912bd9f01dfae. Record the actual audio/model/executable
+hashes and source delta. This is a small engineering holdout, not independently
+blinded certification or evidence that the model never trained on AMI.
+
+Before either admission, the thresholds are:
+weighted DER improves by at least five percentage points against the clock-fixed
+baseline; no recording regresses by more than three percentage points; each
+candidate run has real-time factor below 0.25 on this Linux CPU; and all source
+regression tests pass. DER uses one optimal mapping per complete recording,
+zero collar and overlap included. UNKNOWN is excluded from attributed hypotheses
+and its duration is reported separately, so abstention cannot become a reference
+speaker through optimal remapping. Record speech misses, false alarms, confusion,
+and speaker count as well as the aggregate. A failure prevents enabling the new
+path in a release. No threshold tuning on these two holdout outputs.
+
+A model-default change needs broader, separately collected consented/licensed
+human speech across languages, devices, cross-talk, short interjections, similar
+voices, and headphone capture. It also needs native latency/memory and named
+recognition qualification. No current result establishes that promotion.
