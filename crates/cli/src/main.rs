@@ -6674,6 +6674,33 @@ fn cmd_transcribe(path: &Path, output_json: bool, do_diarize: bool, config: &Con
     Ok(())
 }
 
+/// Attribute an ASR interval only when every intersecting observation agrees.
+fn transcribe_interval_speaker(
+    start: f64,
+    end: f64,
+    segments: &[minutes_core::diarize::SpeakerSegment],
+) -> Option<&str> {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || start >= end {
+        return None;
+    }
+    let mut speaker = None;
+    for segment in segments.iter().filter(|segment| {
+        segment.start.is_finite()
+            && segment.end.is_finite()
+            && segment.start >= 0.0
+            && segment.start < segment.end
+            && segment.start < end
+            && segment.end > start
+    }) {
+        match speaker {
+            Some(previous) if previous != segment.speaker.as_str() => return Some("UNKNOWN"),
+            None => speaker = Some(segment.speaker.as_str()),
+            _ => {}
+        }
+    }
+    speaker
+}
+
 /// Keep optional diarization on the shared execution path for both renderers.
 /// The injected operation lets regressions prove text mode actually runs it,
 /// without loading a model or requiring an audio device in the CLI test suite.
@@ -6703,13 +6730,11 @@ fn format_transcribe_result(
             .segments
             .iter()
             .map(|seg| {
-                // Preserve JSON's first-overlapping-window attribution in
-                // both formats; no overlap means no speaker label.
-                let speaker = dr
-                    .segments
-                    .iter()
-                    .find(|s| s.start < seg.end && s.end > seg.start)
-                    .map(|s| s.speaker.clone());
+                // An ASR interval can span overlapping voices or several
+                // sequential turns. Its words cannot safely inherit the first
+                // intersecting raw speaker; both renderers must abstain.
+                let speaker = transcribe_interval_speaker(seg.start, seg.end, &dr.segments)
+                    .map(str::to_owned);
                 TranscribeSegmentOutput {
                     start: seg.start,
                     end: seg.end,
@@ -13561,6 +13586,134 @@ life (qmd://life/)
     }
 
     #[test]
+    fn transcribe_diarization_abstains_for_overlap_and_cross_speaker_intervals() {
+        use minutes_core::diarize::{DiarizationResult, SpeakerSegment};
+        let result = transcribe_render_fixture();
+        for (second_start, first_end) in [(2.0, 3.0), (2.0, 2.0)] {
+            for reverse in [false, true] {
+                let mut segments = vec![
+                    SpeakerSegment {
+                        start: 0.0,
+                        end: first_end,
+                        speaker: "SPEAKER_1".into(),
+                    },
+                    SpeakerSegment {
+                        start: second_start,
+                        end: 4.0,
+                        speaker: "SPEAKER_2".into(),
+                    },
+                ];
+                if reverse {
+                    segments.reverse();
+                }
+                for output_json in [false, true] {
+                    let output = format_transcribe_result(
+                        &result,
+                        output_json,
+                        true,
+                        &Config::default(),
+                        || {
+                            Some(DiarizationResult {
+                                segments: segments.clone(),
+                                num_speakers: 2,
+                                ..Default::default()
+                            })
+                        },
+                    )
+                    .unwrap();
+                    if output_json {
+                        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+                        assert_eq!(json["data"]["segments"][0]["speaker"], "UNKNOWN");
+                        assert_eq!(json["data"]["segments"][0]["text"], "First turn.");
+                        assert!(json["data"]["segments"][2].get("speaker").is_none());
+                    } else {
+                        assert_eq!(
+                            output,
+                            "[0:00] UNKNOWN: First turn.\n[0:12] Second turn.\n[0:15] Unmatched."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcribe_interval_speaker_preserves_unique_support_and_abstention() {
+        use minutes_core::diarize::SpeakerSegment;
+        let segments = [
+            SpeakerSegment {
+                start: 2.0,
+                end: 4.0,
+                speaker: "A".into(),
+            },
+            SpeakerSegment {
+                start: 0.0,
+                end: 2.0,
+                speaker: "A".into(),
+            },
+            SpeakerSegment {
+                start: 4.0,
+                end: 5.0,
+                speaker: "B".into(),
+            },
+            SpeakerSegment {
+                start: 6.0,
+                end: 7.0,
+                speaker: "UNKNOWN".into(),
+            },
+            SpeakerSegment {
+                start: f64::NAN,
+                end: 4.0,
+                speaker: "invalid".into(),
+            },
+            SpeakerSegment {
+                start: 1.0,
+                end: 0.0,
+                speaker: "invalid".into(),
+            },
+        ];
+        assert_eq!(transcribe_interval_speaker(0.0, 4.0, &segments), Some("A"));
+        assert_eq!(transcribe_interval_speaker(4.0, 5.0, &segments), Some("B"));
+        assert_eq!(
+            transcribe_interval_speaker(3.0, 5.0, &segments),
+            Some("UNKNOWN")
+        );
+        assert_eq!(
+            transcribe_interval_speaker(6.0, 7.0, &segments),
+            Some("UNKNOWN")
+        );
+        assert_eq!(transcribe_interval_speaker(5.0, 6.0, &segments), None);
+        for (start, end) in [
+            (f64::NAN, 4.0),
+            (0.0, f64::INFINITY),
+            (2.0, 2.0),
+            (-1.0, 2.0),
+        ] {
+            assert_eq!(transcribe_interval_speaker(start, end, &segments), None);
+        }
+    }
+
+    #[test]
+    fn enrollment_embedding_requires_one_consistent_speaker() {
+        use minutes_core::diarize::DiarizationResult;
+        let mut result = DiarizationResult {
+            num_speakers: 1,
+            ..Default::default()
+        };
+        result.speaker_embeddings.insert("A".into(), vec![1.0; 256]);
+        assert_eq!(enrollment_embedding(&result).unwrap(), &[1.0; 256]);
+        result.num_speakers = 2;
+        assert!(enrollment_embedding(&result).is_err());
+        result.num_speakers = 1;
+        result.speaker_embeddings.insert("B".into(), vec![1.0; 256]);
+        assert!(enrollment_embedding(&result).is_err());
+        result.speaker_embeddings.clear();
+        assert!(enrollment_embedding(&result).is_err());
+        result.num_speakers = 0;
+        assert!(enrollment_embedding(&result).is_err());
+    }
+
+    #[test]
     fn transcribe_without_diarization_preserves_text_and_skips_the_engine() {
         let result = transcribe_render_fixture();
         let output = format_transcribe_result(&result, false, false, &Config::default(), || {
@@ -18296,6 +18449,21 @@ fn persist_identity_name(name: &str, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn enrollment_embedding(result: &minutes_core::diarize::DiarizationResult) -> Result<&[f32]> {
+    match (
+        result.num_speakers,
+        result.speaker_embeddings.len(),
+        result.speaker_embeddings.values().next(),
+    ) {
+        (1, 1, Some(embedding)) => Ok(embedding.as_slice()),
+        _ => anyhow::bail!(
+            "Could not isolate one consistent speaker for enrollment. No profile was changed. \
+             Record a clear sample with only you speaking, then try again. \
+             For help: https://github.com/silverstein/minutes/discussions"
+        ),
+    }
+}
+
 fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()> {
     use minutes_core::voice;
 
@@ -18439,29 +18607,11 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
         ));
     }
 
-    if result.num_speakers > 1 {
-        tracing::warn!(
-            speakers = result.num_speakers,
-            "multiple speakers detected during enrollment — picking an arbitrary one"
-        );
-        eprintln!(
-            "  ⚠ Detected {} voices — the enrolled profile may not be yours.",
-            result.num_speakers
-        );
-        eprintln!("  For best results, re-run in a quiet room with just you speaking.");
-    }
-
     eprintln!("  \x1b[2mComputing voice profile...\x1b[0m");
 
-    // Enrollment expects a single speaker, so just grab the first available
-    // embedding. When multiple speakers are detected the choice is arbitrary
-    // (HashMap order), but the user is warned above to re-record solo.
-    let (_, embedding) = result
-        .speaker_embeddings
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Diarization produced no speaker embeddings."))?;
-    let embedding = embedding.clone();
+    // Refuse ambiguity before opening the profile database. A warning cannot
+    // make an arbitrary HashMap entry a safe identity for the user's voice.
+    let embedding = enrollment_embedding(&result)?.to_vec();
 
     // Step 5: Save
     let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;

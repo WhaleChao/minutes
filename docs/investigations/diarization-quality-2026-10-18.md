@@ -75,6 +75,23 @@ clock fix. A development fixture regressed with the new track path under CAM++,
 so it is not enabled for that model. Neither the model default nor recognition
 thresholds change. This is not the complete upstream Community-1/VBx pipeline.
 
+CLI renderer qualification also covers a separate alignment boundary: an ASR
+segment can span simultaneous voices or consecutive turns. Both text and JSON
+must return UNKNOWN when their interval intersects different raw speaker labels,
+independent of raw segment order. Tests cover overlap, sequential turns, one
+supported voice, absent evidence, invalid intervals and unchanged words.
+This renderer correction does not change model predictions or the paired DER
+results below.
+
+The downstream audit also distinguishes explicit UNKNOWN evidence from an absent
+observation. Saved-meeting onset/dominance heuristics preserve the former,
+including UNKNOWN reached through the existing boundary tolerance. Enrollment
+refuses inconsistent speaker counts or multiple embeddings before touching the
+voice-profile database. CLI renderer and enrollment contracts run explicitly on
+all three main CI platforms. The model workflow keeps the immutable clock-fixed
+comparator after the new pipeline lands; its already-seen meetings are regression
+controls, not a new holdout for these downstream corrections.
+
 ## Evaluation and admission
 
 The first development set consists of direct Apple TTS WAVs: two Dutch voices

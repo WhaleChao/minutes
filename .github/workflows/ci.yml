@@ -334,6 +334,17 @@ jobs:
         run: cargo test -p minutes-cli --no-default-features -- copilot --test-threads=1
         timeout-minutes: 4
 
+      - name: CLI transcription renderer contracts
+        # Core attribution tests do not execute this independent CLI renderer.
+        # Exercise both formats, overlap/turn-crossing abstention, and absent
+        # evidence with deterministic injected results and no audio device.
+        run: cargo test -p minutes-cli --no-default-features -- transcribe_ --test-threads=1
+        timeout-minutes: 4
+
+      - name: CLI voice-enrollment contracts
+        run: cargo test -p minutes-cli --no-default-features -- enrollment_ --test-threads=1
+        timeout-minutes: 4
+
       - name: Diarization unit tests (cross-platform)
         run: cargo test -p minutes-core --no-default-features --features diarize --lib -- diarize --test-threads=1
         timeout-minutes: 3
