@@ -333,6 +333,11 @@ jobs:
           mkdir -p "$out"
           cp -f "release-input/minutes-macos-arm64" "$out/minutes"
           cp -f "$plugin" "$out/"
+          # download-artifact normalizes files to 0644. Restore and exercise
+          # the packaged CLI so extracting this archive yields a runnable tool.
+          chmod 755 "$out/minutes"
+          test -x "$out/minutes"
+          "$out/minutes" --version
 
           if [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" && -n "$APPLE_SIGNING_IDENTITY" ]]; then
             keychain="$RUNNER_TEMP/minutes-cli-release.keychain-db"
