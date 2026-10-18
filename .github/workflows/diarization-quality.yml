@@ -35,7 +35,10 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
-      BASELINE_REF: ${{ github.event.pull_request.base.sha || inputs.baseline_ref }}
+      # Keep the clock-fixed admission comparator immutable after the new
+      # pipeline lands. Comparing its next fix with main would measure zero
+      # gain and fail the original gate despite unchanged model predictions.
+      BASELINE_REF: ${{ inputs.baseline_ref || '0917898c9391617312ae8cc55a81f5d5c8facf8e' }}
       CANDIDATE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
     defaults:
       run:

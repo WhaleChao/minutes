@@ -3090,6 +3090,7 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
             speaker: String,
             ts_str: String,
             text: String,
+            preserve_unknown: bool,
         },
         Raw(String),
     }
@@ -3108,6 +3109,8 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
                 if let Some(secs) = parse_timestamp(ts_str) {
                     let speaker =
                         find_speaker(secs, &sorted_segments, result.from_stems).to_string();
+                    let preserve_unknown = speaker == "UNKNOWN"
+                        && speaker_observation(secs, &sorted_segments, result.from_stems).is_some();
                     if speaker == "UNKNOWN" {
                         unknown_count += 1;
                     } else {
@@ -3117,6 +3120,7 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
                         speaker,
                         ts_str: ts_str.to_string(),
                         text: text.to_string(),
+                        preserve_unknown,
                     });
                     continue;
                 }
@@ -3138,7 +3142,7 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
         .iter()
         .position(|l| matches!(l, OutputLine::Attributed { .. }));
     if let Some(first_idx) = first_attr {
-        let is_unknown = matches!(&lines[first_idx], OutputLine::Attributed { speaker, .. } if speaker == "UNKNOWN");
+        let is_unknown = matches!(&lines[first_idx], OutputLine::Attributed { speaker, preserve_unknown: false, .. } if speaker == "UNKNOWN");
         if is_unknown {
             let next_speaker = lines[first_idx + 1..].iter().find_map(|l| match l {
                 OutputLine::Attributed { speaker, .. } if speaker != "UNKNOWN" => {
@@ -3169,8 +3173,13 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
     if all_unknown {
         if let Some(dominant) = dominant_speaker {
             for line in &mut lines {
-                if let OutputLine::Attributed { speaker, .. } = line {
-                    if speaker == "UNKNOWN" {
+                if let OutputLine::Attributed {
+                    speaker,
+                    preserve_unknown,
+                    ..
+                } = line
+                {
+                    if speaker == "UNKNOWN" && !*preserve_unknown {
                         *speaker = dominant.clone();
                         unknown_count = unknown_count.saturating_sub(1);
                         matched_count += 1;
@@ -3187,6 +3196,7 @@ pub fn apply_speakers(transcript: &str, result: &DiarizationResult) -> String {
                 speaker,
                 ts_str,
                 text,
+                ..
             } => {
                 output.push_str(&format!("[{} {}] {}\n", speaker, ts_str, text));
             }
@@ -3226,7 +3236,7 @@ fn dominant_speaker_label(segments: &[SpeakerSegment]) -> Option<String> {
 
     // Require a strong majority before overriding UNKNOWN lines. This avoids
     // inventing certainty when the clip is genuinely mixed.
-    if duration / total >= 0.6 {
+    if label != "UNKNOWN" && duration / total >= 0.6 {
         Some(label.to_string())
     } else {
         None
@@ -3244,10 +3254,21 @@ fn dominant_speaker_label(segments: &[SpeakerSegment]) -> Option<String> {
 /// 3. Beyond tolerance: return "UNKNOWN" — don't fabricate attribution
 ///    for timestamps in silence.
 fn find_speaker(time_secs: f64, segments: &[SpeakerSegment], from_stems: bool) -> &str {
+    speaker_observation(time_secs, segments, from_stems).unwrap_or("UNKNOWN")
+}
+
+// Some("UNKNOWN") is an explicit abstention, including the existing boundary
+// tolerance; None means no observation. Onset/dominance heuristics may only
+// fill the latter, never erase uncertainty produced by the diarizer.
+fn speaker_observation(
+    time_secs: f64,
+    segments: &[SpeakerSegment],
+    from_stems: bool,
+) -> Option<&str> {
     // Exact containment (binary search since segments are sorted)
     let idx = segments.partition_point(|seg| seg.end <= time_secs);
     if idx < segments.len() && time_secs >= segments[idx].start && time_secs < segments[idx].end {
-        return &segments[idx].speaker;
+        return Some(&segments[idx].speaker);
     }
 
     // Gap fallback: check the surrounding segments within 0.5s tolerance.
@@ -3259,7 +3280,7 @@ fn find_speaker(time_secs: f64, segments: &[SpeakerSegment], from_stems: bool) -
     if idx < segments.len() {
         let gap = segments[idx].start - time_secs;
         if gap >= 0.0 && gap <= next_tolerance {
-            return &segments[idx].speaker;
+            return Some(&segments[idx].speaker);
         }
     }
 
@@ -3268,11 +3289,11 @@ fn find_speaker(time_secs: f64, segments: &[SpeakerSegment], from_stems: bool) -
         let prev = &segments[idx - 1];
         let gap = time_secs - prev.end;
         if gap >= 0.0 && gap <= prev_tolerance {
-            return &prev.speaker;
+            return Some(&prev.speaker);
         }
     }
 
-    "UNKNOWN"
+    None
 }
 
 fn exclusive_transcript_segments(segments: &[SpeakerSegment]) -> Vec<SpeakerSegment> {
@@ -4957,6 +4978,79 @@ mod tests {
         let labeled = apply_speakers(transcript, &result);
         assert!(labeled.contains("[SPEAKER_0 0:00]"));
         assert!(labeled.contains("[SPEAKER_1 0:05]"));
+    }
+
+    #[test]
+    fn apply_speakers_preserves_explicit_abstention_through_onset_and_dominance() {
+        let cases = [
+            vec![
+                SpeakerSegment {
+                    speaker: "UNKNOWN".into(),
+                    start: 0.045,
+                    end: 1.0,
+                },
+                SpeakerSegment {
+                    speaker: "SPEAKER_0".into(),
+                    start: 1.0,
+                    end: 10.0,
+                },
+            ],
+            vec![
+                SpeakerSegment {
+                    speaker: "SPEAKER_0".into(),
+                    start: 0.0,
+                    end: 10.0,
+                },
+                SpeakerSegment {
+                    speaker: "SPEAKER_1".into(),
+                    start: 0.0,
+                    end: 1.0,
+                },
+            ],
+        ];
+        for segments in cases {
+            for from_stems in [false, true] {
+                let result = DiarizationResult {
+                    segments: segments.clone(),
+                    num_speakers: 2,
+                    from_stems,
+                    ..Default::default()
+                };
+                for transcript in [
+                    "[0:00] Uncertain words.\n[0:03] Certain words.\n",
+                    "[0:00] Uncertain words.\n",
+                ] {
+                    let output = apply_speakers(transcript, &result);
+                    assert!(
+                        output.contains("[UNKNOWN 0:00] Uncertain words."),
+                        "{output}"
+                    );
+                    if transcript.contains("Certain words.") {
+                        assert!(
+                            output.contains("[SPEAKER_0 0:03] Certain words."),
+                            "{output}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dominant_unknown_is_not_an_attributed_speaker() {
+        let segments = [
+            SpeakerSegment {
+                speaker: "SPEAKER_0".into(),
+                start: 0.0,
+                end: 2.0,
+            },
+            SpeakerSegment {
+                speaker: "UNKNOWN".into(),
+                start: 2.0,
+                end: 10.0,
+            },
+        ];
+        assert_eq!(dominant_speaker_label(&segments), None);
     }
 
     #[test]
