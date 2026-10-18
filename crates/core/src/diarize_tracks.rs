@@ -336,9 +336,9 @@ mod tests {
         for class in 4..7 {
             let tracks = decode_window(0, 160_000, &[class], 100).unwrap();
             assert_eq!(tracks.len(), 2);
-            assert!(tracks
-                .iter()
-                .all(|track| track.regions == vec![721..991] && track.clean_regions.is_empty()));
+            assert!(tracks.iter().all(|track| track.regions.len() == 1
+                && track.regions[0] == (721..991)
+                && track.clean_regions.is_empty()));
         }
     }
 

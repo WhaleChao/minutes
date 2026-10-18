@@ -64,6 +64,10 @@ jobs:
             baseline -> target
             candidate -> target
           key: diarization-quality-${{ runner.arch }}
+      - uses: actions/cache@v6
+        with:
+          path: fixtures
+          key: diarization-public-fixtures-${{ hashFiles('candidate/tests/eval/diarization/*json') }}
       - name: Download and verify only pinned public fixtures and models
         run: python candidate/tests/eval/diarization/fetch.py --directory fixtures
       - name: Build source-bound baseline with the identical probe harness

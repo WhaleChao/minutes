@@ -2,19 +2,21 @@
 """Explicit download of the public, licensed fixtures/models pinned next to this file."""
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import urllib.request
 
 
-def download(url, target, expected):
+def download_once(url, target, expected):
     if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == expected:
         return
     temporary = None
     try:
-        with urllib.request.urlopen(url, timeout=60) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as output:
+        with urllib.request.urlopen(url, timeout=120) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as output:
             temporary = Path(output.name)
             digest, length = hashlib.sha256(), 0
             for block in iter(lambda: response.read(1024 * 1024), b''):
@@ -29,6 +31,17 @@ def download(url, target, expected):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def download(url, target, expected):
+    for attempt in range(3):
+        try:
+            download_once(url, target, expected)
+            return
+        except (OSError, http.client.HTTPException):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def main():
