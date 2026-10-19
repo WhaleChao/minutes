@@ -131,7 +131,6 @@ pub(crate) fn blocked_fixture_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spawn_reaped;
     use std::io::Write;
 
     #[test]
@@ -154,6 +153,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn helper_reaper_does_not_wait_for_slow_helpers_before_reaping_exited_ones() {
+        use crate::spawn_reaped;
+
         let absent = tempfile::tempdir().unwrap();
         let error = spawn_reaped(&mut command(absent.path().join("missing-helper"))).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
