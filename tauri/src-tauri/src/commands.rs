@@ -5068,11 +5068,12 @@ pub fn show_user_notification(app_handle: &tauri::AppHandle, title: &str, body: 
             escape_applescript_literal(title)
         );
 
-        if std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .spawn()
-            .is_ok()
+        if minutes_core::spawn_reaped(
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script),
+        )
+        .is_ok()
         {
             return;
         }
