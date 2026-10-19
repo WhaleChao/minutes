@@ -199,3 +199,20 @@ summaries can conceal substantial speaker-attributed transcription errors.
 Summary quality alone cannot qualify Minutes. An ASR interval spanning several
 voices must abstain until its words can be assigned with adequate timing
 evidence; assigning the whole sentence to its first speaker is insufficient.
+
+## Completed native comparison
+
+The [full native comparison](full-native-diarization-2026-10-18.md) now has
+source-bound Apple Silicon results on three additional AMI development groups:
+weighted DER 28.06%→17.98%, candidate counts 4/4/4 for four reference speakers in
+each meeting, and about 26 times real-time CPU processing. All predeclared gates
+passed. A separate oracle-word diagnostic improved tcpWER 35.25%→29.78%; this
+uses official words/timing and is not end-to-end ASR accuracy. Overlap remains
+a substantial attribution gap. Native cancellation preserved the input WAV.
+
+This advances the comparison step, not the broader promotion gates. Named
+identity, multilingual/short-turn coverage, other native platforms, concurrent
+live latency and installed app parity remain unqualified. The
+[historical audit](diarization-history-and-live-latency-2026-10-18.md) also
+establishes that old fragment merging targeted embedding stability; the recent
+live-transcription responsiveness fixes are a separate path and should remain.

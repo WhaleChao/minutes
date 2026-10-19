@@ -115,3 +115,41 @@ behavior, concurrent live latency and installed capture remain separate gates.
 
 See the [historical rationale and live-path audit](../../../docs/investigations/diarization-history-and-live-latency-2026-10-18.md)
 before treating every merge as a bug or moving refinement into the live loop.
+
+### Oracle-word attribution diagnostic
+
+This is a separate descriptive follow-up, frozen at `047195d2` after model DER
+was available and before word scoring. It does not change the original gates.
+It uses official manual words/timings for both engines, isolating attribution
+from recognition. This is **not end-to-end transcription WER**. Exact known
+word intervals use MeetEval's `full_segment` timing on both sides and a 0.5s
+hypothesis collar for tcpWER. cpWER permits global speaker permutation; tcpWER
+also restricts temporal matches. See [MeetEval's definition](https://github.com/fgnt/meeteval/blob/v0.4.3/doc/tcpwer.md).
+
+Exactly one unique predicted identity intersecting the word interval gets that
+word. Missing activity, any `UNKNOWN`, or multiple identities abstain. Abstained
+words remain in reference and incur attribution deletions; the app's text is
+not deleted. No minimum coverage fraction is required. The check deliberately
+does not resolve overlapping speakers by consulting reference identities.
+Invalid or zero-duration XML word entries are excluded and counted. Fillers
+remain. The policy pins every annotation hash, timing and normalization rule.
+
+```bash
+python3 tests/eval/diarization/fetch_words.py \
+  --policy tests/eval/diarization/oracle-word-policy.json --directory /owned/full-native
+python3 -m venv /owned/word-metrics-venv
+/owned/word-metrics-venv/bin/pip install 'meeteval==0.4.3'
+/owned/word-metrics-venv/bin/python -m unittest discover \
+  -s tests/eval/diarization -p 'test_*.py'
+/owned/word-metrics-venv/bin/python tests/eval/diarization/word_attribution.py \
+  --manifest tests/eval/diarization/full-native-ami.json \
+  --word-policy tests/eval/diarization/oracle-word-policy.json \
+  --annotations /owned/full-native/word-annotations \
+  --predictions /owned/new-results --output /owned/new-word-report.json
+```
+
+MeetEval builds native extensions; use an adequately provisioned isolated
+environment. CI without this optional dependency skips its two conformance
+tests; the recorded Mac run executed all 16 tests with MeetEval 0.4.3 installed.
+The [native comparison report](../../../docs/investigations/full-native-diarization-2026-10-18.md)
+explains the measured gains, limitations and remaining integration gates.
