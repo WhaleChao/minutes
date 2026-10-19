@@ -58,9 +58,11 @@ physical headset device as a second aggregate input/clock.
 The final backend source SHA-256 is
 `c80b8602dd8166b220ee620a6a3d987cf87cb89eff89329b6163db1449fda9fd`.
 It is byte-identical to the backend built and exercised in the signed AirPods
-acceptance candidate `95d028897292f7d3a96817bf41e7e153acbd55f0`. The rest of the
-combined runtime source likewise matches that already-tested candidate; this
-branch separates the capture review from the maintenance fixes. The recorded
+acceptance candidate `95d028897292f7d3a96817bf41e7e153acbd55f0`. The capture runtime matches that already-tested candidate; this branch separates
+the capture review from the maintenance fixes. A subsequent four-line availability
+guard correction makes the relay event reader compile in minimal CLI builds too;
+it does not change its behavior in the streamed desktop build. Minimal core
+check, strict Clippy and all four event-tail tests passed after that correction. The recorded
 WAVs remain private. No recording audio is included in this repository.
 
 Native checks passed: 2,009 model-free core tests (one ignored), 10 streaming
