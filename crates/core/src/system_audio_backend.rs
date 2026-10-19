@@ -452,8 +452,20 @@ struct CoreAudioTapSystemAudioStreamHandle {
     _started_device: cidre::core_audio::hardware::StartedDevice<cidre::core_audio::AggregateDevice>,
     _tap: cidre::core_audio::TapGuard,
     _ctx: Box<CoreAudioTapCallbackContext>,
+    source_rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
     err_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     route: RouteDescription,
+}
+
+#[cfg(all(target_os = "macos", feature = "streaming"))]
+impl Drop for CoreAudioTapSystemAudioStreamHandle {
+    fn drop(&mut self) {
+        let _ = self._started_device.remove_prop_listener(
+            &cidre::core_audio::PropSelector::DEVICE_NOMINAL_SAMPLE_RATE.global_addr(),
+            core_audio_tap_rate_listener,
+            std::sync::Arc::as_ptr(&self.source_rate).cast_mut(),
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "streaming"))]
@@ -471,12 +483,54 @@ impl SystemAudioStreamHandle for CoreAudioTapSystemAudioStreamHandle {
 struct CoreAudioTapCallbackContext {
     sink: AudioSink,
     err_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ratio: f64,
     channels: usize,
     interleaved: bool,
+    resampler: TapResampler,
+    accumulator: crate::streaming::ChunkAccumulator,
+}
+
+/// Decimates tap audio to 16 kHz, following the aggregate device's sample
+/// rate. The tap delivers at the device's rate, which drops to 16 kHz when a
+/// Bluetooth headset switches to HFP, so a ratio fixed at start plays the
+/// stem back 3x too fast (#1165).
+#[cfg(any(test, all(target_os = "macos", feature = "streaming")))]
+struct TapResampler {
+    source_rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
     resample_pos: f64,
     input_samples: Vec<f32>,
-    accumulator: crate::streaming::ChunkAccumulator,
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "streaming")))]
+impl TapResampler {
+    fn new(source_rate: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            source_rate,
+            resample_pos: 0.0,
+            input_samples: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mono: &[f32]) -> Vec<f32> {
+        let ratio =
+            f64::from_bits(self.source_rate.load(std::sync::atomic::Ordering::Relaxed)) / 16_000.0;
+        self.input_samples.extend_from_slice(mono);
+
+        let mut resampled = Vec::new();
+        while self.resample_pos < self.input_samples.len() as f64 {
+            let idx = self.resample_pos as usize;
+            if let Some(sample) = self.input_samples.get(idx) {
+                resampled.push(*sample);
+            }
+            self.resample_pos += ratio;
+        }
+
+        let consumed = (self.resample_pos as usize).min(self.input_samples.len());
+        if consumed > 0 {
+            self.input_samples.drain(..consumed);
+            self.resample_pos -= consumed as f64;
+        }
+        resampled
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "streaming"))]
@@ -485,15 +539,14 @@ impl CoreAudioTapCallbackContext {
         sink: AudioSink,
         err_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         asbd: cidre::cat::AudioStreamBasicDesc,
+        source_rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             sink,
             err_flag,
-            ratio: asbd.sample_rate / 16_000.0,
             channels: asbd.channels_per_frame.max(1) as usize,
             interleaved: asbd.is_interleaved(),
-            resample_pos: 0.0,
-            input_samples: Vec::new(),
+            resampler: TapResampler::new(source_rate),
             accumulator: crate::streaming::ChunkAccumulator::new(),
         }
     }
@@ -504,23 +557,7 @@ impl CoreAudioTapCallbackContext {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         };
-        self.input_samples.extend(mono);
-
-        let mut resampled = Vec::new();
-        while self.resample_pos < self.input_samples.len() as f64 {
-            let idx = self.resample_pos as usize;
-            if let Some(sample) = self.input_samples.get(idx) {
-                resampled.push(*sample);
-            }
-            self.resample_pos += self.ratio;
-        }
-
-        let consumed = (self.resample_pos as usize).min(self.input_samples.len());
-        if consumed > 0 {
-            self.input_samples.drain(..consumed);
-            self.resample_pos -= consumed as f64;
-        }
-
+        let resampled = self.resampler.push(&mono);
         if resampled.is_empty() {
             return;
         }
@@ -633,6 +670,24 @@ extern "C" fn core_audio_tap_io_proc(
 }
 
 #[cfg(all(target_os = "macos", feature = "streaming"))]
+extern "C-unwind" fn core_audio_tap_rate_listener(
+    obj_id: cidre::core_audio::Obj,
+    _number_addresses: u32,
+    _addresses: *const cidre::core_audio::PropAddr,
+    source_rate: *mut std::sync::atomic::AtomicU64,
+) -> cidre::os::Status {
+    if let (Some(source_rate), Ok(rate)) = (
+        unsafe { source_rate.as_ref() },
+        cidre::core_audio::Device(obj_id).nominal_sample_rate(),
+    ) {
+        if rate > 0.0 {
+            source_rate.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    Default::default()
+}
+
+#[cfg(all(target_os = "macos", feature = "streaming"))]
 fn core_audio_tap_start_stream(
     sink: AudioSink,
 ) -> Result<CoreAudioTapSystemAudioStreamHandle, CaptureError> {
@@ -704,22 +759,42 @@ fn core_audio_tap_start_stream(
     let aggregate_device = ca::AggregateDevice::with_desc(&aggregate_desc)
         .map_err(|error| core_audio_error("create private aggregate tap device", error))?;
 
+    // The IOProc runs at the aggregate device's rate, not necessarily the
+    // tap's reported format rate (e.g. 16 kHz on a Bluetooth headset in HFP).
+    let source_rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        aggregate_device
+            .nominal_sample_rate()
+            .ok()
+            .filter(|rate| *rate > 0.0)
+            .unwrap_or(asbd.sample_rate)
+            .to_bits(),
+    ));
+
     let err_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut ctx = Box::new(CoreAudioTapCallbackContext::new(
         sink,
         std::sync::Arc::clone(&err_flag),
         asbd,
+        std::sync::Arc::clone(&source_rate),
     ));
     let proc_id = aggregate_device
         .create_io_proc_id(core_audio_tap_io_proc, Some(ctx.as_mut()))
         .map_err(|error| core_audio_error("create process tap IOProc", error))?;
     let started_device = ca::device_start(aggregate_device, Some(proc_id))
         .map_err(|error| core_audio_error("start process tap device", error))?;
+    if let Err(error) = started_device.add_prop_listener(
+        &ca::PropSelector::DEVICE_NOMINAL_SAMPLE_RATE.global_addr(),
+        core_audio_tap_rate_listener,
+        std::sync::Arc::as_ptr(&source_rate).cast_mut(),
+    ) {
+        tracing::warn!(%error, "could not watch Core Audio Process Tap sample rate");
+    }
 
     Ok(CoreAudioTapSystemAudioStreamHandle {
         _started_device: started_device,
         _tap: tap,
         _ctx: ctx,
+        source_rate,
         err_flag,
         route: RouteDescription {
             capture_backend: CORE_AUDIO_TAP_CAPTURE_BACKEND.into(),
@@ -953,6 +1028,38 @@ mod tests {
         assert_eq!(result.observed_signal.frames_captured, 1600);
         assert_eq!(result.failure_kind, None);
         assert_eq!(result.diagnostic_confidence, DiagnosticConfidence::High);
+    }
+
+    fn tap_resampler_at(rate: f64) -> (TapResampler, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let source_rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(rate.to_bits()));
+        (
+            TapResampler::new(std::sync::Arc::clone(&source_rate)),
+            source_rate,
+        )
+    }
+
+    #[test]
+    fn tap_resampler_passes_16khz_hfp_stream_through_unchanged() {
+        let (mut resampler, _) = tap_resampler_at(16_000.0);
+
+        assert_eq!(resampler.push(&[0.25; 1_600]).len(), 1_600);
+    }
+
+    #[test]
+    fn tap_resampler_decimates_48khz_stream_to_16khz() {
+        let (mut resampler, _) = tap_resampler_at(48_000.0);
+
+        assert_eq!(resampler.push(&[0.25; 4_800]).len(), 1_600);
+    }
+
+    #[test]
+    fn tap_resampler_follows_source_rate_change_mid_stream() {
+        let (mut resampler, source_rate) = tap_resampler_at(48_000.0);
+        assert_eq!(resampler.push(&[0.25; 4_800]).len(), 1_600);
+
+        source_rate.store(16_000f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(resampler.push(&[0.25; 1_600]).len(), 1_600);
     }
 
     #[cfg(not(feature = "streaming"))]
