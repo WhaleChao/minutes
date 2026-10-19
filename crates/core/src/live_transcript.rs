@@ -5684,6 +5684,33 @@ mod tests {
 
     #[cfg(all(feature = "whisper", feature = "streaming"))]
     #[test]
+    fn recording_sidecar_off_skips_the_sidecar_and_writes_the_disabled_status() {
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.live_transcript.recording_sidecar = false;
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let (live_tx, handle) = crate::capture::start_live_sidecar(&config, &stop, None);
+
+            assert!(
+                live_tx.is_none(),
+                "no sender: the pump must not forward audio"
+            );
+            assert!(handle.is_none(), "no sidecar thread may be spawned");
+            let written = read_live_status(&pid::live_transcript_status_path())
+                .expect("the disabled state must be written for live-text readers");
+            assert_eq!(written.state, LiveStatusState::Disabled);
+            let log = std::fs::read_to_string(crate::logging::log_path()).unwrap();
+            assert!(
+                log.lines()
+                    .any(|line| line.contains("\"live_sidecar_skipped\"")),
+                "the skip must be visible in minutes.log"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
     fn disabled_status_is_a_fresh_file_not_a_transition_from_stale_state() {
         with_temp_home(|| {
             let mut stale = live_status_with_state(LiveStatusState::Failed);
