@@ -36,13 +36,37 @@ microphone, initially 48 kHz output). The saved 16 kHz system stem contains
 a 900 Hz tone for 3.00 seconds, a 1.00-second gap and a 600 Hz tone for 3.00
 seconds. All three stems have matching 14.20-second lengths. An initial
 amplitude-only detector missed the quiet tones behind louder app sounds;
-frequency-selective analysis found the expected pattern. Mat independently
-confirmed hearing both tones. This is an AirPods hardware result, not a
+frequency-selective analysis found the expected pattern. Correction on October
+19: Mat clarified that the AirPods were not in his ears during this run, so the
+earlier human hearing confirmation is withdrawn. The saved-file measurements
+remain valid; they do not establish that playback was heard through the headset.
+This initial run is a device-selected capture result, not a
 reproduction on the reporter's 16 kHz Nothing headset or every mid-call route
 transition. Capture used a separate test profile with no speech model; the
 expected missing-model error after stop concerns processing, and the WAVs
 remained intact. Historical damaged recordings are not automatically altered: a 3x correction is valid only when
 that recording's evidence establishes the ratio.
+
+### Repeats with the AirPods worn
+
+Mat confirmed hearing both tones through his AirPods in the first repeat.
+AirPods remained the selected input/output before, during and after recording;
+the output changed from 48 kHz to 24 kHz while the microphone was in use.
+The voice, system and mixed files each contain 12.40 seconds at 16 kHz mono.
+The strict detector rejected this run: the 600 Hz tone was detected before and
+after a 0.28-second interval dominated by another sound. This run supplies the
+fresh human hearing confirmation, not a clean automated timing pass.
+
+A final capture repeat used the same installed executable and the same detector
+thresholds with playback gain 0.8 instead of 0.5. It passed: 900 Hz from 0.30 to
+3.28 seconds, 600 Hz from 4.30 to 7.28 seconds, giving 2.98-second detected tones
+and a 1.02-second gap at the detector's 20 ms resolution. All three WAVs contain
+219,200 frames (13.70 seconds), saved at 16 kHz mono, with AirPods input/output
+observed at 24 kHz during capture. No separate hearing confirmation was requested
+for this final run; Mat's confirmation above applies to the preceding repeat.
+The original clean run, overlapping-sound repeat, and final clean repeat remain
+separate evidence. The installed executable SHA-256 for both repeats is
+`36538a490df92c95953bd6140c50ad726e6dfb6458f433c1cf07ae4f5d936ec0`.
 
 
 ## Contribution and source identity
