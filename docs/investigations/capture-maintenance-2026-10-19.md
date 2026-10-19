@@ -1,55 +1,13 @@
 # Capture and desktop maintenance triage, 2026-10-19
 
 The source baseline is main `7b1d508657d396349b766492bf7340936aab30fd`.
-These investigations concern GH #1159, #1161, #1162, #1163 and #1165.
+These investigations concern GH #1159, #1161, #1162 and #1163.
 The reports below distinguish contributor measurements from synthetic checks.
 No customer audio was accessed or rewritten.
 
-## Bluetooth tap timing (#1165)
-
-Leon reports that a 13m34s Google Meet call with a Nothing Ear (a) headset in
-16 kHz HFP saved the remote speaker into the first third of the system stem,
-followed by digital silence. His exact 3x slow-down recovered intelligible,
-aligned audio. This is attributed evidence from the issue, not a headset
-reproduction by this change.
-
-The old callback held the process tap's format read before aggregate creation,
-used that rate for the entire recording, and included the physical output
-device in its private aggregate. It also combined a buffer's channel count
-with a potentially stale cached count using `max`, which can halve mono frames.
-
-The repair uses a tap-only private aggregate, requests 16 kHz at the HAL boundary,
-and treats the aggregate input stream's actual virtual format as authoritative.
-An off-audio-thread property listener publishes coherent format snapshots to the
-callback. The sample clock carries fractional time across callback and rate
-boundaries; complete output chunks retain their sequence and accumulation.
-Interleaved channel counts come from the delivered buffer headers. Format
-notifications are unregistered and drained before device destruction; callbacks
-retained after a removal failure cannot query a destroyed stream.
-
-This follows the tap/aggregate model described in
-[Apple's capture sample](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)
-and the tap-only aggregate and nominal-rate setup in
-[Chromium's capture implementation](https://chromium.googlesource.com/chromium/src/+/a4545b03c738f0a84468a7f70066c85f80d6b23d/media/audio/mac/catap_audio_input_stream.mm).
-
-Synthetic coverage measures tone pitch and duration at 8, 16, 44.1, 48 and
-96 kHz, irregular callback lengths, fractional phase through rate changes,
-invalid-rate rejection, and the actual macOS callback through a three-second
-stereo/HFP/stereo sequence.
-
-A signed Minutes Dev acceptance check additionally exercised the real generic
-dual-source recording path with AirPods selected for input and output (24 kHz
-microphone, initially 48 kHz output). The saved 16 kHz system stem contains
-a 900 Hz tone for 3.00 seconds, a 1.00-second gap and a 600 Hz tone for 3.00
-seconds. All three stems have matching 14.20-second lengths. An initial
-amplitude-only detector missed the quiet tones behind louder app sounds;
-frequency-selective analysis found the expected pattern. Mat independently
-confirmed hearing both tones. This is an AirPods hardware result, not a
-reproduction on the reporter's 16 kHz Nothing headset or every mid-call route
-transition. Capture used a separate test profile with no speech model; the
-expected missing-model error after stop concerns processing, and the WAVs
-remained intact. Historical damaged recordings are not automatically altered: a 3x correction is valid only when
-that recording's evidence establishes the ratio.
+The Bluetooth tap repair and native AirPods qualification are being reconciled
+with Leon's PR #1166 in a separate capture change. The maintenance fixes here do
+not change the system-audio backend.
 
 ## Relay polling (#1159)
 
@@ -128,7 +86,8 @@ first broad run and passed in isolation; its source was unchanged. Full-suite
 results are recorded separately from these focused checks.
 
 The final native model-free run passed 2,009 tests, with one deliberately ignored.
-The streaming audio-backend suite passed 10 tests and the relay suite passed 24.
+The shared-candidate streaming audio suite passed 10 tests before the capture
+change was split out; the relay suite passed 24.
 Whole-workspace no-default-features Clippy, formatting, coverage auditing and
 the static website build passed. The stored-offer controller passed its three
 Node tests; the signed app rendered a simulated offer, cleared it on Dev restart,
