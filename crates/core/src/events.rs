@@ -882,7 +882,6 @@ fn latest_event_seq_from_active_log_tail_inner(path: &Path) -> std::io::Result<O
 // A relay follows only bytes appended after its startup snapshot. Historical
 // queries keep their replay semantics; capture never reparses that history on
 // its 10 ms accept/partial loop.
-#[cfg(any(feature = "streaming", test))]
 struct EventTailFile {
     file: fs::File,
     identity: same_file::Handle,
@@ -891,7 +890,6 @@ struct EventTailFile {
     oversized: bool,
 }
 
-#[cfg(any(feature = "streaming", test))]
 impl EventTailFile {
     fn open(path: &Path, at_end: bool) -> std::io::Result<Self> {
         let mut file = fs::File::open(path)?;
@@ -911,7 +909,6 @@ impl EventTailFile {
     }
 }
 
-#[cfg(any(feature = "streaming", test))]
 pub(crate) struct EventTail {
     current: Option<EventTailFile>,
     queued: std::collections::VecDeque<EventTailFile>,
@@ -921,7 +918,6 @@ pub(crate) struct EventTail {
     bytes_read: usize,
 }
 
-#[cfg(any(feature = "streaming", test))]
 impl EventTail {
     /// Writers use the same lock, so the sequence and starting byte offset are
     /// one snapshot. Events appended after it cannot fall into a startup gap.
