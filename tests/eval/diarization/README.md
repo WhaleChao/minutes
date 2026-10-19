@@ -150,6 +150,6 @@ python3 -m venv /owned/word-metrics-venv
 
 MeetEval builds native extensions; use an adequately provisioned isolated
 environment. CI without this optional dependency skips its two conformance
-tests; the recorded Mac run executed all 16 tests with MeetEval 0.4.3 installed.
+tests; the recorded Mac run executed all 17 tests with MeetEval 0.4.3 installed.
 The [native comparison report](../../../docs/investigations/full-native-diarization-2026-10-18.md)
 explains the measured gains, limitations and remaining integration gates.

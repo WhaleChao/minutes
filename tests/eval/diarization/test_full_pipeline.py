@@ -5,8 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from full_pipeline import FILE_LIMIT, read_rttm, supervise, verified_files
+from full_pipeline import FILE_LIMIT, kill_group, read_rttm, supervise, verified_files
 from run import digest
 
 
@@ -69,6 +70,16 @@ class FullPipelineTests(unittest.TestCase):
             process = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
             self.assertTrue(process.returncode != 0 or not process.stdout.strip()
                             or process.stdout.strip().startswith('Z'), process.stdout)
+
+    def test_denied_cleanup_only_ignores_absent_or_zombie_groups(self):
+        with patch('full_pipeline.os.killpg', side_effect=PermissionError), \
+                patch('full_pipeline.subprocess.check_output') as status:
+            for listing in ('', '123 Z\n', '123 Z+\n456 S\n'):
+                status.return_value = listing
+                kill_group(123)
+            status.return_value = '123 S\n'
+            with self.assertRaises(PermissionError):
+                kill_group(123)
 
     def test_kernel_file_limit_stops_runaway_output(self):
         with tempfile.TemporaryDirectory() as tmp:

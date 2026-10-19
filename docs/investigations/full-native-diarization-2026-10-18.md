@@ -91,19 +91,27 @@ nice 10, a 15 minute wall deadline, one-hour admitted-audio ceiling, a 4 GiB sam
 RSS watchdog and a 16 MiB kernel output-file limit. The RSS guard is not a kernel
 memory reservation. Per-child peak memory is measured separately with `wait4`.
 
-All 16 scorer/supervisor/word tests passed on the native Mac, including actual
+All 17 scorer/supervisor/word tests passed on the native Mac, including actual
 worker-descendant cancellation, deadline/RSS termination, output limiting,
 provider-environment exclusion, global permutation, all-unknown deletion penalty
-and time-constrained word matching. Linux passed 14 with the two optional
+and time-constrained word matching. Linux passed 15 with the two optional
 MeetEval tests skipped. Installing MeetEval's compiled extensions on the
 resource-constrained VM failed with SIGTERM; the actual metrics ran successfully
 in an isolated Mac Python 3.12.13 environment.
+
+Hosted macOS CI subsequently exposed an already-reaped process-group cleanup
+race. Cleanup now accepts a denied signal only when process metadata confirms
+no live group member remains; denied termination of a live member still fails.
+The additional regression control is included in the 17 tests above. This changes
+supervision cleanup only; the frozen `13b790ca` model report retains its original
+runner hash, model configuration and predictions.
 
 Separately, the actual native candidate on IB4001 was cancelled after one second;
 it exited by SIGKILL after 1.280 seconds with the WAV SHA256 unchanged. The exact
 internal inference phase was not instrumented. This proves this offline worker
 can be terminated without changing its input, not that installed live capture
-has been qualified. The normal installed Minutes/Minutes Dev apps were untouched.
+has been qualified. The normal installed Minutes/Minutes Dev apps were untouched. A repeat with the
+cleanup correction terminated in 1.269 seconds and preserved the same input hash.
 
 ## Integration recommendation and remaining gates
 
@@ -135,6 +143,7 @@ build and scoring instructions. Hash-bound public numeric reports:
 - [Frozen word policy](../../tests/eval/diarization/oracle-word-policy.json)
 - [Oracle-word report](../../tests/eval/diarization/reports/2026-10-18/oracle-words.json)
 - [Actual native cancellation receipt](../../tests/eval/diarization/reports/2026-10-18/native-cancellation.json)
+- [Cancellation with corrected cleanup](../../tests/eval/diarization/reports/2026-10-18/native-cancellation-cleanup.json)
 
 Raw predictions, annotations, models and local build logs remain private task
 artifacts on the evaluation host; they are not bundled into Minutes or this PR.

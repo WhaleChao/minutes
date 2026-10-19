@@ -48,6 +48,20 @@ def group_rss_bytes(group):
                if len(row := line.split()) == 3 and int(row[1]) == group)
 
 
+def kill_group(group):
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin may report EPERM after the root was reaped while only dead
+        # descendants remain. Never suppress a denied signal to a live member.
+        output = subprocess.check_output(['ps', '-axo', 'pgid=,stat='], text=True)
+        if any(int(row[0]) == group and not row[1].startswith('Z')
+               for line in output.splitlines() if len(row := line.split()) == 2):
+            raise
+
+
 def supervise(command, output, wall_seconds=900, rss_bytes=4 * 1024**3,
               cancel_after=None, poll_seconds=0.2):
     """Kernel file-size limit, sampled group RSS guard, deadline and group kill.
@@ -90,20 +104,14 @@ def supervise(command, output, wall_seconds=900, rss_bytes=4 * 1024**3,
                 elif rss > rss_bytes:
                     reason = 'sampled_group_rss_budget'
                 if reason:
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    kill_group(child.pid)
                     _, status, usage = os.wait4(child.pid, 0)
                     child.returncode = os.waitstatus_to_exitcode(status)
                     break
                 time.sleep(poll_seconds)
         finally:
             # Also terminate descendants left behind after a successful root exit.
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_group(child.pid)
             if child.returncode is None:
                 child.wait()
     kernel_peak = usage.ru_maxrss * (1 if sys.platform == 'darwin' else 1024)
