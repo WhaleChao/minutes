@@ -69,3 +69,8 @@ and a signed installed Dev build. The original amplitude detector failed its
 threshold check and was corrected by frequency analysis; that initial failure
 is not a capture failure or an erased result. The app's default recording and
 transcription backends remain unchanged. A packaged release is separate.
+
+The [machine-readable native receipt](bluetooth-tap-sample-rate-2026-10-19.json)
+records the source digest, input/output rates, saved frame counts, expected and
+measured tone intervals, and the frequency-selective analysis method. It contains
+measurements only, with no captured audio.
