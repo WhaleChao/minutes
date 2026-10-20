@@ -680,8 +680,25 @@ private func runCaptureLifecycleSelfTest() -> Bool {
 }
 
 @available(macOS 15.0, *)
+private func captureStartupError(_ error: Error) -> Error {
+    let detail = error as NSError
+    // Apple's userDeclined specifically means Screen Recording access was
+    // refused. Preserve other errors rather than misdiagnosing every failure.
+    guard detail.domain == SCStreamErrorDomain,
+          detail.code == SCStreamError.Code.userDeclined.rawValue else { return error }
+    return NSError(domain: detail.domain, code: detail.code, userInfo: [
+        NSLocalizedDescriptionKey: "System audio access was declined. Allow Minutes in System Settings > Privacy & Security > Screen Recording (Screen & System Audio Recording on newer macOS), then retry. If Minutes is already allowed, restart the idle app and recheck capture access."
+    ])
+}
+
+@available(macOS 15.0, *)
 private func runCaptureRecoverySelfTest() async -> Bool {
     var checks: [Bool] = []
+    let denied = NSError(domain: SCStreamErrorDomain, code: SCStreamError.Code.userDeclined.rawValue)
+    checks.append(captureStartupError(denied).localizedDescription.contains("Screen Recording"))
+    let unrelated = NSError(domain: "SyntheticCaptureFailure", code: 42,
+        userInfo: [NSLocalizedDescriptionKey: "A distinct test error"])
+    checks.append(captureStartupError(unrelated).localizedDescription == "A distinct test error")
     let lifecycle = CaptureLifecycle()
     checks.append(lifecycle.beginRecovery())
     checks.append(!lifecycle.beginRecovery())
@@ -929,6 +946,16 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     }
 
     func start() async throws {
+        // This helper owns the actual capture operation. Its authorization is
+        // authoritative; the desktop parent's cached TCC probe can be stale.
+        var microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            microphoneAllowed = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+        guard microphoneAllowed else {
+            throw NSError(domain: "MinutesSystemAudioRecord", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Microphone access is required to record both sides. Allow Minutes in System Settings > Privacy & Security > Microphone, then try again."])
+        }
         let baseName = outputURL.deletingPathExtension().lastPathComponent
         let stemDir = outputURL.deletingLastPathComponent()
         voiceStemURL = stemDir.appendingPathComponent("\(baseName).voice.wav")
@@ -936,7 +963,11 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         voiceStemWriter = voiceStemURL.map { FixedFormatStemWriter(url: $0) }
         systemStemWriter = systemStemURL.map { FixedFormatStemWriter(url: $0) }
         withState { originUptime = ProcessInfo.processInfo.systemUptime }
-        try await startStream(attempt: 0)
+        do {
+            try await startStream(attempt: 0)
+        } catch {
+            throw captureStartupError(error)
+        }
         startMonitoring()
     }
 
@@ -995,6 +1026,11 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             }
         } else {
             microphone = AVCaptureDevice.default(for: .audio)
+        }
+
+        guard microphone != nil else {
+            throw NSError(domain: "MinutesSystemAudioRecord", code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "No microphone is available. Connect a microphone and try again; recording has not started."])
         }
 
         if let microphone {

@@ -1074,6 +1074,10 @@ pub struct RecordingConfig {
     /// Audio input device name override. When set, Minutes uses this device
     /// instead of the system default. Use `minutes devices` to list available names.
     pub device: Option<String>,
+    /// Explicit desktop meeting audio choice. None requires a first-use choice;
+    /// CLI recording intent and sources remain independent of this preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_audio_source: Option<String>,
     /// Automatically infer call intent when a known call app is detected.
     /// Default: false. Process-based detection has high false-positive rates
     /// (e.g. Zoom running but not in a call). Users trigger call capture
@@ -1111,6 +1115,7 @@ impl Default for RecordingConfig {
             max_duration_secs: 28800,
             min_disk_space_mb: 500,
             device: None,
+            desktop_audio_source: None,
             auto_call_intent: false,
             allow_degraded_call_capture: false,
             capture_backend: "cpal".into(),
