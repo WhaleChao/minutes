@@ -243,6 +243,11 @@ jobs:
         # otherwise only surfaces at release, and exercises Linux beyond no-default-features.
         run: cargo build -p minutes-core --no-default-features --features engine-sherpa
 
+      - name: Sherpa meeting model lifetime and fallback
+        if: runner.os != 'Windows'
+        # Compiles a tiny deterministic ABI fixture, with no model download.
+        run: cargo test -p minutes-core --no-default-features --features engine-sherpa --test sherpa_meeting_reuse -- --test-threads=1
+
       - name: Sherpa and diarize share one binary (#685)
         # The inverse of the guard this replaces. #683 proved the two stacks
         # cannot be statically linked together; the plugin moved sherpa behind
