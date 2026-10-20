@@ -978,12 +978,17 @@ enum Commands {
         language: Option<String>,
     },
 
-    /// Download whisper model and set up minutes
+    /// Install speech models; --model selects the Whisper model unless --download-only is set
     Setup {
-        /// Whisper model to download (tiny, base, small, medium, large-v3), or with
-        /// --diarization the model set: legacy or community-1. Omit to let setup choose.
+        /// Whisper model to install and select (base, small, medium, large-v3;
+        /// tiny is an explicit low-resource option), or with --diarization:
+        /// legacy or community-1. Omit to keep the configured model.
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Install --model without changing any saved model or engine selection
+        #[arg(long, requires = "model", conflicts_with_all = ["vad", "list", "diarization", "parakeet", "sherpa", "sherpa_model", "demo"])]
+        download_only: bool,
 
         /// Download only the Silero VAD model(s) into the configured model directory; takes precedence over --model
         #[arg(long)]
@@ -2467,6 +2472,7 @@ fn main() -> Result<()> {
         Commands::Sources => cmd_sources(),
         Commands::Setup {
             model,
+            download_only,
             vad,
             list,
             diarization,
@@ -2487,13 +2493,44 @@ fn main() -> Result<()> {
             } else if sherpa {
                 cmd_setup_sherpa(&config, true)
             } else if list {
-                cmd_setup("small", true, false)
+                cmd_setup("small", true, false, false)
             } else if diarization {
-                cmd_setup(model.as_deref().unwrap_or("small"), false, true)
+                cmd_setup(model.as_deref().unwrap_or("small"), false, true, false)
             } else {
-                let plan = setup_plan(model.as_deref());
+                let plan = setup_plan(model.as_deref(), &config);
                 eprintln!("Setup selection: {}", plan.reason);
-                cmd_setup(&plan.whisper_model, false, false)?;
+                let select_model = model.is_some() && !download_only;
+                if select_model {
+                    eprintln!(
+                        "This will set transcription.model = \"{}\". Use --download-only to install it without changing your selection.",
+                        plan.whisper_model
+                    );
+                } else {
+                    eprintln!("Saved model and engine selections will be preserved.");
+                }
+                if model.is_none() && !is_downloadable_whisper_model(&plan.whisper_model) {
+                    eprintln!(
+                        "Keeping custom Whisper model {}; manage its file separately.",
+                        plan.whisper_model
+                    );
+                } else {
+                    cmd_setup(&plan.whisper_model, false, false, select_model)?;
+                }
+                if model.is_none() {
+                    // Live and dictation have independent selections. Installing
+                    // their models must never replace the batch model.
+                    let mut installed = vec![plan.whisper_model.as_str()];
+                    for live_model in [&config.dictation.model, &config.live_transcript.model] {
+                        if !live_model.is_empty() && !installed.contains(&live_model.as_str()) {
+                            if is_downloadable_whisper_model(live_model) {
+                                cmd_setup(live_model, false, false, false)?;
+                                installed.push(live_model);
+                            } else {
+                                eprintln!("Keeping custom live/dictation model {live_model}; manage its file separately.");
+                            }
+                        }
+                    }
+                }
                 if plan.install_sherpa {
                     cmd_setup_sherpa(&config, false)?;
                 }
@@ -7789,7 +7826,7 @@ struct SetupPlan {
     reason: String,
 }
 
-fn setup_plan(explicit_model: Option<&str>) -> SetupPlan {
+fn setup_plan(explicit_model: Option<&str>, config: &Config) -> SetupPlan {
     #[cfg(feature = "engine-sherpa")]
     let plugin_present = minutes_core::sherpa_plugin::plugin_available();
     #[cfg(not(feature = "engine-sherpa"))]
@@ -7797,17 +7834,19 @@ fn setup_plan(explicit_model: Option<&str>) -> SetupPlan {
 
     setup_plan_for(
         explicit_model,
+        &config.transcription.model,
         cfg!(all(
             feature = "engine-sherpa",
             target_os = "macos",
             target_arch = "aarch64"
-        )),
+        )) && config.transcription.engine == "auto",
         plugin_present,
     )
 }
 
 fn setup_plan_for(
     explicit_model: Option<&str>,
+    configured_model: &str,
     sherpa_auto_supported: bool,
     plugin_present: bool,
 ) -> SetupPlan {
@@ -7815,39 +7854,43 @@ fn setup_plan_for(
         return SetupPlan {
             whisper_model: model.to_string(),
             install_sherpa: false,
-            reason: format!("--model selected Whisper {model}."),
+            reason: format!("--model requests installation of Whisper {model}."),
         };
     }
 
     if sherpa_auto_supported && plugin_present {
         SetupPlan {
-            whisper_model: "tiny".into(),
+            whisper_model: configured_model.into(),
             install_sherpa: true,
-            reason: "this Apple Silicon build includes sherpa, so setup will install Parakeet v3 plus Whisper tiny for live and dictation fallback.".into(),
+            reason: format!("this Apple Silicon build includes sherpa, so setup will install Parakeet v3 and keep the configured Whisper {configured_model} model. Live and dictation keep their own selections."),
         }
     } else if sherpa_auto_supported {
         SetupPlan {
-            whisper_model: "small".into(),
+            whisper_model: configured_model.into(),
             install_sherpa: false,
-            reason: "this Apple Silicon build includes sherpa but its plugin is missing, so setup will install Whisper small. Install `minutes-macos-arm64-sherpa.tar.gz` or the signed desktop app to get the plugin and Parakeet v3.".into(),
+            reason: format!("this Apple Silicon build includes sherpa but its plugin is missing, so setup will keep Whisper {configured_model}. Install `minutes-macos-arm64-sherpa.tar.gz` or the signed desktop app to get the plugin and Parakeet v3."),
         }
     } else {
         SetupPlan {
-            whisper_model: "small".into(),
+            whisper_model: configured_model.into(),
             install_sherpa: false,
-            reason: "sherpa auto-selection is unavailable on this build or platform, so setup will install Whisper small.".into(),
+            reason: format!("sherpa auto-selection is unavailable on this build or platform, so setup will keep Whisper {configured_model}."),
         }
     }
 }
 
-fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
+fn is_downloadable_whisper_model(model: &str) -> bool {
+    ["tiny", "base", "small", "medium", "large-v3"].contains(&model)
+}
+
+fn cmd_setup(model: &str, list: bool, diarization: bool, select_model: bool) -> Result<()> {
     if list {
         eprintln!("Available whisper models:");
-        eprintln!("  tiny      75 MB   (fastest, lowest quality)");
         eprintln!("  base     142 MB");
         eprintln!("  small    466 MB   (recommended default)");
         eprintln!("  medium   1.5 GB");
         eprintln!("  large-v3 3.1 GB   (best quality, slower)");
+        eprintln!("  tiny      75 MB   (advanced low-resource choice; lower accuracy)");
         eprintln!();
         eprintln!("Speaker diarization:");
         eprintln!("  --diarization   34 MB   (pyannote-rs: segmentation + speaker embedding)");
@@ -7884,7 +7927,7 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
     }
 
     let valid_models = ["tiny", "base", "small", "medium", "large-v3"];
-    if !valid_models.contains(&model) {
+    if !is_downloadable_whisper_model(model) {
         anyhow::bail!(
             "unknown model: {}. Available: {}",
             model,
@@ -7971,20 +8014,21 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
         }
     }
 
-    let config_path = Config::config_path();
-    Config::upsert_string_setting_at(&config_path, "transcription", "model", model).with_context(
-        || {
-            format!(
-                "failed to save the selected model in {}",
-                config_path.display()
-            )
-        },
-    )?;
-    eprintln!(
-        "Configured transcription.model = \"{}\" in {}",
-        model,
-        config_path.display()
-    );
+    if select_model {
+        let config_path = Config::config_path();
+        Config::upsert_string_setting_at(&config_path, "transcription", "model", model)
+            .with_context(|| {
+                format!(
+                    "failed to save the selected model in {}",
+                    config_path.display()
+                )
+            })?;
+        eprintln!(
+            "Configured transcription.model = \"{}\" in {}",
+            model,
+            config_path.display()
+        );
+    }
 
     download_vad_models(model_dir)?;
 
@@ -9640,7 +9684,7 @@ mod tests {
     /// (`STATUS_STACK_OVERFLOW` in `copilot_start_parses_goal_and_surface`
     /// on #883). Production parsing runs once on the main thread and is
     /// unaffected; this keeps the tests honest without shrinking coverage.
-    fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
+    pub(super) fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -10499,26 +10543,63 @@ life (qmd://life/)
 
     #[test]
     fn setup_plan_keeps_explicit_model_and_platform_defaults() {
-        let explicit = setup_plan_for(Some("medium"), true, false);
+        let explicit = setup_plan_for(Some("medium"), "small", true, false);
         assert_eq!(explicit.whisper_model, "medium");
         assert!(!explicit.install_sherpa);
 
-        let apple_silicon = setup_plan_for(None, true, true);
-        assert_eq!(apple_silicon.whisper_model, "tiny");
+        let apple_silicon = setup_plan_for(None, "small", true, true);
+        assert_eq!(apple_silicon.whisper_model, "small");
         assert!(apple_silicon.install_sherpa);
         assert!(apple_silicon.reason.contains("Apple Silicon"));
 
-        let plugin_missing = setup_plan_for(None, true, false);
-        assert_eq!(plugin_missing.whisper_model, "small");
+        let plugin_missing = setup_plan_for(None, "medium", true, false);
+        assert_eq!(plugin_missing.whisper_model, "medium");
         assert!(!plugin_missing.install_sherpa);
         assert!(plugin_missing
             .reason
             .contains("minutes-macos-arm64-sherpa.tar.gz"));
         assert!(plugin_missing.reason.contains("desktop app"));
 
-        let fallback = setup_plan_for(None, false, false);
-        assert_eq!(fallback.whisper_model, "small");
+        let fallback = setup_plan_for(None, "large-v3", false, false);
+        assert_eq!(fallback.whisper_model, "large-v3");
         assert!(!fallback.install_sherpa);
+
+        // Tiny remains valid when a user deliberately selected it. Setup must
+        // not silently upgrade that choice either.
+        let retained = setup_plan_for(None, "tiny", true, true);
+        assert_eq!(retained.whisper_model, "tiny");
+    }
+
+    #[test]
+    fn download_only_requires_one_whisper_model_and_rejects_other_setup_modes() {
+        let parsed = parse_cli(["minutes", "setup", "--model", "base", "--download-only"])
+            .expect("install-only Whisper setup must parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::Setup {
+                download_only: true,
+                ..
+            }
+        ));
+        assert!(parse_cli(["minutes", "setup", "--download-only"]).is_err());
+        for mode in [
+            "--vad",
+            "--list",
+            "--diarization",
+            "--parakeet",
+            "--sherpa",
+            "--demo",
+        ] {
+            assert!(parse_cli([
+                "minutes",
+                "setup",
+                "--model",
+                "base",
+                "--download-only",
+                mode
+            ])
+            .is_err());
+        }
     }
 
     #[test]
@@ -11886,7 +11967,15 @@ life (qmd://life/)
             .to_string();
         assert!(!help.contains("authorized-input"));
 
-        let command = Cli::command();
+        // CommandFactory builds the same large debug parser as parse_cli.
+        // Keep this inspection on the established #884 test stack as well.
+        let command = std::thread::Builder::new()
+            .name("cli-command-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(Cli::command)
+            .expect("spawn cli command thread")
+            .join()
+            .expect("cli command thread panicked");
         let process = command
             .find_subcommand("process")
             .expect("process subcommand exists");

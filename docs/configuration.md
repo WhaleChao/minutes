@@ -10,7 +10,8 @@ Optional — minutes works out of the box.
 engine = "auto"           # Apple Silicon release builds use Parakeet v3 when installed, otherwise Whisper
 # engine = "whisper"      # Keep Whisper explicitly on every platform
 # engine = "sherpa"       # Select the in-process Parakeet v3 engine explicitly
-model = "small"           # whisper: tiny (75MB), base, small (466MB), medium, large-v3 (3.1GB)
+model = "small"           # Whisper meeting baseline: small (466MB); base, medium, large-v3 also supported
+                          # tiny (75MB) is an explicit advanced low-resource choice with lower accuracy
 # language = "ur"          # Force transcription language (ISO 639-1 code, e.g. "en", "ur", "es", "zh")
                           # Default: auto-detect. Set this for similar-sounding languages (Urdu/Hindi, etc.)
 # engine = "apple-speech"  # Retained for compatibility; currently resolves to Whisper until signed runtime acceptance passes.
@@ -176,3 +177,28 @@ Images are never attached to every prompt automatically, and an assistant
 should only claim it can see the screen after it has opened or received a
 specific returned image. Unless `keep_after_summary = true`, Minutes deletes
 the PNGs and their readable references after summarization.
+
+## Installing models without changing your preferences
+
+`minutes setup` keeps your configured meeting model (Small by default), installs
+the selected Live/dictation models (Base by default), and preserves all model and
+engine selections. On supported Apple Silicon builds with the sherpa plugin, it
+also installs Parakeet for the Auto engine.
+
+To install a companion model without selecting it for every meeting:
+
+```bash
+minutes setup --model base --download-only
+```
+
+An explicit `minutes setup --model small` installs and selects Small for Whisper
+meeting transcription. It does not change the separate dictation or Live model.
+The command explains the selection before installation.
+
+Tiny remains available through `--model tiny` or the advanced model options.
+Minutes does not select it as an automatic fallback. Existing Tiny preferences
+are preserved; choose a larger model explicitly to upgrade.
+
+Background MCP model installation uses `--download-only`. If an older CLI does
+not support that flag, update Minutes; the MCP server will not retry with a
+command that changes your preferences.

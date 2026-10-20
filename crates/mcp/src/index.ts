@@ -2578,7 +2578,7 @@ export type EnsureWhisperModelOptions = {
   checkState?: WhisperModelCheckState;
   health?: () => Promise<string>;
   configFileExists?: () => Promise<boolean>;
-  setup?: (model?: string) => Promise<void>;
+  setup?: (model: string) => Promise<void>;
   log?: (message: string) => void;
 };
 
@@ -2601,8 +2601,10 @@ export async function ensureWhisperModel(
     });
     return stdout;
   });
-  const setup = options.setup ?? (async (model?: string) => {
-    const args = model === undefined ? ["setup"] : ["setup", "--model", model];
+  const setup = options.setup ?? (async (model: string) => {
+    // Background availability checks may install the selected model, but
+    // must never select another one or rewrite a concurrently edited config.
+    const args = ["setup", "--model", model, "--download-only"];
     await execFileAsync(MINUTES_BIN, args, {
       timeout: 300000,
       env: mcpCliChildEnv(),
@@ -2631,15 +2633,9 @@ export async function ensureWhisperModel(
     healthOutput.effectiveEngine?.toLowerCase() === "whisper" &&
     healthOutput.reason === "whisper: parakeet model missing — run minutes setup";
   if (parakeetModelMissing) {
-    log("[Minutes] Auto found the sherpa plugin but Parakeet is missing — running minutes setup...");
-    try {
-      await setup();
-      log("[Minutes] ✓ Parakeet and Whisper fallback models downloaded — recording is ready");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`[Minutes] Model download failed: ${message}. Run manually: minutes setup`);
-    }
-    return;
+    log(
+      "[Minutes] Parakeet is not installed — keeping your configured Whisper selection. Run minutes setup to install Parakeet; background setup will not change engines or models."
+    );
   }
 
   // Auto may resolve to sherpa when Parakeet v3 is installed. In that case
@@ -2699,16 +2695,16 @@ export async function ensureWhisperModel(
       );
       return;
     }
-    model = "tiny";
-    log("[Minutes] No Whisper model is configured — downloading tiny model (~75MB)...");
+    model = "small";
+    log("[Minutes] No Whisper model is configured — installing the default small model without changing saved settings...");
   }
 
   try {
     await setup(model);
-    log(`[Minutes] ✓ Whisper ${model} model downloaded — recording is ready`);
+    log(`[Minutes] ✓ Whisper ${model} model downloaded; saved selections were preserved`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    log(`[Minutes] Model download failed: ${message}. Run manually: minutes setup --model ${model}`);
+    log(`[Minutes] Model download failed: ${message}. To install without changing your selection, run minutes setup --model ${model} --download-only. If the CLI does not support --download-only, upgrade Minutes first.`);
   }
 }
 

@@ -9655,6 +9655,10 @@ pub fn cmd_needs_setup(state: tauri::State<AppState>) -> serde_json::Value {
             "batch": batch_setup,
             "standaloneLive": standalone_live_setup,
         },
+        "modelSelections": {
+            "dictation": config.dictation.model,
+            "standaloneLive": config.live_transcript.model,
+        },
         "hasMeetingsDir": has_meetings_dir,
         "activation": primary_setup.activation.clone(),
     })

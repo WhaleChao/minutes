@@ -6628,12 +6628,15 @@
           <div class="about-controls-group">
             <div class="about-controls-copy">Whisper model</div>
             <select id="settings-whisper-model" class="settings-field">
-              <option value="tiny">tiny — 75 MB, fastest, lower quality</option>
-              <option value="base">base — 148 MB, fast, decent quality</option>
+              <option value="base">base — 142 MB, lower resource use</option>
               <option value="small">small — 466 MB, good quality (recommended)</option>
               <option value="medium">medium — 1.5 GB, great quality</option>
               <option value="large-v3">large-v3 — 3.1 GB, best quality</option>
+              <optgroup label="Advanced: lower memory, lower accuracy">
+                <option value="tiny">tiny — 75 MB, explicit low-resource choice</option>
+              </optgroup>
             </select>
+            <div class="about-controls-meta is-hidden" id="settings-tiny-model-note">Tiny is selected. For more reliable meeting transcripts, choose Small or a larger model and download it. Your current selection is preserved until you change it.</div>
             <div class="settings-section-inline settings-section-inline-tight">
               <div class="about-controls-meta settings-model-status" id="settings-model-status"></div>
               <button class="btn btn-secondary btn-sm is-hidden" id="btn-download-model">Download</button>
@@ -6832,11 +6835,13 @@
             <div class="about-controls-group">
               <div class="about-controls-copy">Dictation whisper model</div>
               <select id="settings-dictation-model" class="settings-field">
-                <option value="tiny">tiny — fastest, lower quality</option>
                 <option value="base">base — fast, decent quality (default)</option>
                 <option value="small">small — good quality, slower</option>
                 <option value="medium">medium — more accurate, slower</option>
                 <option value="large-v3">large-v3 — highest Whisper quality, most memory</option>
+                <optgroup label="Advanced: lower memory, lower accuracy">
+                  <option value="tiny">tiny — explicit low-resource choice</option>
+                </optgroup>
               </select>
               <div class="about-controls-meta">Larger Whisper models use more memory and take longer. Install a missing model above, or manage models in Transcription settings.</div>
             </div>
@@ -7982,11 +7987,18 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       const watchStep = root.querySelector('#step-watch-artifact');
       const watchStatus = root.querySelector('#step-watch-artifact-status');
 
-      if (activation.hasModel || milestones.modelReadyAt) {
-        modelStep?.classList.add('done');
+      // A past download milestone does not prove the currently selected
+      // model is installed. Current readiness wins after a selection change
+      // or a failed companion install.
+      const modelReady = activation.hasModel === true;
+      modelStep?.classList.toggle('done', modelReady);
+      modelBody?.classList.toggle('ui-hidden', modelReady);
+      if (modelReady) {
         setText(modelStatus, 'Done');
-        modelBody?.classList.add('ui-hidden');
         artifactStep?.classList.remove('disabled');
+      } else {
+        setText(modelStatus, 'Needs setup');
+        artifactStep?.classList.add('disabled');
       }
 
       if (milestones.firstRecordingStartedAt) {
@@ -11953,6 +11965,33 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     }
 
+    async function installOnboardingModels(model) {
+      // Read only model readiness/preferences; full Settings also probes
+      // providers and must not delay or block first-run installation.
+      const setup = await invoke('cmd_needs_setup');
+      const selections = setup.modelSelections;
+      if (!selections || typeof selections.dictation !== 'string' || typeof selections.standaloneLive !== 'string') {
+        throw new Error('Could not read your saved speech model choices. Try setup again.');
+      }
+      // Batch, Live and dictation are separate choices. Install the existing
+      // companion selections rather than making all three use the batch model.
+      const models = new Set([model]);
+      const dictationModel = selections.dictation;
+      const liveModel = selections.standaloneLive || dictationModel;
+      for (const companion of [dictationModel, liveModel]) {
+        if (['tiny', 'base', 'small', 'medium', 'large-v3'].includes(companion)) {
+          models.add(companion);
+        }
+      }
+      for (const selected of models) {
+        await invoke('cmd_download_model', { model: selected });
+      }
+      // An explicit onboarding choice selects only the batch model, and only
+      // after installation succeeds. Failures leave all selections untouched.
+      await invoke('cmd_set_setting', { section: 'transcription', key: 'model', value: model });
+      return invoke('cmd_needs_setup');
+    }
+
     function setupOnboarding(root) {
       applyActivationState(root, currentSetup?.activation || activationState);
 
@@ -11976,40 +12015,20 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           }, 500);
 
           try {
-            const result = await invoke('cmd_download_model', { model });
+            const setup = await installOnboardingModels(model);
             clearInterval(progressTimer);
             fill.style.width = '100%';
-            text.textContent = result;
+            text.textContent = setup.needsSetup
+              ? 'Meeting model installed. Another selected speech model still needs setup in Settings.'
+              : 'Speech models ready. Live and dictation keep their own selections.';
 
-            // Persist the chosen model to ALL whisper-backed surfaces:
-            // transcription (batch + recording pipeline) AND dictation.
-            // live_transcript.model defaults to empty which falls back to
-            // dictation.model per the comment in config.rs, so updating
-            // dictation propagates transitively.
-            //
-            // Before this, cmd_download_model only put the file on disk;
-            // a user picking "tiny" in onboarding would still have
-            // transcription.model="small" (default) and dictation.model=
-            // "base" (default) and Minutes would try to use models that
-            // were not downloaded. allaire surfaced the dictation half
-            // of this in the v0.17.0 ship feedback.
-            try {
-              await invoke('cmd_set_setting', { section: 'transcription', key: 'model', value: model });
-            } catch (settingErr) {
-              console.warn('onboarding: failed to persist transcription.model:', settingErr);
-            }
-            try {
-              await invoke('cmd_set_setting', { section: 'dictation', key: 'model', value: model });
-            } catch (settingErr) {
-              console.warn('onboarding: failed to persist dictation.model:', settingErr);
-            }
+            root.querySelector('#step-model').classList.toggle('done', !setup.needsSetup);
+            root.querySelector('#step-model-status').textContent = setup.needsSetup ? 'More setup needed' : 'Done';
+            root.querySelector('#step-model-body').classList.toggle('ui-hidden', !setup.needsSetup);
+            if (setup.needsSetup) root.querySelectorAll('.model-btn').forEach(b => b.disabled = false);
 
-            root.querySelector('#step-model').classList.add('done');
-            root.querySelector('#step-model-status').textContent = 'Done';
-            root.querySelector('#step-model-body').classList.add('ui-hidden');
-
-            currentSetup = { ...currentSetup, hasModel: true, needsSetup: false };
-            activationState = { ...(activationState || {}), ...(currentSetup?.activation || {}), hasModel: true };
+            currentSetup = setup;
+            activationState = currentSetup.activation || activationState;
             applyActivationState(root, currentSetup?.activation || activationState);
           } catch (e) {
             clearInterval(progressTimer);
@@ -12117,11 +12136,10 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     function renderSetupEmptyState() {
       const standaloneLiveNote = renderStandaloneLiveNote(currentSetup);
       const modelStepBody = `
-                <p>Choose a model size:</p>
+                <p>Choose a meeting model. Live and dictation keep their own models (Base by default).</p>
                 <div class="model-options">
-                  <button class="btn btn-secondary btn-sm model-btn" data-model="tiny">Tiny (75 MB, fast)</button>
-                  <button class="btn btn-primary btn-sm model-btn" data-model="base">Base (141 MB, recommended)</button>
-                  <button class="btn btn-secondary btn-sm model-btn" data-model="small">Small (466 MB, best accuracy)</button>
+                  <button class="btn btn-primary btn-sm model-btn" data-model="small">Small (466 MB, recommended)</button>
+                  <button class="btn btn-secondary btn-sm model-btn" data-model="base">Base (142 MB, lower resource use)</button>
                 </div>
                 <div class="download-progress ui-hidden">
                   <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -12619,6 +12637,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           warmParakeetIfSelected(eng === 'parakeet' || resolvedLiveBackend === 'parakeet' ? 'parakeet' : eng);
         }
         document.getElementById('settings-whisper-model').value = s.transcription.model;
+        document.getElementById('settings-tiny-model-note').classList.toggle('is-hidden', s.transcription.model !== 'tiny');
         const dl = s.transcription.downloaded_models || [];
         const selectedModel = s.transcription.model;
         const isDownloaded = dl.includes(selectedModel);
@@ -13318,6 +13337,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     });
     document.getElementById('settings-whisper-model').addEventListener('change', async (e) => {
       await invoke('cmd_set_setting', { section: 'transcription', key: 'model', value: e.target.value });
+      document.getElementById('settings-tiny-model-note').classList.toggle('is-hidden', e.target.value !== 'tiny');
       const s = await invoke('cmd_get_settings');
       const dl = s.transcription.downloaded_models || [];
       const isDownloaded = dl.includes(e.target.value);
