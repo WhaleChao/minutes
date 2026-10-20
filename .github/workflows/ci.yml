@@ -345,6 +345,12 @@ jobs:
         run: cargo test -p minutes-cli --no-default-features -- enrollment_ --test-threads=1
         timeout-minutes: 4
 
+      - name: CLI model-setup preferences
+        run: |
+          cargo test -p minutes-cli --no-default-features --bin minutes -- setup_ --test-threads=1
+          cargo test -p minutes-cli --no-default-features --test model_setup_preferences -- --test-threads=1
+        timeout-minutes: 4
+
       - name: Diarization unit tests (cross-platform)
         run: cargo test -p minutes-core --no-default-features --features diarize --lib -- diarize --test-threads=1
         timeout-minutes: 3
