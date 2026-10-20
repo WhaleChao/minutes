@@ -104,6 +104,11 @@ fn malformed_config_is_not_repaired_or_replaced_by_install_only_setup() {
     fs::write(&profile.config, b"[transcription\nmodel = 'medium'").unwrap();
     let before = fs::read(&profile.config).unwrap();
     let output = profile.setup(&["--model", "base", "--download-only"]);
-    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Minutes config exists but is malformed"),
+        "{stderr}"
+    );
     assert_eq!(fs::read(&profile.config).unwrap(), before);
 }
