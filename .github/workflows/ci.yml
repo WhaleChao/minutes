@@ -966,6 +966,7 @@ jobs:
       - name: Test shipped dictation controllers
         run: |
           node scripts/test_dictation_readiness.mjs
+          node scripts/test_model_setup.mjs
           node scripts/test_dictation_overlay.mjs
           node scripts/test_dictation_history.mjs
 

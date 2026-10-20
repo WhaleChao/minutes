@@ -131,15 +131,18 @@ minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sher
 > rather than the DLL's own directory, so the same trick does not apply there
 > and it needs its own packaging. That is tracked in #645.
 
-On Apple Silicon builds with `engine-sherpa` and a plugin present, plain
-`minutes setup` downloads the four model files plus Whisper tiny for live and
-dictation fallback. Without the plugin it installs Whisper small and explains
-which packaged install includes Parakeet; setup does not download the plugin.
-`minutes setup --sherpa` downloads the four model files (with a size-floor
-integrity check) and writes `transcription.engine = "sherpa"` to your config, so
-no manual edit is needed. If the binary lacks the `engine-sherpa` feature, setup
-still configures the engine and prints a note that transcription falls back to
-Whisper until you rebuild with the feature.
+On Apple Silicon builds with `engine-sherpa`, a plugin present and the Auto
+engine selected, plain `minutes setup` downloads the four Parakeet model files
+and the configured Whisper meeting model (Small by default). It also installs
+the configured Live/dictation models (Base by default) without changing those
+selections. Without the plugin it keeps the configured Whisper model and
+explains which packaged install includes Parakeet; setup does not download the
+plugin. Tiny is never selected as an automatic fallback.
+
+`minutes setup --sherpa` explicitly selects the sherpa engine after installation.
+A binary without the `engine-sherpa` feature refuses that request before
+downloading or changing configuration. To install a Whisper companion without
+selecting it for meetings, use `minutes setup --model base --download-only`.
 
 Run `minutes setup --list` to see all engines and recommended models.
 
