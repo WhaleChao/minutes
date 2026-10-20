@@ -3459,7 +3459,11 @@ mod tests {
                 live_tx,
             );
             pump.queue.push_samples(&samples);
-            pump.finish().unwrap();
+            // This checks WAV integrity, not stop latency. Hosted Windows file
+            // finalization can exceed the production two-second stop budget.
+            // The blocked-writer tests below exercise that deadline separately.
+            pump.finish_with_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
             assert!(!failed.load(Ordering::Acquire));
             assert_eq!(count.load(Ordering::Relaxed), samples.len() as u64);
             std::fs::read(path).unwrap()
@@ -3626,7 +3630,10 @@ mod tests {
         let samples = vec![0.25_f32; 32_137];
         pump.queue.push_samples(&samples);
         let finish_started = Instant::now();
-        pump.finish().unwrap_or_else(|error| {
+        // Allow slow hosted filesystems to seal the file in this tail-integrity
+        // test; dedicated blocked-writer tests still enforce bounded stop.
+        pump.finish_with_timeout(std::time::Duration::from_secs(15))
+            .unwrap_or_else(|error| {
             panic!(
                 "capture writer stop failed: {error:?}; elapsed_us={}, accepted={}/{}, queued={}, storage_failed={}",
                 finish_started.elapsed().as_micros(),
