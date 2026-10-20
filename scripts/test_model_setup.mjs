@@ -79,23 +79,28 @@ test('a historical download milestone cannot hide a currently missing model', ()
   const root = { querySelector: id => {
     if (!nodes.has(id)) {
       const classes = new Set();
-      nodes.set(id, { textContent: '', classes, classList: {
+      nodes.set(id, { textContent: '', dataset: {}, classes, classList: {
         add: x => classes.add(x), remove: x => classes.delete(x),
         toggle: (x, on) => on ? classes.add(x) : classes.delete(x),
       } });
     }
     return nodes.get(id);
   } };
-  const context = vm.createContext({ root, setText: (node, text) => { node.textContent = text; } });
+  let audioRenders = 0;
+  const context = vm.createContext({ root, setText: (node, text) => { node.textContent = text; },
+    renderMeetingAudioChoice: () => { audioRenders++; } });
   const activationStart = html.indexOf('    function applyActivationState(');
   const activationEnd = html.indexOf('    function renderStandaloneLiveNote(', activationStart);
   assert(activationStart > 0 && activationEnd > activationStart);
   vm.runInContext(html.slice(activationStart, activationEnd), context);
   vm.runInContext('applyActivationState(root, { hasModel: true, milestones: { modelReadyAt: "past" } })', context);
   assert(root.querySelector('#step-model').classes.has('done'));
+  assert.equal(root.querySelector('#btn-start-first-recording').dataset.modelReady, 'true');
   vm.runInContext('applyActivationState(root, { hasModel: false, milestones: { modelReadyAt: "past" } })', context);
   assert(!root.querySelector('#step-model').classes.has('done'));
   assert(!root.querySelector('#step-model-body').classes.has('ui-hidden'));
   assert(root.querySelector('#step-first-artifact').classes.has('disabled'));
   assert.equal(root.querySelector('#step-model-status').textContent, 'Needs setup');
+  assert.equal(root.querySelector('#btn-start-first-recording').dataset.modelReady, 'false');
+  assert.equal(audioRenders, 2);
 });

@@ -3627,9 +3627,7 @@ fn start_native_call_recording(
     // TOML may still contain the picker decoration (sample rate/channels).
     // ScreenCaptureKit resolves AVCaptureDevice.localizedName exactly, so
     // normalize at this boundary as well.
-    let configured_microphone = config
-        .recording
-        .device
+    let configured_microphone = crate::recording_audio::microphone(config)
         .as_deref()
         .and_then(minutes_core::capture::canonicalize_input_device_setting);
     let recovery_test_signal = app_handle.config().identifier == "com.useminutes.desktop.dev"
@@ -6372,6 +6370,26 @@ pub fn start_recording(
     if let Some(language) = language_override {
         config.transcription.language = Some(language);
     }
+    let requested_intent =
+        match crate::recording_audio::prepare(&mut config, mode, requested_intent) {
+            Ok(intent) => Some(intent),
+            Err(error) => {
+                set_recording_start_error(&latest_output, error.clone());
+                show_user_notification(&app_handle, "Recording not started", &error);
+                starting.store(false, Ordering::Relaxed);
+                recording.store(false, Ordering::Relaxed);
+                reset_hotkey_capture_state(
+                    hotkey_runtime.as_ref(),
+                    discard_short_hotkey_capture.as_ref(),
+                );
+                if error == crate::recording_audio::CHOICE_REQUIRED {
+                    crate::show_main_window(&app_handle);
+                    app_handle.emit("recording:audio-source-required", ()).ok();
+                }
+                return;
+            }
+        };
+    let allow_degraded = allow_degraded && requested_intent != Some(RecordingIntent::Call);
     // Re-validate the pinned input device at recording start so a
     // mid-session disconnect (Bluetooth headset turning off, USB device
     // unplugged) transparently falls back to the system default. Issue
@@ -6387,14 +6405,17 @@ pub fn start_recording(
         None
     };
     arm_desktop_call_capture_route(&mut config, requested_intent, desktop_call_loopback);
+    let native_route_allowed =
+        crate::recording_audio::native_route_allowed(&config, automatic_app.is_some());
     let preflight = match minutes_core::capture::preflight_recording_with_native_call_capture(
         mode,
         requested_intent,
         allow_degraded,
-        matches!(
-            call_capture::availability(),
-            call_capture::CallCaptureAvailability::Available { .. }
-        ),
+        native_route_allowed
+            && matches!(
+                call_capture::availability(),
+                call_capture::CallCaptureAvailability::Available { .. }
+            ),
         &config,
     ) {
         Ok(preflight) => preflight,
@@ -6411,11 +6432,28 @@ pub fn start_recording(
             return;
         }
     };
-    let native_call_capture_available = preflight.intent == RecordingIntent::Call
+    let native_call_capture_available = native_route_allowed
+        && preflight.intent == RecordingIntent::Call
         && matches!(
             call_capture::availability(),
             call_capture::CallCaptureAvailability::Available { .. }
         );
+    if let Err(error) = crate::recording_audio::validate_route(
+        &config,
+        preflight.intent,
+        native_call_capture_available,
+        preflight.microphone_permission,
+    ) {
+        set_recording_start_error(&latest_output, &error);
+        show_user_notification(&app_handle, "Recording not started", &error);
+        starting.store(false, Ordering::Relaxed);
+        recording.store(false, Ordering::Relaxed);
+        reset_hotkey_capture_state(
+            hotkey_runtime.as_ref(),
+            discard_short_hotkey_capture.as_ref(),
+        );
+        return;
+    }
     // Recheck inside the worker: availability can change after reservation.
     if automatic_app.is_some() && !native_call_capture_available {
         let error = "Automatic recording requires native call capture. Open Minutes to check capture access.";
@@ -6469,42 +6507,16 @@ pub fn start_recording(
                 return;
             }
             Err(error) => {
-                if automatic_app.is_some() {
-                    let detail = format!("Automatic native call recording failed: {error}");
-                    set_recording_start_error(&latest_output, &detail);
-                    show_user_notification(
-                        &app_handle,
-                        "Automatic recording did not start",
-                        &detail,
-                    );
-                    starting.store(false, Ordering::Relaxed);
-                    recording.store(false, Ordering::Relaxed);
-                    return;
-                }
-                eprintln!("Native call recording unavailable, falling back: {}", error);
-                minutes_core::logging::log_error(
-                    "desktop_native_call_start",
-                    "",
-                    &format!("native call recording unavailable, falling back: {error}"),
+                let detail = format!("Microphone + system audio could not start: {error}. Recording has not started. Check capture access in Settings, or choose Microphone only for a room meeting.");
+                set_recording_start_error(&latest_output, &detail);
+                show_user_notification(&app_handle, "Recording not started", &detail);
+                starting.store(false, Ordering::Relaxed);
+                recording.store(false, Ordering::Relaxed);
+                reset_hotkey_capture_state(
+                    hotkey_runtime.as_ref(),
+                    discard_short_hotkey_capture.as_ref(),
                 );
-                if let Some(reason) = &preflight.blocking_reason {
-                    set_recording_start_error(
-                        &latest_output,
-                        format!("{reason}\n\nNative call capture failed: {error}"),
-                    );
-                    show_user_notification(
-                        &app_handle,
-                        "Recording blocked",
-                        &format!("{}\n\nNative call capture failed: {}", reason, error),
-                    );
-                    starting.store(false, Ordering::Relaxed);
-                    recording.store(false, Ordering::Relaxed);
-                    reset_hotkey_capture_state(
-                        hotkey_runtime.as_ref(),
-                        discard_short_hotkey_capture.as_ref(),
-                    );
-                    return;
-                }
+                return;
             }
         }
     }
@@ -6827,8 +6839,22 @@ pub fn launch_recording(
     hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
     discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
 ) -> Result<LaunchOutcome, String> {
+    validate_recording_launch_state(state)
+        .map_err(|error| reject_recording_launch(state, error))?;
+    let config = Config::load_strict().map_err(|error| reject_recording_launch(state, error))?;
+    let mut session_config = config.clone();
+    let requested_intent = Some(
+        crate::recording_audio::prepare(&mut session_config, mode, requested_intent).map_err(
+            |error| {
+                if error == crate::recording_audio::CHOICE_REQUIRED {
+                    crate::show_main_window(&app);
+                    app.emit("recording:audio-source-required", ()).ok();
+                }
+                reject_recording_launch(state, error)
+            },
+        )?,
+    );
     if mode == CaptureMode::Meeting {
-        let config = Config::load();
         if let Some(disclosure) = desktop_recording_consent_required(mode, &config, false) {
             // Palette, tray, hotkey, and desktop-control starts end in the
             // same UI, so Require routes them to the same blocking modal as
@@ -6838,7 +6864,11 @@ pub fn launch_recording(
             crate::show_main_window(&app);
             let _ = app.emit(
                 "minutes://recording-consent-required",
-                serde_json::json!({ "disclosure": disclosure }),
+                serde_json::json!({ "disclosure": disclosure, "args": {
+                    "mode": "meeting", "intent": requested_intent,
+                    "allowDegraded": false, "title": requested_title,
+                    "language": language_override,
+                }}),
             );
             return Ok(LaunchOutcome::ConsentRequested);
         }
@@ -7283,7 +7313,18 @@ pub fn cmd_start_recording(
 
     validate_recording_launch_state(&state)
         .map_err(|error| reject_recording_launch(&state, error))?;
-    let config = Config::load();
+    let config = Config::load_strict().map_err(|error| reject_recording_launch(&state, error))?;
+    let mut session_config = config.clone();
+    let requested_intent = Some(
+        crate::recording_audio::prepare(&mut session_config, capture_mode, requested_intent)
+            .map_err(|error| {
+                if error == crate::recording_audio::CHOICE_REQUIRED {
+                    crate::show_main_window(&app);
+                    app.emit("recording:audio-source-required", ()).ok();
+                }
+                reject_recording_launch(&state, error)
+            })?,
+    );
     if let Some(disclosure) = desktop_recording_consent_required(
         capture_mode,
         &config,
@@ -8100,7 +8141,7 @@ pub fn cmd_search_blocking(
 #[tauri::command]
 pub fn cmd_list_devices() -> serde_json::Value {
     let config = Config::load();
-    let configured_device = config.recording.device.clone();
+    let configured_device = crate::recording_audio::microphone(&config);
     let entries = minutes_core::capture::list_input_devices_detailed();
     // Back-compat: preserve the decorated label list for any caller that
     // still reads `devices`, while exposing structured entries so pickers
@@ -8110,6 +8151,7 @@ pub fn cmd_list_devices() -> serde_json::Value {
         "devices": legacy_labels,
         "entries": entries,
         "configured_device": configured_device,
+        "desktop_audio_source": crate::recording_audio::saved_choice(&config).ok().flatten().map(|source| source.as_str()),
     })
 }
 
@@ -13154,6 +13196,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         "config_path": path.display().to_string(),
         "recording": {
             "device": config.recording.device,
+            "desktop_audio_source": crate::recording_audio::saved_choice(&config).ok().flatten().map(|source| source.as_str()),
         },
         "transcription": {
             "engine": config.transcription.engine,
@@ -13518,6 +13561,13 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
         ("recording", "device") => {
             config.recording.device =
                 minutes_core::capture::canonicalize_input_device_setting(&value);
+            if let Some(sources) = config.recording.sources.as_mut() {
+                sources.voice = config.recording.device.clone();
+            }
+        }
+        ("recording", "desktop_audio_source") => {
+            let source = crate::recording_audio::AudioSource::parse(&value)?;
+            config.recording.desktop_audio_source = Some(source.as_str().into());
         }
 
         // Consent
@@ -17752,6 +17802,67 @@ mod tests {
 
             let config = Config::load();
             assert_eq!(config.recording.device.as_deref(), Some("Ground Control"));
+        });
+    }
+
+    #[test]
+    fn desktop_audio_choice_preserves_existing_source_and_model_preferences() {
+        with_temp_home(|_| {
+            let path = Config::config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = "# Keep my settings\n[transcription]\nmodel = \"medium\"\n[recording]\ncapture_backend = \"core-audio-tap\"\n[recording.sources]\nvoice = \"Studio Mic\"\ncall = \"auto\"\n[future_settings]\nkeep = true\n";
+            std::fs::write(&path, original).unwrap();
+            cmd_set_setting(
+                "recording".into(),
+                "desktop_audio_source".into(),
+                "microphone".into(),
+            )
+            .unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            for line in original.lines() {
+                assert!(
+                    saved.lines().any(|saved_line| saved_line == line),
+                    "lost {line}"
+                );
+            }
+            let config = Config::load_strict().unwrap();
+            assert_eq!(config.transcription.model, "medium");
+            assert_eq!(
+                config.recording.desktop_audio_source.as_deref(),
+                Some("microphone")
+            );
+            assert_eq!(
+                config.recording.sources.unwrap().call.as_deref(),
+                Some("auto")
+            );
+            assert!(cmd_set_setting(
+                "recording".into(),
+                "desktop_audio_source".into(),
+                "unknown".into()
+            )
+            .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        });
+    }
+
+    #[test]
+    fn desktop_microphone_picker_updates_an_existing_dual_voice_source() {
+        with_temp_home(|_| {
+            let mut config = Config::default();
+            config.recording.sources = Some(minutes_core::config::SourcesConfig {
+                voice: Some("Old USB Mic".into()),
+                call: Some("BlackHole 2ch".into()),
+            });
+            config.save().unwrap();
+            cmd_set_setting(
+                "recording".into(),
+                "device".into(),
+                "Studio Mic (16000Hz, 1 ch)".into(),
+            )
+            .unwrap();
+            let sources = Config::load_strict().unwrap().recording.sources.unwrap();
+            assert_eq!(sources.voice.as_deref(), Some("Studio Mic"));
+            assert_eq!(sources.call.as_deref(), Some("BlackHole 2ch"));
         });
     }
 

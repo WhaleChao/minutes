@@ -145,13 +145,14 @@ session cadence and confidence gates. See
 | key | default | meaning |
 |---|---|---|
 | `device` | unset | Explicit input device name; falls back to system default |
+| `desktop_audio_source` | unset | Desktop Meeting audio choice: `"microphone"` or `"microphone-and-system"`. Unset requires a first-use choice, unless an explicit call source already exists. Applies to desktop Meeting starts, including tray and shortcuts; CLI routing, memos, dictation and standalone Live remain independent. |
 | `silence_reminder_secs` | `300` | Seconds of silence before a reminder notification; 0 = off |
 | `silence_threshold` | `3` | RMS energy level (0–100) below which audio is silence |
 | `silence_auto_stop_secs` | `1800` | Seconds of silence before auto-stop; 0 = off |
 | `max_duration_secs` | `28800` | Hard recording cap (default 8h); 0 = off |
 | `min_disk_space_mb` | `500` | Auto-stop when free disk space drops below this; 0 = off |
 | `auto_call_intent` | `false` | Infer call intent from process detection (high false-positive rate) |
-| `allow_degraded_call_capture` | `false` | Allow call capture when selected input isn't a system-audio route |
+| `allow_degraded_call_capture` | `false` | CLI opt-in to call capture when selected input isn't a system-audio route. Desktop microphone + system audio always requires both sources and ignores this opt-in. |
 | `capture_backend` | `"cpal"` | `"cpal"` for loopback devices, `"core-audio-tap"` on macOS 14.4+, or opt-in `"pocketstation"` application capture on Windows and Linux |
 
 ### `[recording.sources]` — multi-source capture
@@ -164,6 +165,16 @@ session cadence and confidence gates. See
 When `capture_backend = "core-audio-tap"`, set `call = "auto"`. The backend
 captures the default macOS system output via Core Audio Process Tap instead of
 opening a named loopback input device.
+
+Both keys are required for CLI Process Tap capture: setting `capture_backend`
+alone does not add a second source. The backend requires macOS 14.4+ and its
+system-audio permission; see [Core Audio Process Tap](core-audio-process-tap.md).
+Desktop native call capture instead uses ScreenCaptureKit on macOS 15+ and
+requires Microphone and Screen Recording access. The desktop audio choice does
+not rewrite these CLI backend/source preferences. An explicitly configured
+in-process backend and call source, such as Process Tap with `call = "auto"`,
+remain in use instead of being replaced by the desktop helper. Choosing microphone only uses
+the selected microphone for that session without capturing the call source.
 
 When `capture_backend = "pocketstation"`, choose the application in `call`.
 Minutes then records that application and the selected microphone as separate

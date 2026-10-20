@@ -973,6 +973,7 @@ jobs:
         run: |
           node scripts/test_dictation_readiness.mjs
           node scripts/test_model_setup.mjs
+          node --test scripts/test_recording_audio.mjs
           node scripts/test_dictation_overlay.mjs
           node scripts/test_dictation_history.mjs
 

@@ -4232,6 +4232,15 @@
       gap: 5px;
     }
 
+    .recording-audio-help {
+      margin: 0;
+      font-size: var(--text-2xs);
+      line-height: 1.5;
+      color: var(--text-secondary);
+    }
+    .recording-audio-help[data-error="true"] { color: var(--red); }
+    .onboarding-audio-choice { margin: 12px 0; }
+
     .footer-action-secondary .btn[hidden] {
       display: none !important;
     }
@@ -6129,6 +6138,15 @@
         <div class="footer-action-primary">
           <button class="btn btn-primary" id="btn-record">Start Recording</button>
         </div>
+        <div class="footer-device-picker" id="meeting-audio-choice">
+          <label class="footer-device-label" for="meeting-audio-source">Meeting audio</label>
+          <select id="meeting-audio-source" class="device-picker" aria-describedby="meeting-audio-help">
+            <option value="" disabled selected>Choose audio to record</option>
+            <option value="microphone-and-system">Microphone + system audio</option>
+            <option value="microphone">Microphone only</option>
+          </select>
+          <p id="meeting-audio-help" class="recording-audio-help" aria-live="polite">Choose the audio for your meeting.</p>
+        </div>
         <div class="footer-device-picker">
           <div class="footer-device-label">Microphone</div>
           <select id="device-picker" class="device-picker" title="Select microphone">
@@ -7599,6 +7617,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
   <script src="scripts/shortcut-recorder.js"></script>
   <script src="scripts/recall-contract.js"></script>
   <script src="scripts/update-offer.js"></script>
+  <script src="scripts/recording-audio.js"></script>
   <script src="scripts/recall-chat.js"></script>
   <script>
     const { invoke } = window.__TAURI__.core;
@@ -8013,6 +8032,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       } else if (activation.phase === 'processing-first-artifact' || activation.phase === 'recording-first-artifact') {
         watchStep?.classList.remove('disabled');
         setText(watchStatus, activation.phase === 'processing-first-artifact' ? 'Processing...' : 'Recording...');
+      }
+      const firstRecording = root.querySelector('#btn-start-first-recording');
+      if (firstRecording) {
+        firstRecording.dataset.modelReady = String(modelReady);
+        renderMeetingAudioChoice();
       }
     }
 
@@ -9020,6 +9044,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         setTitle(liveButton, 'Start live transcription — ask your agent in Recall for coaching');
         setTitle(quickThoughtButton, '');
       }
+      queueMicrotask(renderMeetingAudioChoice);
     }
 
     function copilotStateName(snapshot = copilotSnapshot) {
@@ -9770,6 +9795,42 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
     // ── Device picker ──
     const devicePicker = document.getElementById('device-picker');
+    const meetingAudioSource = document.getElementById('meeting-audio-source');
+    const meetingAudioHelp = document.getElementById('meeting-audio-help');
+    const recordingAudioChoice = window.MinutesRecordingAudio.create({
+      persist: value => invoke('cmd_set_setting', { section: 'recording', key: 'desktop_audio_source', value }),
+      changed: renderMeetingAudioChoice,
+    });
+
+    function renderMeetingAudioChoice() {
+      const state = recordingAudioChoice.snapshot();
+      for (const picker of [meetingAudioSource, document.getElementById('onboarding-meeting-audio-source')]) {
+        if (!picker) continue;
+        picker.value = state.choice || '';
+        picker.disabled = state.pending || footer.classList.contains('capture-mode');
+      }
+      const helpText = state.error || (state.pending ? 'Saving audio choice…'
+        : state.choice === 'microphone' ? 'Your microphone only. People on a computer call are not included.'
+        : state.choice === 'microphone-and-system' ? 'Your microphone and computer audio. Other apps may also be captured.'
+        : 'Choose the audio for your meeting.');
+      for (const help of [meetingAudioHelp, document.getElementById('onboarding-meeting-audio-help')]) {
+        if (!help) continue;
+        help.textContent = helpText;
+        help.dataset.error = state.error ? 'true' : 'false';
+      }
+      const firstRecording = document.getElementById('btn-start-first-recording');
+      if (firstRecording) firstRecording.disabled = !state.ready || firstRecording.dataset.modelReady !== 'true'
+        || footer.classList.contains('capture-mode');
+      if (!footer.classList.contains('capture-mode')) {
+        syncPrimaryCaptureLabel();
+      }
+    }
+    meetingAudioSource.addEventListener('change', () => recordingAudioChoice.save(meetingAudioSource.value));
+    window.__TAURI__.event.listen('recording:audio-source-required', () => {
+      setFooterCaptureMode(false);
+      applyCaptureMode('meeting');
+      (document.getElementById('onboarding-meeting-audio-source') || meetingAudioSource).focus();
+    });
     const dictationMicrophonePicker = document.getElementById('settings-dictation-microphone');
     function populateDevicePicker(picker, result) {
       if (!picker) return;
@@ -9801,11 +9862,13 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     }
 
     async function loadDevices() {
+      const audioLoad = recordingAudioChoice.beginLoad();
       try {
         const result = await invoke('cmd_list_devices');
         // Prefer structured entries so we persist canonical CPAL names. Both
         // pickers share one setting and therefore always render the same value.
         populateDevicePicker(devicePicker, result);
+        recordingAudioChoice.load(result.desktop_audio_source, audioLoad);
 
       } catch (e) {
         console.error('Load devices:', e);
@@ -9830,10 +9893,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     });
     // ── Recording controls ──
     function recordingStartArgsForCurrentUi() {
-      if (activeCallSession && !activeCallSession.dismissed && callBanner.classList.contains('active')) {
-        return { intent: 'call', source: 'call_detect' };
-      }
-      return undefined;
+      return recordingAudioChoice.startArgs({ detected: Boolean(activeCallSession && !activeCallSession.dismissed && callBanner.classList.contains('active')) });
     }
 
     let pendingRecordingStartArgs = null;
@@ -9867,10 +9927,10 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
     // Palette / tray / hotkey / desktop-control starts under Require mode
     // arrive as a backend event rather than a JS invoke result; show the
-    // same modal (review F1/F2). Confirm restarts with pipeline defaults.
+    // same modal (review F1/F2). Keep the requested audio route through consent.
     window.__TAURI__.event.listen('minutes://recording-consent-required', (event) => {
       const disclosure = event?.payload?.disclosure || '';
-      showRecordingConsentModal(disclosure, {});
+      showRecordingConsentModal(disclosure, event?.payload?.args || {});
     });
 
     function showRecordingStartError(error) {
@@ -9921,6 +9981,9 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         return;
       }
       recordButton.textContent = CAPTURE_MODE_LABELS[captureMode];
+      recordButton.disabled = captureMode === 'meeting' ? !recordingAudioChoice.snapshot().ready
+        : captureMode === 'memo' ? quickThoughtButton.disabled : liveButton.disabled;
+      document.getElementById('meeting-audio-choice').classList.toggle('is-hidden', captureMode !== 'meeting');
     }
 
     function applyCaptureMode(mode, { persist = true } = {}) {
@@ -9929,6 +9992,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         seg.setAttribute('aria-checked', seg.dataset.captureMode === captureMode ? 'true' : 'false');
       });
       syncPrimaryCaptureLabel();
+      renderMeetingAudioChoice();
       if (persist) {
         try { localStorage.setItem('minutes.captureMode', captureMode); } catch (_) { }
       }
@@ -11994,6 +12058,9 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
     function setupOnboarding(root) {
       applyActivationState(root, currentSetup?.activation || activationState);
+      root.querySelector('#onboarding-meeting-audio-source').addEventListener('change', (event) => {
+        recordingAudioChoice.save(event.target.value);
+      });
 
       root.querySelectorAll('.model-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
@@ -12044,7 +12111,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         try {
           setFooterCaptureMode(true, 'starting');
           startFastPoll();
-          await startDesktopRecordingWithArgs();
+          await startDesktopRecordingFromUi();
         } catch (e) {
           console.error('First recording:', e);
           showRecordingStartError(e);
@@ -12171,7 +12238,16 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
               </div>
               <div class="step-body">
                 <p>Make a quick 10-second test recording. Say one sentence, stop, and let Minutes save its first markdown artifact.</p>
-                <button class="btn btn-primary" id="btn-start-first-recording">Record a 10-second test</button>
+                <div class="footer-device-picker onboarding-audio-choice">
+                  <label class="footer-device-label" for="onboarding-meeting-audio-source">Meeting audio</label>
+                  <select id="onboarding-meeting-audio-source" class="device-picker" aria-describedby="onboarding-meeting-audio-help">
+                    <option value="" disabled selected>Choose audio to record</option>
+                    <option value="microphone-and-system">Microphone + system audio</option>
+                    <option value="microphone">Microphone only</option>
+                  </select>
+                  <p id="onboarding-meeting-audio-help" class="recording-audio-help" aria-live="polite">Choose the audio for your meeting.</p>
+                </div>
+                <button class="btn btn-primary" id="btn-start-first-recording" disabled>Record a 10-second test</button>
               </div>
             </div>
             <div class="onboarding-step disabled" id="step-watch-artifact">

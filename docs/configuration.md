@@ -2,9 +2,34 @@
 
 Optional — minutes works out of the box.
 
+In the desktop app, choose **Meeting audio** before the first Meeting recording:
+**Microphone only** for a room, or **Microphone + system audio** for a computer
+call. The choice is remembered and works without call detection. Memos use the
+microphone. Native desktop call capture requires macOS 15+, Microphone access
+and Screen Recording access; a failed two-source start does not fall back to
+microphone-only recording.
+
+For CLI system capture on macOS 14.4+, configure **both**
+`recording.capture_backend = "core-audio-tap"` and
+`recording.sources.call = "auto"`, then run `minutes record --call`.
+Process Tap captures the default system output and uses macOS system-audio
+access. It is separate from the desktop ScreenCaptureKit helper. See the
+[audio setup guide](architecture/audio-devices.md) for permissions and loopback
+alternatives.
+
 ```toml
 # By default: ~/.config/minutes/config.toml
 # Or: $XDG_CONFIG_HOME/minutes/config.toml when XDG_CONFIG_HOME is set
+
+[recording]
+# Desktop preference; does not change CLI source routing:
+# desktop_audio_source = "microphone-and-system" # Or "microphone"
+# Optional CLI system capture on macOS 14.4+; BOTH this and sources.call are needed:
+# capture_backend = "core-audio-tap"
+
+[recording.sources]
+# voice = "default"
+# call = "auto"          # Core Audio Process Tap, or auto-detect a CPAL loopback
 
 [transcription]
 engine = "auto"           # Apple Silicon release builds use Parakeet v3 when installed, otherwise Whisper

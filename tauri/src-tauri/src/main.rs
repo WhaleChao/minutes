@@ -29,6 +29,7 @@ mod dictation_experience;
 mod dictation_field;
 mod palette_dispatch;
 mod pty;
+mod recording_audio;
 mod secret_store;
 mod shortcut_manager;
 mod text_insertion;
