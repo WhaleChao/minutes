@@ -411,64 +411,95 @@ fn transcribe_dispatch(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    let requested_engine = config.transcription.engine.as_str();
-    let effective_engine = effective_batch_engine(config);
-    if requested_engine != effective_engine && !requested_engine.eq_ignore_ascii_case("auto") {
-        tracing::warn!(
-            requested_engine,
-            effective_engine,
-            "requested batch transcription engine is unavailable; using fallback"
-        );
+    BatchTranscriptionSession::new(config).transcribe(audio_path, hints)
+}
+
+/// Owns model state for one batch operation, never across meetings or configs.
+/// Each plugin decode still creates a fresh stream; only model weights are reused.
+struct BatchTranscriptionSession<'a> {
+    config: &'a Config,
+    #[cfg(feature = "engine-sherpa")]
+    sherpa: Option<crate::sherpa_plugin::PluginRecognizer>,
+}
+
+impl<'a> BatchTranscriptionSession<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            #[cfg(feature = "engine-sherpa")]
+            sherpa: None,
+        }
     }
-    match effective_engine {
-        "whisper" => transcribe_whisper_dispatch(audio_path, config, hints),
-        "parakeet" => transcribe_parakeet_dispatch(audio_path, config, hints),
-        "sherpa" => {
-            // Whisper auto-fallback: sherpa is opt-in and needs its model. If the
-            // engine isn't compiled in, or the model isn't installed, never break
-            // the recording -- fall back to whisper (the bundled default). The
-            // `sherpa_engine` path helpers are always compiled, so this check
-            // works in any build.
-            let model_dir = crate::sherpa_engine::model_dir(config);
-            if !sherpa_selectable(config) {
-                tracing::warn!(
-                    model_dir = %model_dir.display(),
-                    compiled = cfg!(feature = "engine-sherpa"),
-                    reason = sherpa_unavailable_reason(config),
-                    "engine = \"sherpa\" selected but unavailable; falling back to whisper"
-                );
-                return transcribe_whisper_dispatch(audio_path, config, hints);
-            }
-            // Passing the preflight is not the same as succeeding. The model
-            // files clear a size floor rather than a hash, so a corrupt or
-            // incompatible model loads the plugin fine and then fails inside
-            // it, and an individual decode window can fail too. Those used to
-            // surface as a failed transcription, which loses a recording; the
-            // rule here is that whisper answers whenever sherpa cannot.
-            match transcribe_sherpa_dispatch(audio_path, config, hints) {
-                Ok(result) => Ok(result),
-                Err(error) => {
+
+    fn transcribe(
+        &mut self,
+        audio_path: &Path,
+        hints: &DecodeHints,
+    ) -> Result<TranscribeResult, TranscribeError> {
+        let config = self.config;
+        let requested_engine = config.transcription.engine.as_str();
+        let effective_engine = effective_batch_engine(config);
+        if requested_engine != effective_engine && !requested_engine.eq_ignore_ascii_case("auto") {
+            tracing::warn!(
+                requested_engine,
+                effective_engine,
+                "requested batch transcription engine is unavailable; using fallback"
+            );
+        }
+        match effective_engine {
+            "whisper" => transcribe_whisper_dispatch(audio_path, config, hints),
+            "parakeet" => transcribe_parakeet_dispatch(audio_path, config, hints),
+            "sherpa" => {
+                // Whisper auto-fallback: sherpa is opt-in and needs its model. If the
+                // engine isn't compiled in, or the model isn't installed, never break
+                // the recording -- fall back to whisper (the bundled default). The
+                // `sherpa_engine` path helpers are always compiled, so this check
+                // works in any build.
+                let model_dir = crate::sherpa_engine::model_dir(config);
+                if !sherpa_selectable(config) {
                     tracing::warn!(
                         model_dir = %model_dir.display(),
-                        %error,
-                        "sherpa transcription failed after loading; falling back to whisper"
+                        compiled = cfg!(feature = "engine-sherpa"),
+                        reason = sherpa_unavailable_reason(config),
+                        "engine = \"sherpa\" selected but unavailable; falling back to whisper"
                     );
-                    transcribe_whisper_dispatch(audio_path, config, hints)
+                    return transcribe_whisper_dispatch(audio_path, config, hints);
+                }
+                // Passing the preflight is not the same as succeeding. The model
+                // files clear a size floor rather than a hash, so a corrupt or
+                // incompatible model loads the plugin fine and then fails inside
+                // it, and an individual decode window can fail too. Those used to
+                // surface as a failed transcription, which loses a recording; the
+                // rule here is that whisper answers whenever sherpa cannot.
+                match self.transcribe_sherpa(audio_path, hints) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        #[cfg(feature = "engine-sherpa")]
+                        {
+                            self.sherpa = None;
+                        }
+                        tracing::warn!(
+                            model_dir = %model_dir.display(),
+                            %error,
+                            "sherpa transcription failed after loading; falling back to whisper"
+                        );
+                        transcribe_whisper_dispatch(audio_path, config, hints)
+                    }
                 }
             }
-        }
-        "apple-speech" => {
-            tracing::warn!(
+            "apple-speech" => {
+                tracing::warn!(
                 "apple-speech is experimental and live-transcript-only today — falling back to whisper for batch/default transcription"
             );
-            transcribe_whisper_dispatch(audio_path, config, hints)
-        }
-        other => {
-            tracing::warn!(
-                engine = other,
-                "unknown transcription engine — falling back to whisper"
-            );
-            transcribe_whisper_dispatch(audio_path, config, hints)
+                transcribe_whisper_dispatch(audio_path, config, hints)
+            }
+            other => {
+                tracing::warn!(
+                    engine = other,
+                    "unknown transcription engine — falling back to whisper"
+                );
+                transcribe_whisper_dispatch(audio_path, config, hints)
+            }
         }
     }
 }
@@ -661,6 +692,7 @@ fn transcribe_chunk_ranges(
         );
     }
 
+    let mut session = BatchTranscriptionSession::new(config);
     let mut all_lines = Vec::new();
     let mut aggregate = FilterStats {
         audio_duration_secs,
@@ -681,7 +713,7 @@ fn transcribe_chunk_ranges(
         let processing_path = tmp_wav.processing_path();
         let chunk_hints = hints.clone().with_audio_format_extension("wav");
 
-        let chunk_result = match transcribe_dispatch(&processing_path, config, &chunk_hints) {
+        let chunk_result = match session.transcribe(&processing_path, &chunk_hints) {
             Ok(result) => result,
             Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => {
                 tracing::debug!(
@@ -1075,98 +1107,111 @@ fn sherpa_plugin_unavailable_reason(_config: &Config) -> Option<String> {
     None
 }
 
-/// Dispatch for the opt-in sherpa-onnx engine (parakeet-tdt-0.6b-v3, multilingual).
-/// In-process via `sherpa_engine`; off by default behind `engine-sherpa`.
-fn transcribe_sherpa_dispatch(
-    audio_path: &Path,
-    config: &Config,
-    hints: &DecodeHints,
-) -> Result<TranscribeResult, TranscribeError> {
-    #[cfg(feature = "engine-sherpa")]
-    {
-        // Decode-hint biasing for sherpa is a future follow-up.
-        let _ = hints;
-        let samples =
-            load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
-        if samples.is_empty() {
-            return Err(TranscribeError::EmptyAudio);
-        }
-        let audio_duration_secs = samples.len() as f64 / 16_000.0;
+impl BatchTranscriptionSession<'_> {
+    /// Dispatch for the opt-in sherpa-onnx engine (parakeet-tdt-0.6b-v3, multilingual).
+    /// In-process via `sherpa_engine`; off by default behind `engine-sherpa`.
+    fn transcribe_sherpa(
+        &mut self,
+        audio_path: &Path,
+        hints: &DecodeHints,
+    ) -> Result<TranscribeResult, TranscribeError> {
+        let config = self.config;
+        #[cfg(feature = "engine-sherpa")]
+        {
+            // Decode-hint biasing for sherpa is a future follow-up.
+            let _ = hints;
+            let samples =
+                load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+            if samples.is_empty() {
+                return Err(TranscribeError::EmptyAudio);
+            }
+            let audio_duration_secs = samples.len() as f64 / 16_000.0;
 
-        // Windowed segments carry a start time, so we emit `[m:ss] text` lines
-        // (the same shape the parakeet path produces) -- this makes the sherpa
-        // transcript diarization-compatible and renders in the timestamped
-        // transcript format, rather than one untimed blob.
-        //
-        // sherpa exposes start_ms only; end is inferred from the next segment's
-        // start (or audio_duration_secs for the final segment).
-        let raw_segs = crate::sherpa_engine::transcribe_segments(&samples, config)
+            // Windowed segments carry a start time, so we emit `[m:ss] text` lines
+            // (the same shape the parakeet path produces) -- this makes the sherpa
+            // transcript diarization-compatible and renders in the timestamped
+            // transcript format, rather than one untimed blob.
+            //
+            // sherpa exposes start_ms only; end is inferred from the next segment's
+            // start (or audio_duration_secs for the final segment).
+            if self.sherpa.is_none() {
+                self.sherpa = Some(
+                    crate::sherpa_engine::build_recognizer(config)
+                        .map_err(TranscribeError::TranscriptionFailed)?,
+                );
+            }
+            let raw_segs = crate::sherpa_engine::transcribe_segments_with_recognizer(
+                &samples,
+                config,
+                self.sherpa.as_mut().expect("recognizer initialized above"),
+            )
             .map_err(TranscribeError::TranscriptionFailed)?;
-        // Build parallel (line, start_secs, end_secs, text) data
-        let n_raw = raw_segs.len();
-        let sherpa_seg_data: Vec<(String, f64, f64, String)> = raw_segs
-            .iter()
-            .enumerate()
-            .map(|(i, (start_ms, text))| {
-                let start_secs = *start_ms as f64 / 1000.0;
-                let end_secs = if i + 1 < n_raw {
-                    raw_segs[i + 1].0 as f64 / 1000.0
-                } else {
-                    audio_duration_secs
-                };
-                let secs_int = *start_ms / 1000;
-                let line = format!("[{}:{:02}] {}", secs_int / 60, secs_int % 60, text);
-                (line, start_secs, end_secs, text.clone())
+            // Build parallel (line, start_secs, end_secs, text) data
+            let n_raw = raw_segs.len();
+            let sherpa_seg_data: Vec<(String, f64, f64, String)> = raw_segs
+                .iter()
+                .enumerate()
+                .map(|(i, (start_ms, text))| {
+                    let start_secs = *start_ms as f64 / 1000.0;
+                    let end_secs = if i + 1 < n_raw {
+                        raw_segs[i + 1].0 as f64 / 1000.0
+                    } else {
+                        audio_duration_secs
+                    };
+                    let secs_int = *start_ms / 1000;
+                    let line = format!("[{}:{:02}] {}", secs_int / 60, secs_int % 60, text);
+                    (line, start_secs, end_secs, text.clone())
+                })
+                .collect();
+            let lines: Vec<String> = sherpa_seg_data
+                .iter()
+                .map(|(l, _, _, _)| l.clone())
+                .collect();
+            let raw_segments = lines.len();
+
+            // Run the shared whisper-guard cleanup (dedups any window-boundary
+            // repeats); its output lines are the transcript.
+            let cleanup = run_transcript_cleanup_pipeline(lines.clone());
+            let transcript = cleanup.lines.join("\n");
+            let transcript = if transcript.is_empty() {
+                transcript
+            } else {
+                format!("{transcript}\n")
+            };
+            let word_count = transcript.split_whitespace().count();
+            if word_count < config.transcription.min_words {
+                return Err(TranscribeError::EmptyTranscript(
+                    config.transcription.min_words,
+                ));
+            }
+            let stats = FilterStats {
+                audio_duration_secs,
+                raw_segments,
+                after_no_speech_filter: raw_segments,
+                after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
+                after_interleaved: cleanup.after(TranscriptCleanupStage::DedupInterleaved),
+                after_script_filter: cleanup.after(TranscriptCleanupStage::StripForeignScript),
+                after_noise_markers: cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers),
+                after_trailing_trim: cleanup.after(TranscriptCleanupStage::TrimTrailingNoise),
+                final_words: word_count,
+                ..Default::default()
+            };
+            // Correlate surviving lines back to their timing data
+            let transcript_segments =
+                correlate_sherpa_segments(&cleanup.lines, &lines, &sherpa_seg_data);
+            Ok(TranscribeResult {
+                text: transcript,
+                stats,
+                segments: transcript_segments,
+                detected_language: None, // sherpa does not report detected language
             })
-            .collect();
-        let lines: Vec<String> = sherpa_seg_data
-            .iter()
-            .map(|(l, _, _, _)| l.clone())
-            .collect();
-        let raw_segments = lines.len();
-
-        // Run the shared whisper-guard cleanup (dedups any window-boundary
-        // repeats); its output lines are the transcript.
-        let cleanup = run_transcript_cleanup_pipeline(lines.clone());
-        let transcript = cleanup.lines.join("\n");
-        let transcript = if transcript.is_empty() {
-            transcript
-        } else {
-            format!("{transcript}\n")
-        };
-        let word_count = transcript.split_whitespace().count();
-        if word_count < config.transcription.min_words {
-            return Err(TranscribeError::EmptyTranscript(
-                config.transcription.min_words,
-            ));
         }
-        let stats = FilterStats {
-            audio_duration_secs,
-            raw_segments,
-            after_no_speech_filter: raw_segments,
-            after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
-            after_interleaved: cleanup.after(TranscriptCleanupStage::DedupInterleaved),
-            after_script_filter: cleanup.after(TranscriptCleanupStage::StripForeignScript),
-            after_noise_markers: cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers),
-            after_trailing_trim: cleanup.after(TranscriptCleanupStage::TrimTrailingNoise),
-            final_words: word_count,
-            ..Default::default()
-        };
-        // Correlate surviving lines back to their timing data
-        let transcript_segments =
-            correlate_sherpa_segments(&cleanup.lines, &lines, &sherpa_seg_data);
-        Ok(TranscribeResult {
-            text: transcript,
-            stats,
-            segments: transcript_segments,
-            detected_language: None, // sherpa does not report detected language
-        })
-    }
 
-    #[cfg(not(feature = "engine-sherpa"))]
-    {
-        let _ = (audio_path, config, hints);
-        Err(TranscribeError::EngineNotAvailable("engine-sherpa".into()))
+        #[cfg(not(feature = "engine-sherpa"))]
+        {
+            let _ = (audio_path, config, hints);
+            Err(TranscribeError::EngineNotAvailable("engine-sherpa".into()))
+        }
     }
 }
 
