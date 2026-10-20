@@ -8543,8 +8543,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       elapsedSecs = 0,
       recording = false,
       stopping = false,
+      disabled = false,
     } = {}) {
       if (stopping) return 'Finishing transcript…';
+      // Off by configuration is a choice, not a failure: no "Preparing" wait.
+      if (disabled) return 'Recording · Live transcript off';
       if (diagnostic) {
         if (recording && elapsedSecs < 4) return 'Preparing transcript…';
         return recording
@@ -8715,6 +8718,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             elapsedSecs: elapsedClockSeconds(status.elapsed),
             recording: true,
             stopping: stopRequested,
+            disabled: recordingLive.disabled === true,
           });
           document.getElementById('btn-stop').disabled = !!stopRequested;
 
