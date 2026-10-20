@@ -4962,13 +4962,30 @@ describe("restricted content policy", () => {
     );
     try {
       let flipped = false;
-      const result = await policyListMeetings(meetingsDir, 10, false, () => {
-        if (flipped) return;
-        flipped = true;
-        writeFileSync(
-          path,
-          meeting("A private", "restricted", "POST-SNAPSHOT-PRIVATE-CANARY")
+      const finalManifestAttempts: number[] = [];
+      const result = await policyListMeetings(
+        meetingsDir,
+        10,
+        false,
+        () => {
+          if (flipped) return;
+          flipped = true;
+          writeFileSync(
+            path,
+            meeting("A private", "restricted", "POST-SNAPSHOT-PRIVATE-CANARY")
+          );
+        },
+        {
+          beforeFinalManifest: ({ attempt }) => {
+            finalManifestAttempts.push(attempt);
+          },
+        }
+      ).catch((error) => {
+        console.error(
+          "[corpus-retry-test]",
+          JSON.stringify({ platform: process.platform, flipped, finalManifestAttempts })
         );
+        throw error;
       });
       expect(result.map((item) => item.frontmatter.title)).toEqual(["B stable"]);
       expect(JSON.stringify(result)).not.toContain("POST-SNAPSHOT-PRIVATE-CANARY");
