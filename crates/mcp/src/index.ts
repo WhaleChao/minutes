@@ -4657,10 +4657,13 @@ export function registerLiveEventsSubscriptionHandlers(
 // ── MCP Server ──────────────────────────────────────────────
 
 crashTrace("pre-mcp-server-construct");
+// Bound validation work before a tool schema sees untrusted arguments. Keep
+// this on every protocol instance, including per-session HTTP servers.
+const MCP_SERVER_OPTIONS = { maxToolInputElements: 10_000 };
 const server = new McpServer({
   name: "minutes",
   version: MCP_SERVER_VERSION,
-});
+}, MCP_SERVER_OPTIONS);
 crashTrace("post-mcp-server-construct");
 
 // ── Server instance registry ────────────────────────────────
@@ -4742,7 +4745,7 @@ export function createMinutesServer(): MinutesServerInstance {
   const instance = new McpServer({
     name: "minutes",
     version: MCP_SERVER_VERSION,
-  });
+  }, MCP_SERVER_OPTIONS);
   const teardowns: Array<() => void> = [];
   for (const build of SERVER_BUILDERS) {
     const teardown = build(instance);
