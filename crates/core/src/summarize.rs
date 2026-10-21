@@ -4007,6 +4007,10 @@ mod tests {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // polls with a deadline; each complete HTTP request is read
+                // synchronously under its own bounded read timeout.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
