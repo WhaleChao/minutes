@@ -145,6 +145,25 @@ fn exit_process_without_destructors(code: i32) -> ! {
     }
 }
 
+/// Relaunch the app without running C++ static destructors.
+/// `AppHandle::restart` ends in `std::process::exit`, which aborts via
+/// `__cxa_finalize_ranges` on macOS and shows a crash dialog after every update.
+pub(crate) fn restart_without_destructors(app: &tauri::AppHandle) -> ! {
+    cleanup_before_process_exit(app);
+    match tauri::process::current_binary(&app.env()) {
+        Ok(path) => {
+            if let Err(error) = std::process::Command::new(path)
+                .args(app.env().args_os.iter().skip(1))
+                .spawn()
+            {
+                eprintln!("[restart] failed to relaunch app: {error}");
+            }
+        }
+        Err(error) => eprintln!("[restart] could not resolve current binary: {error}"),
+    }
+    exit_process_without_destructors(0);
+}
+
 fn finish_clean_exit(app: tauri::AppHandle, code: i32) -> ! {
     cleanup_before_process_exit(&app);
     exit_process_without_destructors(code);

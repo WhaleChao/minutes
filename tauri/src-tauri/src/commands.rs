@@ -8763,7 +8763,7 @@ pub fn cmd_restart_for_permission(
             "Restart requires confirmation because an assistant session will close.".into(),
         );
     }
-    app.restart();
+    crate::restart_without_destructors(&app);
     #[allow(unreachable_code)]
     Ok(())
 }
@@ -24178,7 +24178,7 @@ pub async fn cmd_install_update(app: tauri::AppHandle) -> Result<serde_json::Val
             );
             eprintln!("[updater] v{} installed, restarting", version);
             std::thread::sleep(Duration::from_millis(700));
-            app_handle.restart();
+            crate::restart_without_destructors(&app_handle);
             #[allow(unreachable_code)]
             Ok::<(), UpdateInstallError>(())
         }
