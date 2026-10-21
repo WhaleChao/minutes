@@ -2177,6 +2177,7 @@ impl PrivateAudioTempFile {
 enum PreparedTranscriptionInput {
     Original,
     Mixed(AuthorizedProcessAudioInput),
+    IndependentStems(diarize::StemPaths),
     SingleStem {
         path: std::path::PathBuf,
         recording_health: markdown::RecordingHealth,
@@ -2186,7 +2187,7 @@ enum PreparedTranscriptionInput {
 impl PreparedTranscriptionInput {
     fn processing_path(&self, original: &Path) -> PathBuf {
         match self {
-            Self::Original => original.to_path_buf(),
+            Self::Original | Self::IndependentStems(_) => original.to_path_buf(),
             Self::Mixed(handle) => handle.processing_path().to_path_buf(),
             Self::SingleStem { path, .. } => path.clone(),
         }
@@ -2199,7 +2200,7 @@ impl PreparedTranscriptionInput {
     fn internal_authority(&self) -> Option<&AuthorizedProcessAudioInput> {
         match self {
             Self::Mixed(input) => Some(input),
-            Self::Original | Self::SingleStem { .. } => None,
+            Self::Original | Self::SingleStem { .. } | Self::IndependentStems(_) => None,
         }
     }
 
@@ -2208,14 +2209,14 @@ impl PreparedTranscriptionInput {
             Self::SingleStem {
                 recording_health, ..
             } => Some(recording_health),
-            Self::Original | Self::Mixed(_) => None,
+            Self::Original | Self::Mixed(_) | Self::IndependentStems(_) => None,
         }
     }
 
     fn diarization_audio_path(&self) -> Option<&Path> {
         match self {
             Self::SingleStem { path, .. } => Some(path),
-            Self::Original | Self::Mixed(_) => None,
+            Self::Original | Self::Mixed(_) | Self::IndependentStems(_) => None,
         }
     }
 }
@@ -2225,6 +2226,11 @@ impl PreparedTranscriptionInput {
 /// stays bound to the typed private capability accepted by the authorized
 /// coordinator entry. A caller-supplied proof authority takes precedence and
 /// is independently revalidated by that entry.
+struct PreparedTranscriptionResult {
+    transcription: crate::transcribe::TranscribeResult,
+    sources: Option<crate::source_transcript::SourceTranscript>,
+}
+
 fn transcribe_prepared_input_with_hints(
     prepared: &PreparedTranscriptionInput,
     original: &Path,
@@ -2232,22 +2238,81 @@ fn transcribe_prepared_input_with_hints(
     content_type: ContentType,
     config: &Config,
     decode_hints: crate::transcribe::DecodeHints,
-) -> Result<crate::transcribe::TranscribeResult, crate::error::TranscribeError> {
-    if let Some(authority) = input_authority.or_else(|| prepared.internal_authority()) {
-        crate::transcription_coordinator::transcribe_authorized_path_for_content_with_hints(
-            authority,
-            content_type,
-            config,
-            decode_hints,
-        )
-    } else {
-        crate::transcription_coordinator::transcribe_path_for_content_with_hints(
-            &prepared.processing_path(original),
-            content_type,
-            config,
-            decode_hints,
-        )
+) -> Result<PreparedTranscriptionResult, crate::error::TranscribeError> {
+    if input_authority.is_none() {
+        if let PreparedTranscriptionInput::IndependentStems(stems) = prepared {
+            // Sequential calls bound model memory; this is final processing,
+            // never the live capture/optional-consumer path. A short response
+            // on one track must not fail the whole meeting's word threshold.
+            let mut source_config = config.clone();
+            source_config.transcription.min_words = 0;
+            return transcribe_independent_stems(stems, |path| {
+                crate::transcription_coordinator::transcribe_path_for_content_with_hints(
+                    path,
+                    content_type,
+                    &source_config,
+                    decode_hints
+                        .clone()
+                        .with_audio_format_extension("wav")
+                        .with_source_timeline(),
+                )
+            });
+        }
     }
+    let transcription =
+        if let Some(authority) = input_authority.or_else(|| prepared.internal_authority()) {
+            crate::transcription_coordinator::transcribe_authorized_path_for_content_with_hints(
+                authority,
+                content_type,
+                config,
+                decode_hints,
+            )
+        } else {
+            crate::transcription_coordinator::transcribe_path_for_content_with_hints(
+                &prepared.processing_path(original),
+                content_type,
+                config,
+                decode_hints,
+            )
+        }?;
+    Ok(PreparedTranscriptionResult {
+        transcription,
+        sources: None,
+    })
+}
+
+fn transcribe_independent_stems(
+    stems: &diarize::StemPaths,
+    mut transcribe: impl FnMut(
+        &Path,
+    ) -> Result<
+        crate::transcribe::TranscribeResult,
+        crate::error::TranscribeError,
+    >,
+) -> Result<PreparedTranscriptionResult, crate::error::TranscribeError> {
+    let mut run = |path: &Path| match transcribe(path) {
+        Ok(result) => Ok(result),
+        // Signal is not proof of speech: one valid track can contain only
+        // noise. Keep the other track, but never suppress a decoder/model error
+        // or silently retry mixed audio after failure on an audible source.
+        Err(
+            crate::error::TranscribeError::EmptyAudio
+            | crate::error::TranscribeError::EmptyTranscript(_),
+        ) => Ok(crate::transcribe::TranscribeResult {
+            text: String::new(),
+            stats: Default::default(),
+            segments: vec![],
+            detected_language: None,
+        }),
+        Err(error) => Err(error),
+    };
+    let voice = run(&stems.voice)?;
+    let system = run(&stems.system)?;
+    let (transcription, sources) = crate::source_transcript::merge_sources(voice, system);
+    Ok(PreparedTranscriptionResult {
+        transcription,
+        sources: Some(sources),
+    })
 }
 
 /// Prepare the input handed to the transcription coordinator, working around
@@ -2259,9 +2324,10 @@ fn transcribe_prepared_input_with_hints(
 /// garbled samples and emits gibberish. A stopped or crashed capture can leave
 /// valid payload behind placeholder RIFF/data lengths; verified recoverable
 /// headers are repaired before the shared diarization classifier runs. When
-/// both stems are usable, this helper mixes them into a 16kHz mono PCM via
-/// `ffmpeg amix` and returns a prepared input to the transcriber. When
-/// both stems are usable, the mixed handle's `Drop` impl retires the anonymous
+/// both stems are usable for a meeting, they are recognized independently
+/// (#1176), including dual-source WAV recordings. Other content types retain
+/// the original 16kHz mono `ffmpeg amix` workaround. The mixed handle's `Drop`
+/// impl retires the anonymous
 /// or sealed capability on success, Err, panic, or any future early-return;
 /// no plaintext filesystem path is published. When exactly one
 /// stem is usable, the surviving PCM is returned directly with explicit
@@ -2272,7 +2338,8 @@ fn transcribe_prepared_input_with_hints(
 ///   or it is a `.mov` with no sibling stems at all (treated as an ordinary
 ///   non-native-call container; the caller hands the original path to the
 ///   transcriber and accepts whatever the decoder does with it).
-/// - `Ok(Mixed(handle))` — both native-call stems mixed cleanly.
+/// - `Ok(IndependentStems(paths))` — both meeting sources remain separate.
+/// - `Ok(Mixed(handle))` — both non-meeting native-call stems mixed cleanly.
 /// - `Ok(SingleStem { .. })` — exactly one native-call stem contains signal;
 ///   transcribe it directly and surface the attached health warning.
 /// - `Err(MinutesError::Transcribe(NativeCaptureStemMixUnavailable))` — input is
@@ -2293,21 +2360,34 @@ fn prepare_transcription_input(
     prepare_transcription_input_with_format(audio_path, None)
 }
 
+#[cfg(test)]
 fn prepare_transcription_input_with_format(
     audio_path: &Path,
     format_extension: Option<&str>,
 ) -> Result<PreparedTranscriptionInput, MinutesError> {
-    // Only `.mov` containers can hit the 2x decode bug. Everything else is
-    // either a clean PCM wav (Jake's manual reprocess flow), a single-stream
-    // m4a/mp3/ogg (voice memos), or a format that does not exercise the
-    // SCRecordingOutput dual-track path.
+    prepare_transcription_input_for_content(audio_path, format_extension, ContentType::Memo)
+}
+
+fn prepare_transcription_input_for_content(
+    audio_path: &Path,
+    format_extension: Option<&str>,
+    content_type: ContentType,
+) -> Result<PreparedTranscriptionInput, MinutesError> {
+    // MOV needs the duration workaround; dual-source WAV meetings also need
+    // independent ASR. Single-source recordings retain their ordinary decoder.
     let ext = format_extension.map(str::to_lowercase).or_else(|| {
         audio_path
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
     });
-    if ext.as_deref() != Some("mov") {
+    let independent_wav = content_type == ContentType::Meeting
+        && ext.as_deref() == Some("wav")
+        && !audio_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.ends_with(".voice") || stem.ends_with(".system"));
+    if ext.as_deref() != Some("mov") && !independent_wav {
         return Ok(PreparedTranscriptionInput::Original);
     }
 
@@ -2458,6 +2538,11 @@ fn prepare_transcription_input_with_format(
             return Ok(PreparedTranscriptionInput::Original);
         }
     };
+
+    if content_type == ContentType::Meeting {
+        tracing::info!("transcribing native microphone and system stems independently");
+        return Ok(PreparedTranscriptionInput::IndependentStems(stems));
+    }
 
     let mut raw_pcm =
         PrivateAudioTempFile::new("minutes-stem-mix-pcm-", ".s16le").map_err(|error| {
@@ -3206,6 +3291,7 @@ pub struct TranscriptArtifact {
     /// transcription. Diarization must reuse it rather than reopening the
     /// dual-track `.mov` that recovery deliberately bypassed.
     diarization_audio_path: Option<std::path::PathBuf>,
+    source_transcript: Option<crate::source_transcript::SourceTranscript>,
 }
 
 impl std::fmt::Debug for TranscriptArtifact {
@@ -3247,6 +3333,7 @@ impl TranscriptArtifact {
             transcript,
             authority: TranscriptAuthority::AmbientPath,
             diarization_audio_path: None,
+            source_transcript: None,
         }
     }
 }
@@ -4655,13 +4742,10 @@ fn transcribe_to_artifact_with_authority(
         decode_hints = decode_hints.with_audio_format_extension(format);
     }
 
-    // Apply the same stem-mix workaround as `process_with_progress_and_sidecar`
-    // so background-job and `minutes process` callers (which reach the
-    // pipeline via `transcribe_to_artifact` and bypass the foreground
-    // entry point) are not exposed to the macOS 26 dual-track `.mov` 2x
-    // bug. A mixed temp handle cleans itself up; a single surviving stem is
-    // borrowed in place and contributes explicit recording health (#463).
-    let prepared_input = prepare_transcription_input_with_format(audio_path, authorized_format)?;
+    // Use the same native-source preparation as foreground processing. Meeting
+    // sources remain independent; other content retains the MOV decode workaround.
+    let prepared_input =
+        prepare_transcription_input_for_content(audio_path, authorized_format, content_type)?;
     if let Some(format_extension) = prepared_input.format_extension() {
         decode_hints = decode_hints.with_audio_format_extension(format_extension);
     }
@@ -4670,7 +4754,10 @@ fn transcribe_to_artifact_with_authority(
         .diarization_audio_path()
         .map(Path::to_path_buf);
     let step_start = std::time::Instant::now();
-    let result = transcribe_prepared_input_with_hints(
+    let PreparedTranscriptionResult {
+        transcription: result,
+        sources: source_transcript,
+    } = transcribe_prepared_input_with_hints(
         &prepared_input,
         audio_path,
         input_authority,
@@ -4712,6 +4799,7 @@ fn transcribe_to_artifact_with_authority(
     );
     let artifact = artifact.map(|mut artifact| {
         artifact.diarization_audio_path = diarization_audio_path;
+        artifact.source_transcript = source_transcript;
         artifact
     });
     match &artifact {
@@ -4990,6 +5078,7 @@ fn write_transcript_artifact_with_authority(
         transcript,
         authority,
         diarization_audio_path: None,
+        source_transcript: None,
     })
 }
 
@@ -5183,7 +5272,10 @@ where
                         "last_segment_end": result.segments.last().map(|s| s.end),
                     }),
                 );
-                transcript = diarize::apply_speakers(&transcript, &result);
+                transcript = match &artifact.source_transcript {
+                    Some(sources) => sources.apply_speakers(&transcript, &result),
+                    None => diarize::apply_speakers(&transcript, &result),
+                };
                 log_rendered_label_collapse_diagnostic(diagnostic_audio_path, &result, &transcript);
             }
             diarize::DiarizationOutcome::Skipped { reason } => {
@@ -5755,13 +5847,10 @@ where
 
     // Step 1: Transcribe (always)
     on_progress(PipelineStage::Transcribing);
-    // Workaround: if this is a native-call .mov with stems beside it, transcribe
-    // a freshly-mixed PCM from both valid stems or the one surviving stem.
-    // `prepared_input` owns any temporary mix so Err/panic cleanup remains
-    // automatic; a surviving original stem is borrowed and never removed.
-    // If neither sibling contains signal, the typed mix error still prevents
-    // unsafe fallback to the broken dual-track `.mov` decoder.
-    let prepared_input = prepare_transcription_input_with_format(audio_path, authorized_format)?;
+    // Preserve separately captured meeting sources through final ASR. The
+    // original single-survivor recovery and typed MOV decode guard still apply.
+    let prepared_input =
+        prepare_transcription_input_for_content(audio_path, authorized_format, content_type)?;
     if let Some(format_extension) = prepared_input.format_extension() {
         decode_hints = decode_hints.with_audio_format_extension(format_extension);
     }
@@ -5771,7 +5860,10 @@ where
         .map(Path::to_path_buf);
     tracing::info!(step = "transcribe", file = %diagnostic_audio_path.display(), "transcribing audio");
     let step_start = std::time::Instant::now();
-    let result = transcribe_prepared_input_with_hints(
+    let PreparedTranscriptionResult {
+        transcription: result,
+        sources: source_transcript,
+    } = transcribe_prepared_input_with_hints(
         &prepared_input,
         audio_path,
         input_authority,
@@ -5872,7 +5964,10 @@ where
                 }
                 diarization_embeddings = result.speaker_embeddings.clone();
                 speaker_embedding_segments = result.speaker_embedding_segments.clone();
-                let transcript = diarize::apply_speakers(&transcript, &result);
+                let transcript = match &source_transcript {
+                    Some(sources) => sources.apply_speakers(&transcript, &result),
+                    None => diarize::apply_speakers(&transcript, &result),
+                };
                 log_rendered_label_collapse_diagnostic(diagnostic_audio_path, &result, &transcript);
                 transcript
             }
@@ -6447,7 +6542,7 @@ fn format_duration_secs(duration_secs: f64) -> String {
 fn parse_transcript_line_start_secs(line: &str) -> Option<f32> {
     let rest = line.strip_prefix('[')?;
     let bracket_end = rest.find(']')?;
-    let timestamp = &rest[..bracket_end];
+    let timestamp = rest[..bracket_end].split_whitespace().last()?;
     let parts: Vec<&str> = timestamp.split(':').collect();
     let secs = match parts.as_slice() {
         [minutes, seconds] => minutes.parse::<u64>().ok()? * 60 + seconds.parse::<u64>().ok()?,
@@ -12708,6 +12803,136 @@ mod prepare_transcription_input_tests {
             registered_private_audio_reader(&mixed_capability).is_err(),
             "dropped mixed audio must not remain resolvable"
         );
+    }
+
+    #[test]
+    fn meeting_preparation_preserves_independent_stems_without_ffmpeg() {
+        let (_dir, mov) = fake_native_call_capture("source-separated");
+        let input =
+            prepare_transcription_input_for_content(&mov, None, ContentType::Meeting).unwrap();
+        let PreparedTranscriptionInput::IndependentStems(stems) = input else {
+            panic!("both native meeting stems must reach independent ASR");
+        };
+        let mut paths = Vec::new();
+        let result = transcribe_independent_stems(&stems, |path| {
+            paths.push(path.to_path_buf());
+            let text = if path == stems.voice {
+                "[0:00] quieter microphone words"
+            } else {
+                "[0:00] louder system words"
+            };
+            Ok(crate::transcribe::TranscribeResult {
+                text: text.into(),
+                stats: Default::default(),
+                segments: vec![],
+                detected_language: None,
+            })
+        })
+        .unwrap();
+        assert_eq!(paths, vec![stems.voice, stems.system]);
+        assert!(result
+            .transcription
+            .text
+            .contains("quieter microphone words"));
+        assert!(result.transcription.text.contains("louder system words"));
+        assert!(result.sources.is_some());
+    }
+
+    #[test]
+    fn dual_source_wav_uses_independent_asr_but_single_and_authorized_wav_do_not_discover_stems() {
+        let (_dir, mov) = fake_native_call_capture("dual-source-wav");
+        let wav = mov.with_extension("wav");
+        write_audible_wav(&wav);
+        assert!(matches!(
+            prepare_transcription_input_for_content(&wav, None, ContentType::Meeting).unwrap(),
+            PreparedTranscriptionInput::IndependentStems(_)
+        ));
+        assert!(matches!(
+            prepare_transcription_input_for_content(&wav, Some("wav"), ContentType::Meeting)
+                .unwrap(),
+            PreparedTranscriptionInput::Original
+        ));
+        let single = wav.with_file_name("single.wav");
+        write_audible_wav(&single);
+        assert!(matches!(
+            prepare_transcription_input_for_content(&single, None, ContentType::Meeting).unwrap(),
+            PreparedTranscriptionInput::Original
+        ));
+    }
+
+    #[test]
+    fn independent_source_decoder_failure_never_falls_back_to_a_mixed_success() {
+        let (_dir, mov) = fake_native_call_capture("source-failure");
+        let PreparedTranscriptionInput::IndependentStems(stems) =
+            prepare_transcription_input_for_content(&mov, None, ContentType::Meeting).unwrap()
+        else {
+            panic!("independent stems required");
+        };
+        let mut calls = 0;
+        let result = transcribe_independent_stems(&stems, |_| {
+            calls += 1;
+            Err(crate::error::TranscribeError::TranscriptionFailed(
+                "synthetic decoder failure".into(),
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert!(stems.voice.exists() && stems.system.exists());
+    }
+
+    #[test]
+    fn independent_source_without_speech_keeps_the_other_sources_text() {
+        let (_dir, mov) = fake_native_call_capture("source-noise");
+        let PreparedTranscriptionInput::IndependentStems(stems) =
+            prepare_transcription_input_for_content(&mov, None, ContentType::Meeting).unwrap()
+        else {
+            panic!("independent stems required");
+        };
+        let result = transcribe_independent_stems(&stems, |path| {
+            if path == stems.voice {
+                return Err(crate::error::TranscribeError::EmptyTranscript(0));
+            }
+            Ok(crate::transcribe::TranscribeResult {
+                text: "[0:00] actual system speech".into(),
+                stats: Default::default(),
+                segments: vec![],
+                detected_language: None,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            result.transcription.text,
+            "[SYSTEM 0:00] actual system speech\n"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "whisper"))]
+    fn foreground_and_background_meetings_keep_source_provenance() {
+        let (_dir, mov) = fake_native_call_capture("source-pipelines");
+        let mut config = Config {
+            output_dir: mov.parent().unwrap().join("meetings"),
+            ..Config::default()
+        };
+        config.summarization.engine = "none".into();
+        config.diarization.engine = "none".into();
+        let foreground =
+            process(&mov, ContentType::Meeting, Some("Source meeting"), &config).unwrap();
+        let content = fs::read_to_string(foreground.path).unwrap();
+        assert!(content.contains("[MICROPHONE]"));
+        assert!(content.contains("[SYSTEM]"));
+        let background = transcribe_to_artifact(
+            &mov,
+            ContentType::Meeting,
+            Some("Background source meeting"),
+            &config,
+            &BackgroundPipelineContext::default(),
+            None,
+        )
+        .unwrap();
+        assert!(background.transcript.contains("[MICROPHONE]"));
+        assert!(background.transcript.contains("[SYSTEM]"));
+        assert!(background.source_transcript.is_some());
     }
 
     #[test]
