@@ -17,6 +17,65 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+test('idle renders preserve a native picker selection until its change event commits', () => {
+  const html = readFileSync(new URL('../tauri/src/index.html', import.meta.url), 'utf8');
+  const render = html.match(/    function renderMeetingAudioChoice\(\) \{[\s\S]*?\n    \}/)?.[0];
+  assert(render);
+  let value = '', disabled = false, valueWrites = 0, disabledWrites = 0;
+  const picker = {
+    get value() { return value; },
+    set value(next) { valueWrites++; value = next; },
+    get disabled() { return disabled; },
+    set disabled(next) { disabledWrites++; disabled = next; },
+  };
+  const state = { choice: null, pending: false, error: '', ready: false };
+  const context = vm.createContext({
+    recordingAudioChoice: { snapshot: () => state },
+    meetingAudioSource: picker, meetingAudioHelp: null,
+    document: { getElementById: () => null },
+    footer: { classList: { contains: () => false } },
+    syncPrimaryCaptureLabel: () => {},
+  });
+  vm.runInContext(`const renderedMeetingAudioChoices = new WeakMap(); ${render}`, context);
+  const paint = () => vm.runInContext('renderMeetingAudioChoice()', context);
+  paint();
+
+  // A native popup can update its value before WebKit dispatches change.
+  // Simulate that user action without counting it as an application write.
+  value = 'microphone-and-system';
+  paint(); paint(); paint();
+  assert.equal(value, 'microphone-and-system');
+  assert.equal(valueWrites, 0);
+  assert.equal(disabledWrites, 0);
+
+  state.pending = true;
+  paint(); paint();
+  assert.equal(value, 'microphone-and-system');
+  assert.equal(disabled, true);
+  assert.equal(disabledWrites, 1);
+
+  Object.assign(state, { choice: 'microphone-and-system', pending: false, ready: true });
+  paint(); paint();
+  assert.equal(value, 'microphone-and-system');
+  assert.equal(disabled, false);
+  assert.equal(valueWrites, 0);
+  assert.equal(disabledWrites, 2);
+
+  // A rejected save restores the acknowledged value, allowing the same
+  // failed option to emit another change event when the user retries it.
+  value = 'microphone';
+  state.pending = true;
+  paint();
+  Object.assign(state, { pending: false, error: 'Audio choice could not be saved.', ready: false });
+  paint(); paint();
+  assert.equal(value, 'microphone-and-system');
+  assert.equal(valueWrites, 1);
+  value = 'microphone';
+  Object.assign(state, { pending: true, error: '' });
+  paint();
+  assert.equal(value, 'microphone');
+});
+
 test('fresh or unknown preferences cannot start a microphone-only meeting by default', () => {
   for (const value of [null, undefined, '', 'unknown']) {
     const controller = create();
@@ -135,7 +194,7 @@ test('onboarding shows the shared choice and cannot record until it and the mode
   let active = false;
   const context = vm.createContext({ recordingAudioChoice: controller, meetingAudioSource: mainPicker, meetingAudioHelp: mainHelp,
     document: { getElementById: id => nodes[id] || null }, footer: { classList: { contains: () => active } }, syncPrimaryCaptureLabel: () => {} });
-  vm.runInContext(html.slice(begin, end), context);
+  vm.runInContext(`const renderedMeetingAudioChoices = new WeakMap(); ${html.slice(begin, end)}`, context);
   const render = () => vm.runInContext('renderMeetingAudioChoice()', context);
   render(); assert.equal(button.disabled, true);
   load(controller, 'microphone-and-system'); render();
