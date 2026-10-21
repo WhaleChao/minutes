@@ -33,7 +33,24 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+#[cfg(target_os = "macos")]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
+#[allow(clippy::all, rustdoc::broken_intra_doc_links)]
+mod sys {
+    include!(concat!(env!("OUT_DIR"), "/sherpa_bindings.rs"));
+}
+#[cfg(target_os = "macos")]
+mod offline;
+#[cfg(target_os = "macos")]
+use offline::{TransducerConfig, TransducerRecognizer};
+#[cfg(not(target_os = "macos"))]
 use sherpa_rs::sherpa_rs_sys as sys;
+#[cfg(not(target_os = "macos"))]
 use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 
 /// Version of the C surface below.
@@ -195,6 +212,9 @@ pub unsafe extern "C" fn minutes_sherpa_create(
             .map_err(|_| "model_dir was not valid UTF-8".to_string())?
             .to_string();
         let path = |file: &str| format!("{dir}/{file}");
+        // sherpa-rs's config has more fields than the macOS shim, so the
+        // struct update is needed off macOS and redundant on it.
+        #[allow(clippy::needless_update)]
         let cfg = TransducerConfig {
             encoder: path("encoder.int8.onnx"),
             decoder: path("decoder.int8.onnx"),

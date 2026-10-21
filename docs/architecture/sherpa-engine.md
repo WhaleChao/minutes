@@ -66,12 +66,12 @@ before any other on-disk location. Substitute your own install directory if it
 is not `~/.local/bin` (a `cargo install` layout puts the binary in
 `~/.cargo/bin`).
 
-Installing differs by platform, because only macOS links sherpa-onnx
-statically into the plugin:
+The plugin loads sherpa-onnx and its own ONNX Runtime as shared libraries from
+its directory, so install them together:
 
 ```bash
-# macOS: the plugin is self-contained.
-cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.local/bin/
+# macOS: the plugin finds its libraries through an @loader_path runpath.
+cp crates/sherpa-plugin/target/release/{libminutes_sherpa,libsherpa-onnx-c-api,libonnxruntime}.dylib ~/.local/bin/
 
 # Linux: the sherpa libraries must travel with it, since the plugin resolves
 # them through its own $ORIGIN. Copying the plugin alone installs one that
@@ -95,8 +95,8 @@ minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sher
 > arbitrating it. A Rust cdylib exports only its own `#[no_mangle]` surface, so
 > the embedded runtime stays internal and macOS two-level namespaces bind each
 > image's calls to its own copy. Verified on arm64: one binary enrolls a voice
-> through ORT 1.22 and transcribes through the plugin's ORT 1.17, in one
-> process.
+> through ORT 1.22 and transcribes through the plugin's own ORT (1.17 when
+> first verified, 1.28 since the move to shared libraries), in one process.
 >
 > The plugin is found via `MINUTES_SHERPA_PLUGIN`, then beside the running
 > executable, then in `<transcription.model_path>/sherpa/lib/`, which with the
@@ -110,8 +110,14 @@ minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sher
 > it, and `minutes health` then reports it as not installed. Reported by
 > @ReticentEclectic in #998.
 
-> **Platform note.** On macOS, the plugin links sherpa-onnx statically, so it is
-> self-contained and the copy above is all you need.
+> **Platform note.** On macOS the plugin links sherpa-onnx 1.13.x as shared
+> libraries (`libsherpa-onnx-c-api.dylib`, `libonnxruntime.dylib`, ONNX Runtime
+> 1.28). `crates/sherpa-plugin/build.rs` downloads the pinned universal2 archive,
+> checks its SHA-256, and generates the bindings from its headers; set
+> `MINUTES_SHERPA_ARCHIVE` to a local copy for offline builds. The plugin carries
+> an `@loader_path` runpath, so copy all three dylibs together. The previous
+> static build bundled ONNX Runtime 1.17.1, which loaded the Parakeet int8 model
+> in about 6 s and decoded it about three times slower than 1.13.x.
 >
 > On Linux, sherpa-rs links dynamic libraries (`libsherpa-onnx-c-api.so`,
 > `libonnxruntime.so`) that are built into the plugin crate's `target/release`.

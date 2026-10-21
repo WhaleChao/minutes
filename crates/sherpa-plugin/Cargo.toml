@@ -14,10 +14,17 @@ crate-type = ["cdylib"]
 # would put that on every `cargo clippy --all`. It also ships separately from
 # the binaries, which is the entire point of #685.
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Static on macOS: sherpa-onnx AND its own ONNX Runtime live inside this
-# dylib, which is what keeps them away from the host's ort (issue #683).
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static", "sys"] }
+# macOS does not use sherpa-rs. Its newest release pins sherpa-onnx 1.12.9,
+# which bundles ONNX Runtime 1.17.1 and decodes the Parakeet int8 model about
+# three times slower than 1.13.x. build.rs downloads the 1.13.x shared archive
+# instead and generates bindings from its own headers. The ONNX Runtime stays
+# a private dylib beside this plugin, so the host's ort never sees it (#683).
+[target.'cfg(target_os = "macos")'.build-dependencies]
+bindgen = "0.69.4"
+bzip2 = { version = "0.4.4", features = ["static"] }
+sha2 = "0.10"
+tar = "0.4"
+ureq = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "sys"] }

@@ -344,6 +344,13 @@ jobs:
           mkdir -p "$out"
           cp -f "release-input/minutes-macos-arm64" "$out/minutes"
           cp -f "$plugin" "$out/"
+          # The plugin links sherpa-onnx and its private ONNX Runtime as shared
+          # libraries and finds them beside itself through @loader_path.
+          for lib in libsherpa-onnx-c-api.dylib libonnxruntime.dylib; do
+            cp -f "crates/sherpa-plugin/target/release/$lib" "$out/"
+            test -f "$out/$lib" \
+              || { echo "::error::$lib missing from the macOS sherpa archive"; exit 1; }
+          done
           # download-artifact normalizes files to 0644. Restore and exercise
           # the packaged CLI so extracting this archive yields a runnable tool.
           chmod 755 "$out/minutes"
@@ -377,6 +384,11 @@ jobs:
             codesign --force --options runtime --timestamp \
               --sign "$APPLE_SIGNING_IDENTITY" "$out/libminutes_sherpa.dylib"
             codesign --verify --strict --verbose=4 "$out/libminutes_sherpa.dylib"
+            for lib in libsherpa-onnx-c-api.dylib libonnxruntime.dylib; do
+              codesign --force --options runtime --timestamp \
+                --sign "$APPLE_SIGNING_IDENTITY" "$out/$lib"
+              codesign --verify --strict --verbose=4 "$out/$lib"
+            done
           elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "::error::Apple signing credentials are required for a release archive"
             exit 1

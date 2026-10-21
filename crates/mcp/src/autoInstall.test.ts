@@ -1,11 +1,12 @@
 import { mkdtemp, readFile, stat, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 import { createHash } from "crypto";
 import { gzipSync } from "zlib";
 import { describe, expect, it } from "vitest";
 
 import {
+  atomicReplaceMacSherpaFiles,
   downloadReleaseBinaryWithChecksum,
   extractMacSherpaArchive,
   extractZipWithPowerShell,
@@ -145,6 +146,14 @@ describe("macOS sherpa archive installation", () => {
         name: "minutes-macos-arm64-sherpa/libminutes_sherpa.dylib",
         contents: "fixture plugin",
       },
+      {
+        name: "minutes-macos-arm64-sherpa/libsherpa-onnx-c-api.dylib",
+        contents: "fixture sherpa library",
+      },
+      {
+        name: "minutes-macos-arm64-sherpa/libonnxruntime.dylib",
+        contents: "fixture ort library",
+      },
     ]);
     await writeFile(archivePath, gzipSync(archive));
 
@@ -155,6 +164,28 @@ describe("macOS sherpa archive installation", () => {
 
     await expect(readFile(extracted.binaryPath, "utf8")).resolves.toBe("fixture cli");
     await expect(readFile(extracted.pluginPath, "utf8")).resolves.toBe("fixture plugin");
+    expect(extracted.libraryPaths.map((path) => basename(path))).toEqual([
+      "libsherpa-onnx-c-api.dylib",
+      "libonnxruntime.dylib",
+    ]);
+    await expect(readFile(extracted.libraryPaths[1], "utf8")).resolves.toBe("fixture ort library");
+  });
+
+  it("rejects an archive that is missing a shared library", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "minutes-mcp-sherpa-tar-missing-"));
+    const archivePath = join(dir, MACOS_SHERPA_ARCHIVE);
+    await writeFile(
+      archivePath,
+      gzipSync(
+        tarArchive([
+          { name: "minutes-macos-arm64-sherpa/minutes", contents: "fixture cli" },
+          { name: "minutes-macos-arm64-sherpa/libminutes_sherpa.dylib", contents: "plugin" },
+        ])
+      )
+    );
+    await expect(
+      extractMacSherpaArchive({ archivePath, destDir: join(dir, "out") })
+    ).rejects.toThrow("missing minutes-macos-arm64-sherpa/libsherpa-onnx-c-api.dylib");
   });
 
   it("falls back to the bare asset only when the archive is unavailable", async () => {
@@ -186,8 +217,10 @@ describe("macOS sherpa archive installation", () => {
     const installDir = await mkdtemp(join(tmpdir(), "minutes-mcp-sherpa-atomic-"));
     const targetBinary = join(installDir, "minutes");
     const targetPlugin = join(installDir, "libminutes_sherpa.dylib");
+    const targetLibrary = join(installDir, "libonnxruntime.dylib");
     await writeFile(targetBinary, "old cli");
     await writeFile(targetPlugin, "old plugin");
+    await writeFile(targetLibrary, "old ort");
 
     await expect(
       installMacSherpaArchiveWithFallback({
@@ -199,9 +232,11 @@ describe("macOS sherpa archive installation", () => {
         extractArchive: async ({ destDir }) => {
           const binaryPath = join(destDir, "minutes");
           const pluginPath = join(destDir, "libminutes_sherpa.dylib");
+          const libraryPath = join(destDir, "libonnxruntime.dylib");
           await writeFile(binaryPath, "new cli");
           await writeFile(pluginPath, "new plugin");
-          return { binaryPath, pluginPath };
+          await writeFile(libraryPath, "new ort");
+          return { binaryPath, pluginPath, libraryPaths: [libraryPath] };
         },
         verifyExecutable: async () => {
           throw new Error("--version failed");
@@ -211,6 +246,51 @@ describe("macOS sherpa archive installation", () => {
 
     await expect(readFile(targetBinary, "utf8")).resolves.toBe("old cli");
     await expect(readFile(targetPlugin, "utf8")).resolves.toBe("old plugin");
+    await expect(readFile(targetLibrary, "utf8")).resolves.toBe("old ort");
+  });
+
+  it("installs the plugin with its libraries and restores them all if the binary swap fails", async () => {
+    const installDir = await mkdtemp(join(tmpdir(), "minutes-mcp-sherpa-libs-"));
+    const staged = await mkdtemp(join(tmpdir(), "minutes-mcp-sherpa-staged-"));
+    const files = {
+      plugin: join(installDir, "libminutes_sherpa.dylib"),
+      library: join(installDir, "libonnxruntime.dylib"),
+    };
+    await writeFile(files.plugin, "old plugin");
+    await writeFile(files.library, "old ort");
+    const stagedPlugin = join(staged, "libminutes_sherpa.dylib");
+    const stagedLibrary = join(staged, "libonnxruntime.dylib");
+    await writeFile(stagedPlugin, "new plugin");
+    await writeFile(stagedLibrary, "new ort");
+
+    await expect(
+      atomicReplaceMacSherpaFiles({
+        stagedBinaryPath: join(staged, "does-not-exist"),
+        stagedPluginPath: stagedPlugin,
+        stagedLibraryPaths: [stagedLibrary],
+        targetBinaryPath: join(installDir, "minutes"),
+        targetPluginPath: files.plugin,
+        backupDir: staged,
+      })
+    ).rejects.toThrow();
+
+    await expect(readFile(files.plugin, "utf8")).resolves.toBe("old plugin");
+    await expect(readFile(files.library, "utf8")).resolves.toBe("old ort");
+
+    await writeFile(join(staged, "minutes"), "new cli");
+    await writeFile(stagedPlugin, "new plugin");
+    await writeFile(stagedLibrary, "new ort");
+    await atomicReplaceMacSherpaFiles({
+      stagedBinaryPath: join(staged, "minutes"),
+      stagedPluginPath: stagedPlugin,
+      stagedLibraryPaths: [stagedLibrary],
+      targetBinaryPath: join(installDir, "minutes"),
+      targetPluginPath: files.plugin,
+      backupDir: staged,
+    });
+    await expect(readFile(files.plugin, "utf8")).resolves.toBe("new plugin");
+    await expect(readFile(files.library, "utf8")).resolves.toBe("new ort");
+    await expect(readFile(join(installDir, "minutes"), "utf8")).resolves.toBe("new cli");
   });
 });
 

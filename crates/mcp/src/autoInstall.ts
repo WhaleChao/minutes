@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { gunzip } from "zlib";
 import { promisify } from "util";
-import { basename, join } from "path";
+import { basename, dirname, join } from "path";
 import {
   chmod,
   copyFile,
@@ -23,6 +23,8 @@ type ExecFileAsync = (
 const gunzipAsync = promisify(gunzip);
 
 export const MACOS_SHERPA_ARCHIVE = "minutes-macos-arm64-sherpa.tar.gz";
+/** Shared libraries the plugin loads from its own directory (@loader_path). */
+const MACOS_SHERPA_LIBRARIES = ["libsherpa-onnx-c-api.dylib", "libonnxruntime.dylib"];
 export const MACOS_BARE_BINARY = "minutes-macos-arm64";
 
 export class ReleaseAssetUnavailableError extends Error {
@@ -101,9 +103,10 @@ function tarSize(header: Buffer): number {
 }
 
 /**
- * Extract the two files from the macOS sherpa release archive.
+ * Extract the fixed files from the macOS sherpa release archive.
  *
- * The release archive has one fixed directory and two fixed regular files.
+ * The release archive has one fixed directory and four fixed regular files: the
+ * CLI, the plugin, and the two shared libraries the plugin loads from beside itself.
  * Keeping this reader deliberately narrow avoids a package dependency and,
  * more importantly, prevents path traversal, links, devices, or unexpected
  * files from ever being materialized. The archive itself is SHA-256 verified
@@ -112,7 +115,7 @@ function tarSize(header: Buffer): number {
 export async function extractMacSherpaArchive(options: {
   archivePath: string;
   destDir: string;
-}): Promise<{ binaryPath: string; pluginPath: string }> {
+}): Promise<{ binaryPath: string; pluginPath: string; libraryPaths: string[] }> {
   const compressed = await readFile(options.archivePath);
   const tar = await gunzipAsync(compressed);
   const expected = new Map<string, Buffer>();
@@ -120,6 +123,7 @@ export async function extractMacSherpaArchive(options: {
   const expectedNames = new Set([
     `${root}/minutes`,
     `${root}/libminutes_sherpa.dylib`,
+    ...MACOS_SHERPA_LIBRARIES.map((name) => `${root}/${name}`),
   ]);
 
   let offset = 0;
@@ -166,7 +170,13 @@ export async function extractMacSherpaArchive(options: {
   await writeFile(pluginPath, expected.get(`${root}/libminutes_sherpa.dylib`)!, {
     mode: 0o755,
   });
-  return { binaryPath, pluginPath };
+  const libraryPaths: string[] = [];
+  for (const name of MACOS_SHERPA_LIBRARIES) {
+    const libraryPath = join(options.destDir, name);
+    await writeFile(libraryPath, expected.get(`${root}/${name}`)!, { mode: 0o755 });
+    libraryPaths.push(libraryPath);
+  }
+  return { binaryPath, pluginPath, libraryPaths };
 }
 
 /**
@@ -178,36 +188,56 @@ export async function extractMacSherpaArchive(options: {
 export async function atomicReplaceMacSherpaFiles(options: {
   stagedBinaryPath: string;
   stagedPluginPath: string;
+  /** Shared libraries the plugin loads from its own directory. */
+  stagedLibraryPaths?: string[];
   targetBinaryPath: string;
   targetPluginPath: string;
   backupDir: string;
 }): Promise<void> {
-  const pluginBackup = join(options.backupDir, "previous-libminutes_sherpa.dylib");
-  let hadPlugin = false;
-  try {
-    await stat(options.targetPluginPath);
-    hadPlugin = true;
-    await copyFile(options.targetPluginPath, pluginBackup);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  // Libraries land beside the plugin under their own names, before the plugin
+  // that needs them, so a plugin is never visible without its libraries.
+  const targetDir = dirname(options.targetPluginPath);
+  const companions = [
+    ...(options.stagedLibraryPaths ?? []).map((staged) => ({
+      staged,
+      target: join(targetDir, basename(staged)),
+    })),
+    { staged: options.stagedPluginPath, target: options.targetPluginPath },
+  ];
+  const replaced: { target: string; backup: string | null }[] = [];
 
-  let pluginReplaced = false;
-  try {
-    await rename(options.stagedPluginPath, options.targetPluginPath);
-    pluginReplaced = true;
-    await rename(options.stagedBinaryPath, options.targetBinaryPath);
-  } catch (error) {
-    if (pluginReplaced) {
-      if (hadPlugin) {
-        await rename(pluginBackup, options.targetPluginPath).catch(() => {});
+  const restore = async () => {
+    for (const { target, backup } of replaced.reverse()) {
+      if (backup) {
+        await rename(backup, target).catch(() => {});
       } else {
-        await rm(options.targetPluginPath, { force: true }).catch(() => {});
+        await rm(target, { force: true }).catch(() => {});
       }
     }
+  };
+
+  try {
+    for (const [index, { staged, target }] of companions.entries()) {
+      const backup = join(options.backupDir, `previous-${index}-${basename(target)}`);
+      let hadFile = false;
+      try {
+        await stat(target);
+        hadFile = true;
+        await copyFile(target, backup);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await rename(staged, target);
+      replaced.push({ target, backup: hadFile ? backup : null });
+    }
+    await rename(options.stagedBinaryPath, options.targetBinaryPath);
+  } catch (error) {
+    await restore();
     throw error;
   } finally {
-    await rm(pluginBackup, { force: true }).catch(() => {});
+    for (const { backup } of replaced) {
+      if (backup) await rm(backup, { force: true }).catch(() => {});
+    }
   }
 }
 
@@ -261,7 +291,7 @@ export async function installMacSherpaArchiveWithFallback(options: {
 
     const extractedDir = join(temporaryDir, "extracted");
     await mkdir(extractedDir, { recursive: true });
-    const { binaryPath, pluginPath } = await extractArchive({
+    const { binaryPath, pluginPath, libraryPaths } = await extractArchive({
       archivePath,
       destDir: extractedDir,
     });
@@ -275,6 +305,7 @@ export async function installMacSherpaArchiveWithFallback(options: {
     await atomicReplaceMacSherpaFiles({
       stagedBinaryPath: binaryPath,
       stagedPluginPath: pluginPath,
+      stagedLibraryPaths: libraryPaths,
       targetBinaryPath: join(options.installDir, "minutes"),
       targetPluginPath: join(options.installDir, "libminutes_sherpa.dylib"),
       backupDir: temporaryDir,

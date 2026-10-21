@@ -259,8 +259,9 @@ minutes setup --diarization
 minutes setup --sherpa        # downloads the int8 ONNX model (~670MB) + sets engine = "sherpa"
 # If you select sherpa without the feature, model, or plugin, transcription auto-falls-back
 # to Whisper (the bundled default), so a recording never breaks. See docs/architecture/sherpa-engine.md.
-# macOS sherpa builds are self-contained (static). On Linux/Windows, run from the
-# repo (cargo run) rather than copying the binary out of target/ — details in the doc.
+# On every platform the plugin loads its sherpa-onnx and ONNX Runtime shared libraries
+# from its own directory, so copy them with it. Run from the repo (cargo run) rather
+# than copying the binary out of target/. Details in the doc.
 
 # Parakeet preferences currently resolve to Whisper on every platform. The
 # pathname-only parakeet.cpp helper cannot safely receive Minutes' sealed
