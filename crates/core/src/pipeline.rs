@@ -325,6 +325,7 @@ const SILENT_REMOTE_WARNING_MESSAGE: &str =
     "Call/remote audio was not captured (system stem silent); transcript reflects only your microphone";
 const SILENT_MICROPHONE_WARNING_MESSAGE: &str =
     "Microphone audio was not captured (mic stem silent or missing); transcript reflects only call/remote audio";
+const MIXED_WAV_RECOVERY_CODE: &str = "native-call-mixed-wav-recovery";
 
 fn warning_is_native_call_system_stem_recovery(warning: &markdown::CaptureWarning) -> bool {
     match &warning.kind {
@@ -359,6 +360,17 @@ fn detect_silent_remote_stem_warning(
     }
 
     let health = recording_health?;
+    if let Some(warning) = health.capture_warnings.iter().find(|warning| {
+        matches!(&warning.kind, diarize::FailureKind::Other { code }
+            if code == MIXED_WAV_RECOVERY_CODE)
+    }) {
+        return Some(ProcessingWarning {
+            step: "capture".to_string(),
+            reason: "source_tracks_unusable".to_string(),
+            timeout_secs: None,
+            message: Some(warning.message.clone()),
+        });
+    }
     if health
         .capture_warnings
         .iter()
@@ -2176,6 +2188,9 @@ impl PrivateAudioTempFile {
 
 enum PreparedTranscriptionInput {
     Original,
+    OriginalWavRecovery {
+        recording_health: markdown::RecordingHealth,
+    },
     Mixed(AuthorizedProcessAudioInput),
     IndependentStems(diarize::StemPaths),
     SingleStem {
@@ -2187,7 +2202,9 @@ enum PreparedTranscriptionInput {
 impl PreparedTranscriptionInput {
     fn processing_path(&self, original: &Path) -> PathBuf {
         match self {
-            Self::Original | Self::IndependentStems(_) => original.to_path_buf(),
+            Self::Original | Self::OriginalWavRecovery { .. } | Self::IndependentStems(_) => {
+                original.to_path_buf()
+            }
             Self::Mixed(handle) => handle.processing_path().to_path_buf(),
             Self::SingleStem { path, .. } => path.clone(),
         }
@@ -2200,7 +2217,10 @@ impl PreparedTranscriptionInput {
     fn internal_authority(&self) -> Option<&AuthorizedProcessAudioInput> {
         match self {
             Self::Mixed(input) => Some(input),
-            Self::Original | Self::SingleStem { .. } | Self::IndependentStems(_) => None,
+            Self::Original
+            | Self::OriginalWavRecovery { .. }
+            | Self::SingleStem { .. }
+            | Self::IndependentStems(_) => None,
         }
     }
 
@@ -2208,7 +2228,8 @@ impl PreparedTranscriptionInput {
         match self {
             Self::SingleStem {
                 recording_health, ..
-            } => Some(recording_health),
+            }
+            | Self::OriginalWavRecovery { recording_health } => Some(recording_health),
             Self::Original | Self::Mixed(_) | Self::IndependentStems(_) => None,
         }
     }
@@ -2216,9 +2237,37 @@ impl PreparedTranscriptionInput {
     fn diarization_audio_path(&self) -> Option<&Path> {
         match self {
             Self::SingleStem { path, .. } => Some(path),
-            Self::Original | Self::Mixed(_) | Self::IndependentStems(_) => None,
+            Self::Original
+            | Self::OriginalWavRecovery { .. }
+            | Self::Mixed(_)
+            | Self::IndependentStems(_) => None,
         }
     }
+}
+
+/// Only recover a normal WAV before ASR, when no separate source is usable.
+/// Never use this for MOV (the dual-track duration bug), authorized anonymous
+/// inputs, or a decoder/model failure after independent recognition starts.
+fn recover_original_mixed_wav(audio_path: &Path) -> Option<PreparedTranscriptionInput> {
+    if crate::diarize::classify_stem_signal(audio_path) != crate::diarize::StemSignal::Signal {
+        return None;
+    }
+    let recording_health = markdown::RecordingHealth {
+        voice_stem_active_ratio: None,
+        system_stem_active_ratio: None,
+        system_dominant_ratio: None,
+        capture_warnings: vec![markdown::CaptureWarning {
+            kind: diarize::FailureKind::Other { code: MIXED_WAV_RECOVERY_CODE.into() },
+            source: diarize::CaptureSource::Both,
+            message: "Separate microphone and call/remote tracks could not be used. The original mixed WAV was preserved and used for transcription; coverage of both sides cannot be verified, and source labels are unavailable.".into(),
+            diagnostic_confidence: diarize::DiagnosticConfidence::Inferred,
+        }],
+        diarization_path: Some(markdown::DiarizationPath::None),
+    };
+    tracing::warn!(
+        "unusable source tracks; recovering original mixed WAV with a recording-health warning"
+    );
+    Some(PreparedTranscriptionInput::OriginalWavRecovery { recording_health })
 }
 
 /// Dispatch a prepared source without erasing its authority. Ambient originals
@@ -2415,14 +2464,25 @@ fn prepare_transcription_input_for_content(
     // zero-byte-stem check via `stem_has_audio` that catches partial-crash
     // wavs (.exists() alone accepts them; `stem_has_audio` requires a valid
     // hound-readable header with non-zero sample/channel counts).
-    let checked = crate::diarize::discover_stem_plan_checked(&canonical).map_err(|reason| {
-        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
-            reason: format!(
-                "native call stem validation failed for {}: {reason}",
-                canonical.display()
-            ),
+    let checked = match crate::diarize::discover_stem_plan_checked(&canonical) {
+        Ok(checked) => checked,
+        Err(reason) => {
+            if independent_wav {
+                if let Some(recovered) = recover_original_mixed_wav(&canonical) {
+                    return Ok(recovered);
+                }
+            }
+            return Err(
+                crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                    reason: format!(
+                        "native call stem validation failed for {}: {reason}",
+                        canonical.display()
+                    ),
+                }
+                .into(),
+            );
         }
-    })?;
+    };
     let invalid_sibling = checked.invalid_sibling;
 
     let stems = match checked.plan {
@@ -2504,6 +2564,11 @@ fn prepare_transcription_input_for_content(
                             });
                         }
                         crate::diarize::StemSignal::Invalid(reason) => {
+                            if independent_wav {
+                                if let Some(recovered) = recover_original_mixed_wav(&canonical) {
+                                    return Ok(recovered);
+                                }
+                            }
                             return Err(
                                 crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
                                     reason: format!(
@@ -2517,6 +2582,11 @@ fn prepare_transcription_input_for_content(
                         crate::diarize::StemSignal::Silence => {}
                     }
                     if voice.exists() || system.exists() {
+                        if independent_wav {
+                            if let Some(recovered) = recover_original_mixed_wav(&canonical) {
+                                return Ok(recovered);
+                            }
+                        }
                         return Err(crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
                             reason: format!(
                                 "native call capture at {} has no usable PCM stem: voice={}, system={}. Both stems are missing, empty, invalid, or digitally silent.",
@@ -12903,6 +12973,174 @@ mod prepare_transcription_input_tests {
             prepare_transcription_input_for_content(&single, None, ContentType::Meeting).unwrap(),
             PreparedTranscriptionInput::Original
         ));
+    }
+
+    #[test]
+    fn meeting_wav_recovers_original_when_no_sibling_has_usable_audio() {
+        for (voice_state, system_state) in [
+            ("invalid", "invalid"),
+            ("silent", "silent"),
+            ("empty", "empty"),
+            ("invalid", "silent"),
+            ("silent", "invalid"),
+            ("silent", "missing"),
+            ("missing", "silent"),
+            ("invalid", "missing"),
+            ("missing", "invalid"),
+            ("empty", "missing"),
+            ("missing", "empty"),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wav = dir.path().join("recover.wav");
+            write_audible_wav(&wav);
+            for (source, state) in [("voice", voice_state), ("system", system_state)] {
+                let path = dir.path().join(format!("recover.{source}.wav"));
+                match state {
+                    "invalid" => fs::write(path, b"corrupt header").unwrap(),
+                    "silent" => write_digital_silence_wav(&path),
+                    "empty" => fs::write(path, []).unwrap(),
+                    "missing" => {}
+                    _ => unreachable!(),
+                }
+            }
+            let original = fs::read(&wav).unwrap();
+            let voice_before = fs::read(dir.path().join("recover.voice.wav")).ok();
+            let system_before = fs::read(dir.path().join("recover.system.wav")).ok();
+            let input = prepare_transcription_input_for_content(&wav, None, ContentType::Meeting)
+                .unwrap_or_else(|error| {
+                    panic!("{voice_state}/{system_state} siblings must not block the good WAV: {error}")
+                });
+            assert_eq!(input.processing_path(&wav), wav);
+            let health = input
+                .recording_health()
+                .expect("recovery must be disclosed");
+            let warning = &health.capture_warnings[0];
+            assert_eq!(warning.source, crate::diarize::CaptureSource::Both);
+            assert!(warning.message.contains("mixed WAV"));
+            assert!(warning.message.contains("cannot be verified"));
+            assert_eq!(original, fs::read(&wav).unwrap());
+            for (source, before) in [("voice", voice_before), ("system", system_before)] {
+                let path = dir.path().join(format!("recover.{source}.wav"));
+                assert_eq!(
+                    before,
+                    fs::read(path).ok(),
+                    "unusable siblings must be preserved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn meeting_wav_recovery_does_not_hide_unusable_original_or_mov() {
+        for ext in ["wav", "mov"] {
+            for original_state in ["invalid", "silent"] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let original = dir.path().join(format!("no-recovery.{ext}"));
+                if original_state == "silent" {
+                    write_digital_silence_wav(&original);
+                } else {
+                    fs::write(&original, b"invalid original container").unwrap();
+                }
+                for source in ["voice", "system"] {
+                    fs::write(
+                        dir.path().join(format!("no-recovery.{source}.wav")),
+                        b"invalid",
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    prepare_transcription_input_for_content(&original, None, ContentType::Meeting)
+                        .is_err(),
+                    "{ext} must retain its explicit failure"
+                );
+                assert!(
+                    matches!(
+                        prepare_transcription_input_for_content(
+                            &original,
+                            Some(ext),
+                            ContentType::Meeting
+                        )
+                        .unwrap(),
+                        PreparedTranscriptionInput::Original
+                    ),
+                    "authorized input must not inspect siblings"
+                );
+            }
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("audible.mov");
+        write_audible_wav(&mov);
+        for source in ["voice", "system"] {
+            fs::write(dir.path().join(format!("audible.{source}.wav")), b"invalid").unwrap();
+        }
+        assert!(
+            prepare_transcription_input_for_content(&mov, None, ContentType::Meeting).is_err(),
+            "MOV must never enter WAV recovery, even with decodable signal"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "whisper"))]
+    fn meeting_wav_recovery_warning_survives_foreground_and_background_processing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("recover-pipelines.wav");
+        write_audible_wav(&wav);
+        for source in ["voice", "system"] {
+            fs::write(
+                dir.path().join(format!("recover-pipelines.{source}.wav")),
+                b"invalid",
+            )
+            .unwrap();
+        }
+        let mut config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        config.summarization.engine = "none".into();
+        config.diarization.engine = "none".into();
+        let foreground = process(
+            &wav,
+            ContentType::Meeting,
+            Some("Recovered meeting"),
+            &config,
+        )
+        .unwrap();
+        let content = fs::read_to_string(foreground.path).unwrap();
+        assert!(content.contains("mixed WAV"));
+        assert!(content.contains("cannot be verified"));
+        assert!(content.contains("status: degraded"), "{content}");
+        assert!(
+            content.contains("reason: source_tracks_unusable"),
+            "{content}"
+        );
+        assert!(!content.contains("[MICROPHONE]"));
+        assert!(!content.contains("[SYSTEM]"));
+        let background = transcribe_to_artifact(
+            &wav,
+            ContentType::Meeting,
+            Some("Background recovery"),
+            &config,
+            &BackgroundPipelineContext::default(),
+            None,
+        )
+        .unwrap();
+        assert!(background.source_transcript.is_none());
+        let enriched = enrich_transcript_artifact(
+            &wav,
+            &background,
+            &config,
+            &BackgroundPipelineContext::default(),
+            |_| {},
+        )
+        .unwrap();
+        let content = fs::read_to_string(enriched.path).unwrap();
+        assert!(content.contains("mixed WAV"));
+        assert!(content.contains("cannot be verified"));
+        assert!(content.contains("status: degraded"), "{content}");
+        assert!(
+            content.contains("reason: source_tracks_unusable"),
+            "{content}"
+        );
     }
 
     #[test]

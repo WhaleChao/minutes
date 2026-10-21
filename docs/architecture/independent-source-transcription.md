@@ -42,6 +42,13 @@ does not perform acoustic echo cancellation or separate voices already mixed
 within one source, and cannot recover audio that was never recorded.
 
 Single surviving stems retain the existing explicit recording-health warning.
+If neither source track is usable but the original meeting WAV has a valid
+decodable signal, preparation can recover that WAV with an explicit warning:
+coverage of both sides cannot be verified and source labels are unavailable.
+This recovery happens before recognition, never after a source decoder/model
+failure. The original WAV and damaged source files remain preserved. MOV files
+retain their strict source-recovery gate to avoid the dual-track duration bug;
+unsafe/failed source-header repair also remains an error.
 Ordinary single-source inputs and non-meeting processing retain their previous
 routes. Descriptor/proof-authorized processing never discovers ambient sibling
 files: those entry points continue to process only their exact authorized
