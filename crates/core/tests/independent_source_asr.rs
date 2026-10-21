@@ -43,6 +43,13 @@ fn quieter_overlapping_source_survives_real_whisper_with_vad_disabled() {
         .expect("explicit synthetic evidence directory required");
     std::fs::create_dir_all(&evidence).unwrap();
     let temp = tempfile::tempdir().unwrap();
+    // This executable has one ignored qualification test. Isolate all notes,
+    // vocabulary, logs and calendar configuration even when a contributor
+    // invokes it without setting a separate Minutes profile themselves.
+    let profile = temp.path().join("profile");
+    let config_path = profile.join("config.toml");
+    std::env::set_var("MINUTES_DATA_DIR", &profile);
+    std::env::set_var("MINUTES_CONFIG_PATH", &config_path);
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let voice = temp.path().join("overlap.voice.wav");
     let system = temp.path().join("overlap.system.wav");
@@ -77,6 +84,8 @@ fn quieter_overlapping_source_survives_real_whisper_with_vad_disabled() {
     config.transcription.vad_model.clear();
     config.diarization.engine = "none".into();
     config.summarization.engine = "none".into();
+    config.calendar.enabled = false;
+    config.save_to(&config_path).unwrap();
 
     // The baseline has identical mixed bytes, without sibling sources.
     let baseline = temp.path().join("baseline.wav");
