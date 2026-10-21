@@ -13,6 +13,7 @@ pub(crate) mod bounded_child;
 pub(crate) mod macos_graph_xpc;
 pub mod orukeet;
 mod source_transcript;
+mod summary_semantics;
 
 /// Activate a previously validated MCP process-audio outer process group.
 /// The CLI must also hold the helper's live supervisor capability; the core
