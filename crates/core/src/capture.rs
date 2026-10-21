@@ -1196,6 +1196,26 @@ fn wav_spec_16k_mono() -> hound::WavSpec {
     }
 }
 
+/// Size of the canonical 16-bit PCM WAV header that `hound` writes on creation.
+const WAV_HEADER_LEN: u64 = 44;
+
+/// True for a leftover from a capture that never recorded a sample. It holds
+/// no audio, so reusing it cannot destroy a recording.
+fn is_header_only_wav(file: &std::fs::File) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let is_header_sized = file
+        .metadata()
+        .map(|m| m.len() == WAV_HEADER_LEN)
+        .unwrap_or(false);
+    if !is_header_sized || (&*file).seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let is_empty = hound::WavReader::new(std::io::BufReader::new(file))
+        .map(|reader| reader.len() == 0)
+        .unwrap_or(false);
+    is_empty && (&*file).seek(SeekFrom::Start(0)).is_ok()
+}
+
 fn create_wav_writer(
     output_path: &Path,
 ) -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, CaptureError> {
@@ -1221,7 +1241,7 @@ fn create_wav_writer(
             // Never truncate an earlier capture or follow a planted link.
             let existing = directory.bind_exact_file(name)?;
             let file = existing.try_clone_exact_file()?;
-            if file.metadata()?.len() != 0 {
+            if file.metadata()?.len() != 0 && !is_header_only_wav(&file) {
                 return Err(CaptureError::Io(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "refusing to overwrite an existing recording",
@@ -1244,7 +1264,7 @@ fn create_wav_writer(
         Err(error) => return Err(error.into()),
     };
     fs2::FileExt::try_lock_exclusive(&file)?;
-    if file.metadata()?.len() != 0 {
+    if file.metadata()?.len() != 0 && !is_header_only_wav(&file) {
         return Err(CaptureError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "recording reservation is no longer empty",
@@ -1265,8 +1285,18 @@ fn create_wav_writer(
             "recording destination changed during creation",
         )));
     }
-    // Permissions and identity are established before hound writes even its
-    // header. Retain the exact file; no pathname reopen occurs during capture.
+    // Reusing an empty header is a write too. Establish permissions and exact
+    // identity before truncating, including the Windows owner-only DACL check.
+    if is_header_only_wav(&file) {
+        file.set_len(0)?;
+    }
+    if file.metadata()?.len() != 0 {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "recording reservation is no longer empty",
+        )));
+    }
+    // Retain the exact file; no pathname reopen occurs during capture.
     hound::WavWriter::new(std::io::BufWriter::new(file), wav_spec_16k_mono())
         .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV create: {}", e))))
 }
@@ -3522,6 +3552,64 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(create_wav_writer(&path).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wav_creation_reuses_a_private_header_only_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leftover.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), WAV_HEADER_LEN);
+
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(7_i16).unwrap();
+        writer.finalize().unwrap();
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.len(), 1);
+        assert_eq!(reader.samples::<i16>().next().unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn wav_creation_still_refuses_a_leftover_with_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recorded.wav");
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(7_i16).unwrap();
+        writer.finalize().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn wav_creation_preserves_a_locked_header_only_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.wav");
+        create_wav_writer(&path).unwrap().finalize().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_creation_preserves_a_public_header_only_leftover() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public-header.wav");
+        create_wav_writer(&path).unwrap().finalize().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[cfg(unix)]
