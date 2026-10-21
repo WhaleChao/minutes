@@ -424,7 +424,7 @@ export default function Home() {
           <p className="mt-4 text-[14px] leading-6 text-[var(--text-secondary)]">
             Minutes won&apos;t open?{" "}
             <a
-              href="/download/recover.html"
+              href="/download/recover"
               className="text-[var(--text)] underline underline-offset-4 hover:text-[var(--accent)]"
             >
               Reinstall the app and keep your meetings.
