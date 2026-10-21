@@ -159,6 +159,65 @@ pub struct TranscribeResult {
     pub detected_language: Option<String>,
 }
 
+#[cfg(any(feature = "whisper", test))]
+fn prepare_whisper_samples(
+    samples: Vec<f32>,
+    integrated_vad: bool,
+    hints: &DecodeHints,
+) -> Vec<f32> {
+    if integrated_vad || hints.preserve_source_timeline {
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    }
+}
+
+#[cfg(any(feature = "whisper", test))]
+fn source_clock_prefix_samples(samples: &[f32], hints: &DecodeHints) -> usize {
+    if hints.preserve_source_timeline {
+        // Trim only exact digital silence, never a quiet phoneme or noise.
+        // Whisper can place the opening segment at zero even with several
+        // seconds of zero padding. Restore this known offset after recognition.
+        samples
+            .iter()
+            .position(|sample| *sample != 0.0)
+            .unwrap_or(samples.len())
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "whisper", test))]
+fn restore_source_clock(result: &mut TranscribeResult, offset: f64) {
+    if offset == 0.0 {
+        return;
+    }
+    for segment in &mut result.segments {
+        segment.start += offset;
+        segment.end += offset;
+    }
+    let lines: Vec<_> = result.text.lines().collect();
+    // Prefer exact timings over adding an offset to an already rounded label.
+    let exact = lines.len() == result.segments.len()
+        && lines.iter().zip(&result.segments).all(|(line, segment)| {
+            line.split_once(']')
+                .is_some_and(|(_, text)| text.trim() == segment.text)
+        });
+    let adjusted = if exact {
+        result
+            .segments
+            .iter()
+            .map(|segment| {
+                let secs = segment.start.floor() as u64;
+                format!("[{}:{:02}] {}", secs / 60, secs % 60, segment.text)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        offset_timestamped_lines(lines.into_iter(), offset, 0)
+    };
+    result.text = format!("{}\n", adjusted.join("\n"));
+}
+
 /// Meeting-local lexical hints that can safely inform batch decoding.
 ///
 /// These are intentionally narrower than the global graph-derived phrase set:
@@ -172,6 +231,9 @@ pub struct DecodeHints {
     // already-authorized original format alongside lexical hints so decoder
     // selection never has to reopen a mutable pathname merely to infer it.
     audio_format_extension: Option<String>,
+    // Independent capture sources must share their original clock. Removing
+    // quiet intervals from just one source would make timestamp merging wrong.
+    preserve_source_timeline: bool,
 }
 
 impl DecodeHints {
@@ -208,6 +270,7 @@ impl DecodeHints {
             priority_phrases,
             contextual_phrases,
             audio_format_extension: None,
+            preserve_source_timeline: false,
         }
     }
 
@@ -224,11 +287,17 @@ impl DecodeHints {
 
         let mut merged = Self::from_candidates(&merged_priority, &merged_contextual);
         merged.audio_format_extension = self.audio_format_extension.clone();
+        merged.preserve_source_timeline = self.preserve_source_timeline;
         merged
     }
 
     pub(crate) fn with_audio_format_extension(mut self, extension: &str) -> Self {
         self.audio_format_extension = Some(extension.to_string());
+        self
+    }
+
+    pub(crate) fn with_source_timeline(mut self) -> Self {
+        self.preserve_source_timeline = true;
         self
     }
 
@@ -1186,6 +1255,10 @@ impl BatchTranscriptionSession<'_> {
             }
             let stats = FilterStats {
                 audio_duration_secs,
+                // Sherpa receives the complete decoded source; it does not
+                // run the Whisper silence-strip stage. Zero would falsely
+                // diagnose successful recognition as all audio removed.
+                samples_after_silence_strip: samples.len(),
                 raw_segments,
                 after_no_speech_filter: raw_segments,
                 after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
@@ -1365,12 +1438,9 @@ fn transcribe_whisper_samples(
     // energy-based silence stripping to prevent hallucination loops (issue #21).
     let use_integrated_vad = resolve_vad_model_path(config).is_some();
 
-    let samples = if use_integrated_vad {
-        tracing::debug!("Silero VAD available — skipping energy-based silence stripping");
-        samples
-    } else {
-        strip_silence(&samples, 16000)
-    };
+    let prefix_samples = source_clock_prefix_samples(&samples, hints);
+    let samples = samples[prefix_samples..].to_vec();
+    let samples = prepare_whisper_samples(samples, use_integrated_vad, hints);
     stats.samples_after_silence_strip = samples.len();
 
     if samples.is_empty() {
@@ -1381,7 +1451,14 @@ fn transcribe_whisper_samples(
         return Err(TranscribeError::EmptyAudio);
     }
 
-    let result = transcribe_with_whisper(ctx, &samples, audio_path, config, stats, false, hints)?;
+    // Retain Whisper's minimum decode window for a brief response following
+    // digital silence. Padding changes neither content nor the source offset.
+    let mut samples = samples;
+    if hints.preserve_source_timeline && samples.len() < 16_000 {
+        samples.resize(16_000, 0.0);
+    }
+    let mut result =
+        transcribe_with_whisper(ctx, &samples, audio_path, config, stats, false, hints)?;
 
     // Auto-retry without VAD if the first attempt blanked on long audio.
     // Silero VAD can be too aggressive on certain acoustic profiles or non-English
@@ -1400,10 +1477,10 @@ fn transcribe_whisper_samples(
             audio_duration_secs: result.stats.audio_duration_secs,
             ..Default::default()
         };
-        let stripped = strip_silence(&samples, 16000);
+        let stripped = prepare_whisper_samples(samples.clone(), false, hints);
         retry_stats.samples_after_silence_strip = stripped.len();
         if !stripped.is_empty() {
-            return transcribe_with_whisper(
+            result = transcribe_with_whisper(
                 ctx,
                 &stripped,
                 audio_path,
@@ -1411,10 +1488,11 @@ fn transcribe_whisper_samples(
                 retry_stats,
                 true,
                 hints,
-            );
+            )?;
         }
     }
 
+    restore_source_clock(&mut result, prefix_samples as f64 / 16_000.0);
     Ok(result)
 }
 
@@ -4986,6 +5064,60 @@ mod tests {
             load_audio_samples_with_format(&descriptor_path, Some("wav"), &Config::default())
                 .unwrap();
         assert_eq!(samples.len(), 160);
+    }
+
+    #[test]
+    fn source_clock_removes_only_digital_zero_prefix_and_restores_precise_offsets() {
+        let hints = DecodeHints::default().with_source_timeline();
+        let samples = [0.0, -0.0, 0.000_000_001, 0.8, 0.0];
+        assert_eq!(
+            source_clock_prefix_samples(&samples, &hints),
+            2,
+            "even a very quiet nonzero sample must survive"
+        );
+        assert_eq!(
+            source_clock_prefix_samples(&samples, &DecodeHints::default()),
+            0
+        );
+        let mut result = TranscribeResult {
+            text: "[0:00] yes\n".into(),
+            stats: FilterStats::default(),
+            segments: vec![TranscriptSegment {
+                start: 0.75,
+                end: 1.5,
+                text: "yes".into(),
+            }],
+            detected_language: None,
+        };
+        restore_source_clock(&mut result, 4.5);
+        assert_eq!(result.text, "[0:05] yes\n");
+        assert_eq!(result.segments[0].start, 5.25);
+        assert_eq!(result.segments[0].end, 6.0);
+    }
+
+    #[test]
+    fn independent_sources_preserve_silence_and_the_original_clock_even_on_vad_retry() {
+        let mut samples = vec![0.0; 16000 * 4];
+        samples.extend(
+            (0..16000)
+                .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin()),
+        );
+        samples.extend(vec![0.0; 16000 * 4]);
+        let hints = DecodeHints::default()
+            .with_source_timeline()
+            .with_additional_candidates(&["Minutes".into()], &[]);
+        assert_eq!(
+            prepare_whisper_samples(samples.clone(), false, &hints),
+            samples
+        );
+        assert_eq!(
+            prepare_whisper_samples(samples.clone(), true, &hints),
+            samples
+        );
+        assert!(
+            prepare_whisper_samples(samples.clone(), false, &DecodeHints::default()).len()
+                < samples.len()
+        );
     }
 
     #[test]
