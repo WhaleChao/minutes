@@ -7961,6 +7961,7 @@ pub(crate) fn extract_action_items(summary: &summarize::Summary) -> Vec<markdown
     summary
         .action_items
         .iter()
+        .filter(|text| !crate::summary_semantics::is_absence_item("action_items", text))
         .map(|item| {
             let (assignee, task) = if let Some(rest) = item.strip_prefix('@') {
                 // "@user: Send pricing doc by Friday"
@@ -7994,6 +7995,7 @@ pub(crate) fn extract_decisions(summary: &summarize::Summary) -> Vec<markdown::D
     summary
         .decisions
         .iter()
+        .filter(|text| !crate::summary_semantics::is_absence_item("decisions", text))
         .map(|text| {
             // Try to infer topic from the first few words
             let topic = infer_topic(text);
@@ -8044,6 +8046,9 @@ pub(crate) fn extract_intents(summary: &summarize::Summary) -> Vec<markdown::Int
     }
 
     for question in &summary.open_questions {
+        if crate::summary_semantics::is_absence_item("open_questions", question) {
+            continue;
+        }
         let (who, what) = parse_actor_prefix(question);
         intents.push(markdown::Intent {
             kind: markdown::IntentKind::OpenQuestion,
@@ -8055,6 +8060,9 @@ pub(crate) fn extract_intents(summary: &summarize::Summary) -> Vec<markdown::Int
     }
 
     for commitment in &summary.commitments {
+        if crate::summary_semantics::is_absence_item("commitments", commitment) {
+            continue;
+        }
         let due = extract_due_date(commitment);
         let (who, what) = parse_actor_prefix(commitment);
         intents.push(markdown::Intent {
@@ -8172,6 +8180,9 @@ pub(crate) fn build_entity_links(
     }
 
     for decision in decisions {
+        if crate::summary_semantics::is_absence_item("decisions", &decision.text) {
+            continue;
+        }
         if let Some(topic) = &decision.topic {
             add_project_entity(&mut projects, topic, Some(&decision.text));
         } else {
@@ -10048,6 +10059,40 @@ mod tests {
             "trusted list of 1 must not use merged fallback"
         );
         assert_eq!(actions[0].assignee, "Matt");
+    }
+
+    #[test]
+    fn absence_placeholders_cannot_create_structured_intents_or_project_entities() {
+        let mut summary = sample_summary();
+        summary.decisions = vec![
+            "No decisions were made.".into(),
+            "Aucune décision spécifique n'a été prise.".into(),
+            "No changes to pricing.".into(),
+        ];
+        summary.action_items = vec!["None.".into()];
+        summary.open_questions = vec!["No open questions.".into()];
+        summary.commitments = vec!["No commitments were made.".into()];
+        let decisions = extract_decisions(&summary);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].text, "No changes to pricing.");
+        let intents = extract_intents(&summary);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].what, "No changes to pricing.");
+        let mut legacy = decisions;
+        legacy.push(markdown::Decision {
+            id: None,
+            effective_date: None,
+            text: summary.decisions[1].clone(),
+            topic: Some("Aucune décision spécifique n'a".into()),
+            authority: None,
+            supersedes: None,
+        });
+        let entities = build_entity_links("Recording", None, &[], &[], &legacy, &[], &[], None);
+        assert!(entities
+            .projects
+            .iter()
+            .all(|project| !project.label.contains("Aucune")
+                && !project.label.contains("No Decisions")));
     }
 
     #[test]
