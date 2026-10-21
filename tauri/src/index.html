@@ -9802,12 +9802,23 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       changed: renderMeetingAudioChoice,
     });
 
+    const renderedMeetingAudioChoices = new WeakMap();
     function renderMeetingAudioChoice() {
       const state = recordingAudioChoice.snapshot();
       for (const picker of [meetingAudioSource, document.getElementById('onboarding-meeting-audio-source')]) {
         if (!picker) continue;
-        picker.value = state.choice || '';
-        picker.disabled = state.pending || footer.classList.contains('capture-mode');
+        // Idle status polling also renders this surface. Reassigning a native
+        // select while its popup is tracking can discard the user's selection
+        // before WebKit delivers change. Only apply a new acknowledged choice
+        // or roll back a rejected save so the same option can be retried.
+        const choice = state.choice || '';
+        const rendered = renderedMeetingAudioChoices.get(picker);
+        if (!rendered || rendered.choice !== choice || (state.error && rendered.error !== state.error)) {
+          if (picker.value !== choice) picker.value = choice;
+        }
+        renderedMeetingAudioChoices.set(picker, { choice, error: state.error });
+        const disabled = state.pending || footer.classList.contains('capture-mode');
+        if (picker.disabled !== disabled) picker.disabled = disabled;
       }
       const helpText = state.error || (state.pending ? 'Saving audio choice…'
         : state.choice === 'microphone' ? 'Your microphone only. People on a computer call are not included.'
