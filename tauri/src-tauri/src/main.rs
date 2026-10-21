@@ -149,11 +149,25 @@ fn exit_process_without_destructors(code: i32) -> ! {
 /// `AppHandle::restart` ends in `std::process::exit`, which aborts via
 /// `__cxa_finalize_ranges` on macOS and shows a crash dialog after every update.
 pub(crate) fn restart_without_destructors(app: &tauri::AppHandle) -> ! {
+    #[cfg(not(target_os = "macos"))]
+    app.restart();
+
+    #[cfg(target_os = "macos")]
+    restart_macos_without_destructors(app)
+}
+
+#[cfg(target_os = "macos")]
+fn restart_macos_without_destructors(app: &tauri::AppHandle) -> ! {
+    // Resolve Tauri state before its cleanup: no Tauri APIs may be used after
+    // cleanup_before_exit clears tray, window and webview resources.
+    let env = app.env();
+    let binary = tauri::process::current_binary(&env);
     cleanup_before_process_exit(app);
-    match tauri::process::current_binary(&app.env()) {
+    app.cleanup_before_exit();
+    match binary {
         Ok(path) => {
             if let Err(error) = std::process::Command::new(path)
-                .args(app.env().args_os.iter().skip(1))
+                .args(env.args_os.iter().skip(1))
                 .spawn()
             {
                 eprintln!("[restart] failed to relaunch app: {error}");
