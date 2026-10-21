@@ -421,6 +421,15 @@ export default function Home() {
             Windows
           </a>
           </div>
+          <p className="mt-4 text-[14px] leading-6 text-[var(--text-secondary)]">
+            Minutes won&apos;t open?{" "}
+            <a
+              href="/download/recover"
+              className="text-[var(--text)] underline underline-offset-4 hover:text-[var(--accent)]"
+            >
+              Reinstall the app and keep your meetings.
+            </a>
+          </p>
         </div>
 
         <p className="mt-4 text-[13px] text-[var(--text-secondary)]">
