@@ -379,7 +379,7 @@ export default function Home() {
 
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
-          makes meeting audio an explicit choice and preserves your selected speech models.{" "}
+          fixes macOS restart crashes and improves overlapping-speech transcripts and automatic summary language.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
