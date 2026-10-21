@@ -164,6 +164,10 @@ pub fn summarize_with_template_report(
     template: Option<&Template>,
     log_file: Option<&str>,
 ) -> SummaryReport {
+    // Resolve once for the full meeting, then pass the same language to every
+    // chunk, synthesis pass and provider. Notes are not language evidence.
+    let resolved_config = resolve_meeting_summary_config(transcript, config, template);
+    let config = &resolved_config;
     let mut coverage = None;
     let engine = &config.summarization.engine;
     let model = summarization_model_hint(config, !screen_files.is_empty());
@@ -572,9 +576,29 @@ pub fn get_effective_summary_language(config: &Config) -> &str {
     }
 }
 
+fn resolve_meeting_summary_config(
+    transcript: &str,
+    config: &Config,
+    template: Option<&Template>,
+) -> Config {
+    let mut resolved = config.clone();
+    if let Some(language) = template
+        .and_then(|template| template.frontmatter.language.as_deref())
+        .filter(|language| !language.eq_ignore_ascii_case("auto"))
+    {
+        resolved.summarization.language = language.to_string();
+    } else if get_effective_summary_language(config) == "auto" {
+        if let Some(language) = crate::summary_semantics::meeting_language(transcript) {
+            resolved.summarization.language = language;
+        }
+    }
+    resolved
+}
+
 fn build_system_prompt(language: &str, template: Option<&Template>) -> String {
     let effective_language = template
         .and_then(|t| t.frontmatter.language.as_deref())
+        .filter(|language| !language.eq_ignore_ascii_case("auto"))
         .unwrap_or(language);
     let base = build_base_system_prompt(effective_language);
     compose_additional_instructions(&base, template)
@@ -601,6 +625,11 @@ Extract:
 4. Open questions (unresolved questions or unknowns that still need follow-up)
 5. Commitments (explicit promises, commitments, or owner statements made by someone)
 6. Participants (names of people present or mentioned in the conversation)
+
+For an empty section, leave its header with no bullet items. Never invent a
+"none", "no decisions were made" or translated absence bullet. Those are
+section states, not decisions or tasks. MICROPHONE and SYSTEM are audio-source
+labels, not participant names. Preserve substantive negative decisions.
 
 Respond in this exact format:
 
@@ -666,9 +695,12 @@ fn parse_summary_response(response: &str) -> Summary {
     let mut commitments = Vec::new();
     let mut participants_raw = Vec::new();
     let mut current_section = "";
+    let mut fallback_lines = Vec::new();
+    let mut removed_absence = false;
 
     for line in response.lines() {
         let trimmed = line.trim();
+        fallback_lines.push(line);
 
         if trimmed.starts_with("KEY POINTS:") {
             current_section = "key_points";
@@ -691,6 +723,11 @@ fn parse_summary_response(response: &str) -> Summary {
         }
 
         if let Some(item) = trimmed.strip_prefix("- ") {
+            if crate::summary_semantics::is_absence_item(current_section, item) {
+                fallback_lines.pop();
+                removed_absence = true;
+                continue;
+            }
             match current_section {
                 "key_points" => key_points.push(item.to_string()),
                 "decisions" => decisions.push(item.to_string()),
@@ -718,7 +755,11 @@ fn parse_summary_response(response: &str) -> Summary {
 
     Summary {
         text: if key_points.is_empty() {
-            response.to_string()
+            if removed_absence {
+                fallback_lines.join("\n")
+            } else {
+                response.to_string()
+            }
         } else {
             String::new()
         },
@@ -3873,6 +3914,153 @@ mod tests {
     }
 
     #[test]
+    fn chunk_absence_placeholders_never_become_decisions_or_fallback_summary_text() {
+        let summary = parse_summary_response("DECISIONS:\n- No decisions were made.\nDECISIONS:\n- Aucune décision spécifique n'a été prise.\nDECISIONS:\n- Keep annual billing.\n- No changes to pricing.\nACTION ITEMS:\n- None.\n- @Mat: Prepare the follow up.\n");
+        assert_eq!(
+            summary.decisions,
+            ["Keep annual billing.", "No changes to pricing."]
+        );
+        assert_eq!(summary.action_items, ["@Mat: Prepare the follow up."]);
+        assert!(!summary.text.contains("No decisions were made"));
+        assert!(!summary.text.contains("Aucune décision"));
+        assert!(!summary.text.contains("None."));
+        assert!(summary.text.contains("No changes to pricing."));
+    }
+
+    #[test]
+    fn meeting_language_resolution_respects_explicit_and_template_settings() {
+        let english = "The team reviewed the annual billing proposal and discussed the customer experience. We decided to keep the existing pricing and prepare the follow up next Tuesday. The engineering team will investigate recording quality before the next release. ".repeat(4);
+        let mut config = Config::default();
+        assert_eq!(
+            resolve_meeting_summary_config(&english, &config, None)
+                .summarization
+                .language,
+            "English"
+        );
+        config.summarization.language = "es".into();
+        assert_eq!(
+            resolve_meeting_summary_config(&english, &config, None)
+                .summarization
+                .language,
+            "es"
+        );
+        config.summarization.language = "auto".into();
+        config.transcription.language = Some("de".into());
+        assert_eq!(
+            get_effective_summary_language(&resolve_meeting_summary_config(
+                &english, &config, None
+            )),
+            "de"
+        );
+        let mut template = Template::from_str(
+            "---\nname: Test\nslug: test\nversion: 1.0.0\nlanguage: fr\n---\n",
+            crate::template::TemplateSource::Bundled,
+            None,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_meeting_summary_config(&english, &config, Some(&template))
+                .summarization
+                .language,
+            "fr"
+        );
+        template.frontmatter.language = Some("auto".into());
+        config.transcription.language = None;
+        let resolved = resolve_meeting_summary_config(&english, &config, Some(&template));
+        assert!(
+            build_system_prompt(get_effective_summary_language(&resolved), Some(&template))
+                .contains("Always respond in English")
+        );
+        assert_eq!(
+            config.summarization.language, "auto",
+            "resolution must not persist a new setting"
+        );
+    }
+
+    #[test]
+    fn every_ollama_chunk_receives_the_meeting_language_even_when_notes_are_french() {
+        let english = "The team reviewed annual billing and discussed the customer experience. We decided to keep the existing pricing and prepare the follow up document next Tuesday. Engineering will investigate recording quality before the next release.\n".repeat(8);
+        let french_notes = "Veuillez préparer le document pour les participants. Les prochaines étapes doivent être clairement identifiées pour cette réunion.";
+        let mut config = Config::default();
+        config.summarization.engine = "ollama".into();
+        config.summarization.chunk_max_tokens = 120;
+        let count = build_prompt(
+            &compose_notes_and_transcript(Some(french_notes), &english),
+            120,
+        )
+        .len();
+        assert!(count > 2);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        config.summarization.ollama_url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + std::time::Duration::from_secs(15);
+            let mut prompts = Vec::new();
+            while prompts.len() < count {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "missing summary requests");
+                        thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // polls with a deadline; each complete HTTP request is read
+                // synchronously under its own bounded read timeout.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let body = loop {
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break bytes[end + 4..end + 4 + length].to_vec();
+                    }
+                };
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                prompts.push(body["prompt"].as_str().unwrap().to_string());
+                let item = if prompts.len() == count {
+                    "Keep annual billing."
+                } else if prompts.len() % 2 == 0 {
+                    "Aucune décision spécifique n'a été prise."
+                } else {
+                    "No decisions were made."
+                };
+                let response = serde_json::json!({"response": format!("KEY POINTS:\n- Reviewed billing.\nDECISIONS:\n- {item}\n")}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            }
+            prompts
+        });
+        let report =
+            summarize_with_template_report(&english, Some(french_notes), &[], &config, None, None);
+        let prompts = server.join().unwrap();
+        assert!(prompts
+            .iter()
+            .all(|prompt| prompt.contains("Always respond in English")));
+        assert_eq!(report.summary.unwrap().decisions, ["Keep annual billing."]);
+    }
+
+    #[test]
     fn parse_summary_response_extracts_sections() {
         let response = "\
 KEY POINTS:
@@ -3903,10 +4091,10 @@ COMMITMENTS:
 
     #[test]
     fn parse_summary_response_handles_freeform_text() {
-        let response = "This meeting covered pricing and roadmap. No specific decisions.";
+        let response = "This meeting covered pricing and roadmap. No specific decisions.\n";
         let summary = parse_summary_response(response);
         assert!(summary.key_points.is_empty());
-        assert!(!summary.text.is_empty());
+        assert_eq!(summary.text, response);
     }
 
     #[test]
