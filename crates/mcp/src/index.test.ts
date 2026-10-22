@@ -490,8 +490,8 @@ describe("Whisper model auto-setup", () => {
 
 describe("release asset selection", () => {
   it.each([
-    ["darwin", "arm64", "minutes-macos-arm64-sherpa.tar.gz"],
-    ["darwin", "x64", "minutes-macos-arm64-sherpa.tar.gz"],
+    ["darwin", "arm64", "minutes-macos-arm64-sherpa-shared.tar.gz"],
+    ["darwin", "x64", "minutes-macos-arm64-sherpa-shared.tar.gz"],
     ["linux", "x64", "minutes-linux-x64"],
     ["win32", "x64", "minutes-windows-x64.zip"],
     ["linux", "arm64", null],

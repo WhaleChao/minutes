@@ -7,10 +7,10 @@ cd "$ROOT_DIR"
 export CXXFLAGS="${CXXFLAGS:-"-I$(xcrun --show-sdk-path)/usr/include/c++/v1"}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 # engine-sherpa / vad-ort stay OPT-IN for app builds pending the #369 release
-# decision. Packaging is fixed for opt-in local builds: sherpa links statically
-# and the existing ort path does not leave dangling runtime dylib references.
+# decision. Opt-in engine-sherpa builds ship the isolated plugin and its private
+# shared libraries together.
 # Opt in explicitly:
-#   MINUTES_BUILD_FEATURES=parakeet,metal,vad-ort   # engine-sherpa conflicts with diarize/vad-ort on macOS (#683)
+#   MINUTES_BUILD_FEATURES=parakeet,metal,engine-sherpa
 if [ -z "${MINUTES_BUILD_FEATURES+x}" ]; then
     MINUTES_BUILD_FEATURES="parakeet,metal"
 fi
@@ -202,6 +202,14 @@ echo "=== Building ${DEV_PRODUCT_NAME}.app ==="
 # rejects it against the other members. Outputs are unaffected: target/ is
 # workspace-level, so $BUILD_APP below is still correct from the root.
 (cd tauri/src-tauri && run_with_ort_retry cargo tauri build --bundles app --config "$ROOT_DIR/$DEV_CONFIG" --features "$MINUTES_BUILD_FEATURES" --no-sign)
+# Match the released shared-engine layout in opt-in native dogfood builds.
+if [[ ",$MINUTES_BUILD_FEATURES," == *,engine-sherpa,* ]]; then
+  (cd crates/sherpa-plugin && cargo build --release --locked)
+  for lib in libminutes_sherpa.dylib libsherpa-onnx-c-api.dylib libonnxruntime.dylib; do
+    cp -f "crates/sherpa-plugin/target/release/$lib" "$BUILD_APP/Contents/MacOS/$lib"
+    chmod 755 "$BUILD_APP/Contents/MacOS/$lib"
+  done
+fi
 # Inside-out signing (#311): sign every nested executable FIRST (the CLI
 # sidecar with its own entitlements), then the outer bundle WITHOUT --deep.
 # --deep re-signs nested code with the outer entitlements (clobbering the

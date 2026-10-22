@@ -1134,10 +1134,50 @@ jobs:
   # was CANCELLED. A `skipped` result (the path filter doing its job) passes the
   # gate. So: required Rust jobs that ran must be green; required jobs the filter
   # correctly skipped do not block. Point branch protection at "CI Gate" alone.
+  sherpa_macos_packaging:
+    name: Sherpa relocation (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/sherpa-plugin -> target
+      - name: Build both client generations and verify relocated signed plugins
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          set -euo pipefail
+          CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
+          export CXXFLAGS
+          (cd crates/sherpa-plugin && cargo build --release --locked)
+          (cd crates/sherpa-plugin && cargo build --release --locked --features legacy-static --target-dir target/legacy-static)
+          relocated="$RUNNER_TEMP/sherpa-relocated"
+          mkdir -p "$relocated/shared" "$relocated/legacy"
+          for lib in libminutes_sherpa.dylib libsherpa-onnx-c-api.dylib libonnxruntime.dylib; do
+            cp -f "crates/sherpa-plugin/target/release/$lib" "$relocated/shared/$lib"
+            codesign --force --options runtime --sign - "$relocated/shared/$lib"
+            codesign --verify --strict "$relocated/shared/$lib"
+          done
+          cp -f crates/sherpa-plugin/target/legacy-static/release/libminutes_sherpa.dylib "$relocated/legacy/"
+          codesign --force --options runtime --sign - "$relocated/legacy/libminutes_sherpa.dylib"
+          for layout in shared legacy; do
+            (cd /tmp && python3 "$GITHUB_WORKSPACE/scripts/verify_sherpa_plugin_loads.py" "$relocated/$layout/libminutes_sherpa.dylib")
+          done
+
   ci_gate:
     name: CI Gate
     needs:
       - changes
+      - sherpa_macos_packaging
       - test
       - install
       - linux_full_build
