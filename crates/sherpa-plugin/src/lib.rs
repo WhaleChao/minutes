@@ -33,9 +33,6 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-#[cfg(all(target_os = "macos", feature = "legacy-static"))]
-use sherpa_legacy as sherpa_rs;
-
 #[cfg(all(target_os = "macos", not(feature = "legacy-static")))]
 #[allow(
     non_camel_case_types,

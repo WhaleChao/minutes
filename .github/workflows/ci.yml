@@ -1156,7 +1156,8 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           set -euo pipefail
-          export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
+          CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
+          export CXXFLAGS
           (cd crates/sherpa-plugin && cargo build --release --locked)
           (cd crates/sherpa-plugin && cargo build --release --locked --features legacy-static --target-dir target/legacy-static)
           relocated="$RUNNER_TEMP/sherpa-relocated"

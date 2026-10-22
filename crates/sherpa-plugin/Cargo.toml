@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 [features]
 # Keep the original two-file release archive usable by already-published MCP
 # clients. New clients and desktop builds use the faster shared engine.
-legacy-static = ["dep:sherpa-legacy"]
+legacy-static = ["dep:sherpa-rs"]
 
 # Deliberately outside the workspace. This crate embeds the whole sherpa-onnx
 # stack, so building it downloads a large prebuilt bundle; making it a member
@@ -25,7 +25,7 @@ legacy-static = ["dep:sherpa-legacy"]
 # instead and generates bindings from its own headers. The ONNX Runtime stays
 # a private dylib beside this plugin, so the host's ort never sees it (#683).
 [target.'cfg(target_os = "macos")'.dependencies]
-sherpa-legacy = { package = "sherpa-rs", version = "0.6.8", optional = true, default-features = false, features = ["download-binaries", "static", "sys"] }
+sherpa-rs = { version = "0.6.8", optional = true, default-features = false, features = ["download-binaries", "static", "sys"] }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 bindgen = "0.69.4"
