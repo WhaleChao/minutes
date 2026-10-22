@@ -259,8 +259,9 @@ def check(workflow_text: str) -> list[str]:
             "libonnxruntime.dylib beside the plugin"
         )
     if not re.search(
-        r"for lib in libsherpa-onnx-c-api\.dylib libonnxruntime\.dylib[\s\S]*?"
-        r"codesign\s+--force\s+--options\s+runtime\s+--timestamp[\s\S]*?\"\$out/\$lib\"",
+        r"for lib in libsherpa-onnx-c-api\.dylib libonnxruntime\.dylib; do\s*"
+        r"codesign\s+--force\s+--options\s+runtime\s+--timestamp\s*\\\s*"
+        r"--sign\s+\"\$APPLE_SIGNING_IDENTITY\"\s+\"\$out/\$lib\"",
         mac_live,
     ):
         failures.append(
@@ -268,10 +269,21 @@ def check(workflow_text: str) -> list[str]:
             "ONNX Runtime dylibs it ships beside the plugin"
         )
 
+    for required in [
+        "--features legacy-static --target-dir target/legacy-static",
+        'COPYFILE_DISABLE=1 tar czf "$out-shared.tar.gz" "$out"',
+        'cp -f crates/sherpa-plugin/target/legacy-static/release/libminutes_sherpa.dylib "$out/libminutes_sherpa.dylib"',
+        'rm -f "$out/libsherpa-onnx-c-api.dylib" "$out/libonnxruntime.dylib"',
+    ]:
+        if required not in mac_live:
+            failures.append("macOS must preserve the legacy archive and publish the shared archive separately: " + required)
+
     return failures
 
 
 MUTATIONS: list[tuple[str, object]] = [
+    ("drops the legacy plugin build", lambda s: s.replace("--features legacy-static --target-dir target/legacy-static", "")),
+    ("drops the shared archive", lambda s: s.replace('COPYFILE_DISABLE=1 tar czf "$out-shared.tar.gz" "$out"', "")),
     ("drops the plugin build", lambda s: s.replace(
         "( cd crates/sherpa-plugin && cargo build --release --locked )", "")),
     ("comments out the plugin build", lambda s: s.replace(

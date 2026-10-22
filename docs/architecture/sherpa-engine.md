@@ -352,3 +352,19 @@ The current engine code sets `model_type = ""` so sherpa auto-detects the NeMo
 Parakeet-TDT loader. If a future `sherpa-rs` change or local patch forces the
 generic `"transducer"` model type, model loading can fail with a metadata error
 like this. Keep `model_type` empty for this model family.
+
+### macOS archive compatibility
+
+New MCP clients first request `minutes-macos-arm64-sherpa-shared.tar.gz`, which
+contains the CLI, the plugin, and both private shared libraries. On an older
+release that lacks this asset, they accept the original two-file static archive;
+only an unavailable asset permits fallback, never a checksum or extraction error.
+A single shared library without its companion is rejected.
+
+Releases also retain `minutes-macos-arm64-sherpa.tar.gz` with the current CLI and
+a plugin built using `--features legacy-static` in a separate target directory.
+Already-published MCP clients strictly accept only this two-file layout. Do not
+add shared libraries to that asset or remove it during the migration. Both
+plugins expose the same Minutes ABI. Desktop bundles use the default shared
+build; the Homebrew bump migrates the formula resource and install recipe to
+carry both libraries with the plugin.

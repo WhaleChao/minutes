@@ -22,7 +22,9 @@ fn main() {
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("linux") => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN"),
         #[cfg(target_os = "macos")]
-        Ok("macos") => macos::link_sherpa(),
+        Ok("macos") if std::env::var_os("CARGO_FEATURE_LEGACY_STATIC").is_none() => {
+            macos::link_sherpa()
+        }
         _ => {}
     }
 }
@@ -105,7 +107,8 @@ mod macos {
             return;
         };
         for name in DYLIBS {
-            let _ = std::fs::copy(lib_dir.join(name), profile_dir.join(name));
+            std::fs::copy(lib_dir.join(name), profile_dir.join(name))
+                .unwrap_or_else(|error| panic!("stage required {name} beside plugin: {error}"));
         }
     }
 }

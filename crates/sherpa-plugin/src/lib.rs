@@ -33,7 +33,10 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "legacy-static"))]
+use sherpa_legacy as sherpa_rs;
+
+#[cfg(all(target_os = "macos", not(feature = "legacy-static")))]
 #[allow(
     non_camel_case_types,
     non_snake_case,
@@ -44,13 +47,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/sherpa_bindings.rs"));
 }
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "legacy-static")))]
 mod offline;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "legacy-static")))]
 use offline::{TransducerConfig, TransducerRecognizer};
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), feature = "legacy-static"))]
 use sherpa_rs::sherpa_rs_sys as sys;
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), feature = "legacy-static"))]
 use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 
 /// Version of the C surface below.

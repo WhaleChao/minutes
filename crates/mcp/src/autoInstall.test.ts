@@ -14,6 +14,7 @@ import {
   installMacSherpaArchiveWithFallback,
   MACOS_BARE_BINARY,
   MACOS_SHERPA_ARCHIVE,
+  MACOS_LEGACY_SHERPA_ARCHIVE,
   parseSha256Sums,
   ReleaseAssetUnavailableError,
 } from "./autoInstall.js";
@@ -171,6 +172,48 @@ describe("macOS sherpa archive installation", () => {
     await expect(readFile(extracted.libraryPaths[1], "utf8")).resolves.toBe("fixture ort library");
   });
 
+  it("installs the legacy archive when the shared asset is absent from an older release", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "minutes-mcp-legacy-"));
+    const downloads: string[] = [];
+    const result = await installMacSherpaArchiveWithFallback({
+      installDir: dir,
+      execFileAsync: async () => undefined,
+      downloadAsset: async ({ binaryName, targetPath }) => {
+        downloads.push(binaryName);
+        if (binaryName === MACOS_SHERPA_ARCHIVE) {
+          throw new ReleaseAssetUnavailableError(binaryName, "older release");
+        }
+        await writeFile(targetPath, gzipSync(tarArchive([
+          { name: "minutes-macos-arm64-sherpa/minutes", contents: "legacy cli" },
+          { name: "minutes-macos-arm64-sherpa/libminutes_sherpa.dylib", contents: "static plugin" },
+        ])));
+      },
+    });
+    expect(downloads).toEqual([MACOS_SHERPA_ARCHIVE, MACOS_LEGACY_SHERPA_ARCHIVE]);
+    expect(result).toEqual({ assetName: MACOS_LEGACY_SHERPA_ARCHIVE, usedFallback: true });
+    await expect(readFile(join(dir, "libminutes_sherpa.dylib"), "utf8")).resolves.toBe("static plugin");
+    await expect(stat(join(dir, "libonnxruntime.dylib"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not fall back after checksum or malformed-archive errors", async () => {
+    for (const corruptedDownload of [false, true]) {
+      const dir = await mkdtemp(join(tmpdir(), "minutes-mcp-bad-shared-"));
+      const downloads: string[] = [];
+      await expect(installMacSherpaArchiveWithFallback({
+        installDir: dir,
+        execFileAsync: async () => undefined,
+        downloadAsset: async ({ binaryName, targetPath }) => {
+          downloads.push(binaryName);
+          if (corruptedDownload) throw new Error("checksum mismatch");
+          await writeFile(targetPath, gzipSync(tarArchive([
+            { name: "minutes-macos-arm64-sherpa/minutes", contents: "cli" },
+          ])));
+        },
+      })).rejects.toThrow(corruptedDownload ? "checksum mismatch" : "missing");
+      expect(downloads).toEqual([MACOS_SHERPA_ARCHIVE]);
+    }
+  });
+
   it("rejects an archive that is missing a shared library", async () => {
     const dir = await mkdtemp(join(tmpdir(), "minutes-mcp-sherpa-tar-missing-"));
     const archivePath = join(dir, MACOS_SHERPA_ARCHIVE);
@@ -180,12 +223,13 @@ describe("macOS sherpa archive installation", () => {
         tarArchive([
           { name: "minutes-macos-arm64-sherpa/minutes", contents: "fixture cli" },
           { name: "minutes-macos-arm64-sherpa/libminutes_sherpa.dylib", contents: "plugin" },
+          { name: "minutes-macos-arm64-sherpa/libsherpa-onnx-c-api.dylib", contents: "sherpa" },
         ])
       )
     );
     await expect(
       extractMacSherpaArchive({ archivePath, destDir: join(dir, "out") })
-    ).rejects.toThrow("missing minutes-macos-arm64-sherpa/libsherpa-onnx-c-api.dylib");
+    ).rejects.toThrow("missing minutes-macos-arm64-sherpa/libonnxruntime.dylib");
   });
 
   it("falls back to the bare asset only when the archive is unavailable", async () => {
@@ -196,7 +240,7 @@ describe("macOS sherpa archive installation", () => {
       targetPath: string;
     }): Promise<void> => {
       downloads.push(input.binaryName);
-      if (input.binaryName === MACOS_SHERPA_ARCHIVE) {
+      if (input.binaryName !== MACOS_BARE_BINARY) {
         throw new ReleaseAssetUnavailableError(input.binaryName, "fixture archive is absent");
       }
       await writeFile(input.targetPath, "bare cli");
@@ -208,7 +252,7 @@ describe("macOS sherpa archive installation", () => {
       downloadAsset,
     });
 
-    expect(downloads).toEqual([MACOS_SHERPA_ARCHIVE, MACOS_BARE_BINARY]);
+    expect(downloads).toEqual([MACOS_SHERPA_ARCHIVE, MACOS_LEGACY_SHERPA_ARCHIVE, MACOS_BARE_BINARY]);
     expect(result).toEqual({ assetName: MACOS_BARE_BINARY, usedFallback: true });
     await expect(readFile(join(installDir, "minutes"), "utf8")).resolves.toBe("bare cli");
   });

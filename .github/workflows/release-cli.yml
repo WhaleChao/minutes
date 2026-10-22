@@ -337,6 +337,7 @@ jobs:
         run: |
           set -euo pipefail
           ( cd crates/sherpa-plugin && cargo build --release --locked )
+          ( cd crates/sherpa-plugin && cargo build --release --locked --features legacy-static --target-dir target/legacy-static )
           plugin="crates/sherpa-plugin/target/release/libminutes_sherpa.dylib"
           out="minutes-macos-arm64-sherpa"
           test -f "$plugin"
@@ -400,20 +401,37 @@ jobs:
           ( cd /tmp && python3 \
               "$GITHUB_WORKSPACE/scripts/verify_sherpa_plugin_loads.py" \
               "$GITHUB_WORKSPACE/$out/libminutes_sherpa.dylib" )
+          # New clients use a new asset name. Already-published MCP packages
+          # keep receiving the two-file, statically linked layout they accept.
+          COPYFILE_DISABLE=1 tar czf "$out-shared.tar.gz" "$out"
+          cp -f crates/sherpa-plugin/target/legacy-static/release/libminutes_sherpa.dylib "$out/libminutes_sherpa.dylib"
+          rm -f "$out/libsherpa-onnx-c-api.dylib" "$out/libonnxruntime.dylib"
+          if [[ -n "$APPLE_SIGNING_IDENTITY" ]]; then
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$out/libminutes_sherpa.dylib"
+            codesign --verify --strict --verbose=4 "$out/libminutes_sherpa.dylib"
+          fi
+          ( cd /tmp && python3 \
+              "$GITHUB_WORKSPACE/scripts/verify_sherpa_plugin_loads.py" \
+              "$GITHUB_WORKSPACE/$out/libminutes_sherpa.dylib" )
           COPYFILE_DISABLE=1 tar czf "$out.tar.gz" "$out"
 
       - name: Upload macOS sherpa archive artifact
         uses: actions/upload-artifact@v7
         with:
           name: minutes-macos-arm64-sherpa.tar.gz
-          path: minutes-macos-arm64-sherpa.tar.gz
+          path: |
+            minutes-macos-arm64-sherpa.tar.gz
+            minutes-macos-arm64-sherpa-shared.tar.gz
 
       - name: Upload macOS sherpa archive release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           draft: true
-          files: minutes-macos-arm64-sherpa.tar.gz
+          files: |
+            minutes-macos-arm64-sherpa.tar.gz
+            minutes-macos-arm64-sherpa-shared.tar.gz
 
   # The Desktop Extension bundle. Built here rather than by hand because it is
   # the artifact the Claude Desktop directory serves, and a hand step is one
