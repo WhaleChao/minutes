@@ -6636,6 +6636,7 @@
             <select id="settings-transcription-engine" class="settings-field">
               <option value="auto">Auto (Whisper)</option>
               <option value="whisper">Whisper — broad language support, built-in</option>
+              <option value="sherpa" disabled>Parakeet v3 — unavailable</option>
               <option value="parakeet" disabled>Parakeet — unavailable</option>
               <option value="apple-speech" disabled>Apple Speech — unavailable, using Whisper</option>
             </select>
@@ -8153,10 +8154,33 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     }
 
+    // Look up a select option by value, remembering it after it has been
+    // detached so a later settings load can put it back.
+    function settingsSelectOption(select, value) {
+      select._minutesOptions = select._minutesOptions || {};
+      const option = select.querySelector(`option[value="${value}"]`) || select._minutesOptions[value] || null;
+      if (option) select._minutesOptions[value] = option;
+      return option;
+    }
+
+    // Detach rather than hide: WebKit's native select menu does not reliably
+    // honor `hidden` on options. `before` lists anchors in order; the option
+    // goes in front of the first one currently in the select.
+    function setSettingsOptionPresent(select, option, present, before) {
+      if (!select || !option) return;
+      if (present && option.parentNode !== select) {
+        const anchor = (before || []).find((candidate) => candidate && candidate.parentNode === select) || null;
+        select.insertBefore(option, anchor);
+      } else if (!present && option.parentNode === select) {
+        option.remove();
+      }
+    }
+
     function backendLabel(backend) {
       switch (backend) {
         case 'apple-speech': return 'Apple Speech';
         case 'parakeet': return 'Parakeet';
+        case 'sherpa': return 'Parakeet v3';
         case 'whisper': return 'Whisper';
         case 'inherit': return 'your main transcription engine';
         default: return backend || 'Whisper';
@@ -12652,35 +12676,54 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         const liveFallbackOrder = liveTranscript.fallback_order || [resolvedLiveBackend];
         const liveMentionsParakeet = liveBackend === 'parakeet' || liveFallbackOrder.includes('parakeet');
         const parakeetSelectable = s.transcription.parakeet_selectable === true;
+        const sherpaSelectable = s.transcription.sherpa_selectable === true;
         const parakeetUnavailableReason = s.transcription.parakeet_unavailable_reason || '';
         const parakeetStatus = s.transcription.parakeet_status || null;
         const appleSpeechStatus = s.transcription.apple_speech_status || null;
         const engineSelect = document.getElementById('settings-transcription-engine');
         const autoOpt = engineSelect.querySelector('option[value="auto"]');
-        const parakeetOpt = engineSelect.querySelector('option[value="parakeet"]');
+        const sherpaOpt = settingsSelectOption(engineSelect, 'sherpa');
+        const parakeetOpt = settingsSelectOption(engineSelect, 'parakeet');
         const engineAppleOpt = engineSelect.querySelector('option[value="apple-speech"]');
         const engineDetail = document.getElementById('settings-transcription-engine-detail');
         const liveBackendSelect = document.getElementById('settings-live-backend');
         const liveBackendDetail = document.getElementById('settings-live-backend-detail');
-        const liveParakeetOpt = liveBackendSelect ? liveBackendSelect.querySelector('option[value="parakeet"]') : null;
+        const liveParakeetOpt = liveBackendSelect ? settingsSelectOption(liveBackendSelect, 'parakeet') : null;
         const liveAppleOpt = liveBackendSelect ? liveBackendSelect.querySelector('option[value="apple-speech"]') : null;
         if (autoOpt) {
           autoOpt.textContent = s.transcription.auto_engine_reason === 'sherpa: model present'
             ? 'Auto (Parakeet)'
             : 'Auto (Whisper)';
         }
+        if (sherpaOpt) {
+          // Built-in Parakeet v3. Only offered when it can run here, or kept
+          // visible when it is the saved choice so the select can show it.
+          sherpaOpt.disabled = !sherpaSelectable;
+          sherpaOpt.textContent = sherpaSelectable
+            ? 'Parakeet v3 — built-in, fast on Apple Silicon'
+            : 'Parakeet v3 — unavailable, using Whisper';
+          setSettingsOptionPresent(engineSelect, sherpaOpt, sherpaSelectable || eng === 'sherpa', [parakeetOpt, engineAppleOpt]);
+        }
         if (parakeetOpt) {
+          // The parakeet.cpp subprocess engine is retired. Show it only to a
+          // config that still selects it, so nobody else sees a second,
+          // permanently unavailable "Parakeet" next to the working one.
           parakeetOpt.disabled = !parakeetSelectable;
           parakeetOpt.textContent = parakeetSelectable
             ? 'Parakeet — local backend'
-            : (eng === 'parakeet' ? 'Parakeet — unavailable, using Whisper' : 'Parakeet — unavailable');
+            : 'Parakeet — unavailable, using Whisper';
+          setSettingsOptionPresent(engineSelect, parakeetOpt, parakeetSelectable || eng === 'parakeet', [engineAppleOpt]);
         }
         if (engineDetail) {
           engineDetail.textContent = eng === 'parakeet' && !parakeetSelectable
             ? `Parakeet is ${parakeetUnavailableReason || 'unavailable'}; this retained preference resolves to Whisper for batch, recording, and recording-sidecar transcription.`
             : (eng === 'apple-speech'
               ? 'Apple Speech cannot accept sealed audio yet; this retained preference resolves to Whisper for batch, recording, and recording-sidecar transcription.'
-              : 'The main engine controls batch, recording, and recording-sidecar transcription. Standalone live transcript has its own backend setting above.');
+              : (resolvedBatchEngine === 'sherpa'
+                ? 'Parakeet v3 runs on this Mac for batch, recording, and recording-sidecar transcription. Whisper takes over if Parakeet fails on a recording.'
+                : (eng === 'sherpa'
+                  ? 'Parakeet v3 is not installed here; this preference resolves to Whisper for batch, recording, and recording-sidecar transcription.'
+                  : 'The main engine controls batch, recording, and recording-sidecar transcription. Standalone live transcript has its own backend setting above.')));
         }
         if (engineAppleOpt) {
           engineAppleOpt.disabled = true;
@@ -12693,7 +12736,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           liveParakeetOpt.disabled = !parakeetSelectable;
           liveParakeetOpt.textContent = parakeetSelectable
             ? 'Parakeet — local backend'
-            : (liveBackend === 'parakeet' ? 'Parakeet — unavailable, using Whisper' : 'Parakeet — unavailable');
+            : 'Parakeet — unavailable, using Whisper';
+          setSettingsOptionPresent(liveBackendSelect, liveParakeetOpt, parakeetSelectable || liveBackend === 'parakeet', [liveAppleOpt]);
         }
         if (liveAppleOpt) {
           const appleSelectable = Boolean(appleSpeechStatus && appleSpeechStatus.selectable);
