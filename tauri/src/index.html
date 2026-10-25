@@ -17199,7 +17199,10 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       recallTerminal.focus();
       // Never type over something the person already started.
       if (recallTerminalInputDraft || !recallTerminalInputReliable) return;
-      recallTerminal.paste(`Discuss “${name}”: `);
+      // Name the file, not just the meeting: Minutes writes the selected
+      // meeting (summary and full transcript) to CURRENT_MEETING.md on submit,
+      // and a title alone sent the agent searching the corpus with shell tools.
+      recallTerminal.paste(`Discuss the meeting in CURRENT_MEETING.md (“${name}”): `);
     }
 
     // ── Recording-aware phase transitions ──
