@@ -142,11 +142,18 @@ fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
         return ("whisper", None);
     }
     if backend.eq_ignore_ascii_case("apple-speech") {
+        let reason = if live_supports_apple_speech() {
+            "Apple Speech runs only in standalone live transcript".to_string()
+        } else {
+            format!(
+                "Apple Speech {}",
+                crate::pipeline::apple_speech_unavailable_reason()
+            )
+        };
         return (
             "whisper",
             Some(format!(
-                "live_transcript.backend retained apple-speech, but Apple Speech {}; using sealed local Whisper for recording sidecar",
-                crate::pipeline::apple_speech_unavailable_reason()
+                "live_transcript.backend retained apple-speech, but {reason}; using sealed local Whisper for recording sidecar"
             )),
         );
     }
@@ -1238,7 +1245,6 @@ fn run_inner(
     // Only now create the writer (which truncates the JSONL and WAV files)
     let mut writer =
         LiveTranscriptWriter::new(config, context_session_id, TranscriptSource::Standalone)?;
-    writer.enable_shadow(config);
     writer.mark_healthy();
     crate::events::append_event(crate::events::recording_started_event(
         writer.session_id.clone(),
@@ -1261,6 +1267,21 @@ fn run_inner(
         standalone_backend.eq_ignore_ascii_case("apple-speech") && live_supports_apple_speech();
     #[cfg(not(target_os = "macos"))]
     let mut apple_live_enabled = false;
+
+    // Shadow scores Apple Speech against the Whisper line that ships. When Apple
+    // Speech is itself the shipped live engine there is no Whisper line to score,
+    // so the session records why it is not measuring instead of arming a runner
+    // that would never be fed.
+    if apple_live_enabled {
+        if crate::apple_speech_shadow::shadow_enabled(config) {
+            crate::apple_speech_shadow::log_shadow_disabled(
+                "standalone",
+                "apple-speech is the shipped live engine for this session",
+            );
+        }
+    } else {
+        writer.enable_shadow(config);
+    }
 
     // Parakeet engine dispatch — mirrors run_sidecar_inner_mpsc. When the user
     // configures `engine = "parakeet"` and the parakeet feature is compiled in,

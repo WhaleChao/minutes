@@ -654,20 +654,30 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
     minutes_core::transcription_coordinator::parakeet_backend_status(config)
 }
 
+/// Shown when the signed transport binds but this Mac's Speech framework
+/// cannot run the transcriber, so the reason is not blamed on the transport.
+const APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON: &str =
+    "the Speech framework on this Mac cannot run the speech transcriber (macOS 26 or later is required)";
+
+/// Apple Speech availability for the desktop settings surface. `selectable`
+/// covers standalone live transcript only, the one surface the product gate
+/// opens; dictation and the main engine keep rejecting it.
 fn apple_speech_status_view() -> serde_json::Value {
     let transport_available =
         minutes_core::pipeline::apple_speech_private_audio_transport_supported();
     match minutes_core::apple_speech::probe_capabilities() {
         Ok(report) => serde_json::json!({
             "supported": report.runtime_supported,
-            "selectable": false,
+            "selectable": transport_available && report.runtime_supported,
             "transport_available": transport_available,
-            "unavailable_reason": if transport_available && report.runtime_supported {
-                serde_json::Value::Null
-            } else {
+            "unavailable_reason": if !transport_available {
                 serde_json::Value::String(
                     minutes_core::pipeline::apple_speech_unavailable_reason().into()
                 )
+            } else if !report.runtime_supported {
+                serde_json::Value::String(APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON.into())
+            } else {
+                serde_json::Value::Null
             },
             "report": report,
         }),
@@ -13511,6 +13521,25 @@ fn reject_unselectable_apple_speech(value: &str, setting: &str) -> Result<(), St
     ))
 }
 
+/// Standalone live transcript is the one surface Apple Speech may be chosen
+/// for, and only when this signed app can reach the worker and the Speech
+/// runtime can transcribe.
+fn reject_unselectable_live_apple_speech(value: &str) -> Result<(), String> {
+    if !value.eq_ignore_ascii_case("apple-speech") {
+        return Ok(());
+    }
+    let status = apple_speech_status_view();
+    if status["selectable"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    let reason = status["unavailable_reason"]
+        .as_str()
+        .unwrap_or(minutes_core::pipeline::apple_speech_unavailable_reason());
+    Err(format!(
+        "Apple Speech cannot be selected as the live transcript backend: {reason}. Use Whisper; an existing Apple Speech preference is retained but resolves to Whisper."
+    ))
+}
+
 #[tauri::command]
 pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<String, String> {
     let mut config = Config::load();
@@ -13763,7 +13792,7 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
                     VALID_LIVE_TRANSCRIPT_BACKENDS.join(", ")
                 ));
             }
-            reject_unselectable_apple_speech(&value, "live transcript backend")?;
+            reject_unselectable_live_apple_speech(&value)?;
             reject_unselectable_parakeet(&value, "live transcript backend")?;
             config.live_transcript.backend = value.clone();
         }
@@ -17911,6 +17940,18 @@ mod tests {
         assert_eq!(live_readiness.configured_backend, "parakeet");
         assert_eq!(live_readiness.fallback_order, vec!["whisper"]);
         assert_eq!(primary.engine, "whisper");
+    }
+
+    #[test]
+    fn live_apple_speech_selection_requires_the_signed_transport() {
+        // Unit tests never run inside a trusted signed bundle, so the transport
+        // gate is closed and the live backend setter must refuse Apple Speech.
+        assert!(!minutes_core::pipeline::apple_speech_private_audio_transport_supported());
+        let error = reject_unselectable_live_apple_speech("apple-speech").unwrap_err();
+        assert!(error.contains("live transcript backend"));
+        assert!(error.contains("secure private audio"));
+        assert!(reject_unselectable_live_apple_speech("whisper").is_ok());
+        assert_eq!(apple_speech_status_view()["selectable"], false);
     }
 
     #[test]
