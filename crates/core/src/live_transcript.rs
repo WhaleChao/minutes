@@ -1265,6 +1265,17 @@ fn run_inner(
     #[cfg(target_os = "macos")]
     let mut apple_live_enabled =
         standalone_backend.eq_ignore_ascii_case("apple-speech") && live_supports_apple_speech();
+    // A failed Apple Speech utterance is re-transcribed by Whisper. Without
+    // that model the utterance would have nowhere to go, so a hand-edited or
+    // retained preference does not enable Apple Speech either.
+    #[cfg(target_os = "macos")]
+    if apple_live_enabled && !live_whisper_fallback_available(config) {
+        apple_live_enabled = false;
+        emit_apple_speech_fallback_warning(
+            "standalone",
+            "the Whisper fallback model for live transcript is not installed",
+        );
+    }
     #[cfg(not(target_os = "macos"))]
     let mut apple_live_enabled = false;
 
@@ -2723,16 +2734,56 @@ fn transcribe_with_parakeet_for_live_sidecar(
     }
 }
 
+/// Longest the capture consumer thread waits for one Apple Speech utterance.
+/// The audio channel buffers about 6.4 s, and a Whisper fallback may still
+/// need to load after a timeout, so this stays well under that.
+#[cfg(all(feature = "whisper", target_os = "macos"))]
+const APPLE_SPEECH_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
 #[cfg(all(feature = "whisper", target_os = "macos"))]
 fn transcribe_with_apple_speech_for_live_sidecar(
     samples: &[f32],
     config: &Config,
 ) -> Result<Option<(String, f64)>, MinutesError> {
-    transcribe_with_apple_speech_for_live_sidecar_impl(
-        samples,
-        config,
-        crate::apple_speech_worker::transcribe_samples,
-    )
+    // The worker's own deadline is 180 s. Run the call on its own thread so a
+    // stalled worker costs this session at most the deadline below, then the
+    // caller latches the fallback engine; a late result is discarded.
+    let owned = zeroize::Zeroizing::new(samples.to_vec());
+    let config = config.clone();
+    call_with_deadline(APPLE_SPEECH_LIVE_DEADLINE, move || {
+        transcribe_with_apple_speech_for_live_sidecar_impl(
+            &owned,
+            &config,
+            crate::apple_speech_worker::transcribe_samples,
+        )
+    })
+}
+
+/// Run `call` on its own thread and wait at most `deadline` for it. A call
+/// that overruns keeps running detached; its result is dropped.
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
+fn call_with_deadline<T, F>(deadline: std::time::Duration, call: F) -> Result<T, MinutesError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MinutesError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("apple-speech-live".into())
+        .spawn(move || {
+            let _ = tx.send(call());
+        })
+        .map_err(MinutesError::Io)?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(MinutesError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Apple Speech did not answer within {} ms",
+                deadline.as_millis()
+            ),
+        ))),
+    }
 }
 
 #[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
@@ -4091,6 +4142,22 @@ mod tests {
     #[cfg(not(feature = "parakeet"))]
     use super::PARAKEET_LIVE_SCOPE_WARNING;
     use super::*;
+
+    #[test]
+    fn a_stalled_apple_speech_call_costs_at_most_its_deadline() {
+        let started = std::time::Instant::now();
+        let result: Result<u8, MinutesError> =
+            call_with_deadline(std::time::Duration::from_millis(100), || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                Ok(1)
+            });
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            call_with_deadline(std::time::Duration::from_secs(5), || Ok(7)).unwrap(),
+            7
+        );
+    }
 
     #[test]
     fn live_apple_speech_never_waits_for_an_asset_download() {

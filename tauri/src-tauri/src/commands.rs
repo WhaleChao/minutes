@@ -659,10 +659,6 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
 const APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON: &str =
     "the Speech framework on this Mac cannot run the speech transcriber (macOS 26 or later is required)";
 
-/// Shown when Apple Speech could run but its Whisper fallback model is missing.
-const APPLE_SPEECH_FALLBACK_UNAVAILABLE_REASON: &str =
-    "the Whisper model live transcript falls back to is not installed (run `minutes setup --model small`)";
-
 /// Apple Speech availability for the desktop settings surface. `selectable`
 /// covers standalone live transcript only, the one surface the product gate
 /// opens; dictation and the main engine keep rejecting it.
@@ -673,19 +669,23 @@ fn apple_speech_status_view() -> serde_json::Value {
 fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
     let transport_available =
         minutes_core::pipeline::apple_speech_private_audio_transport_supported();
-    // Runtime support comes from the OS version, not the capability helper:
-    // that helper is compiled with `xcrun swiftc`, which most Macs lack, while
-    // the signed worker that does the transcribing ships inside the app.
-    let runtime_supported = apple_speech_runtime_supported();
+    let runtime_supported = transport_available && apple_speech_runtime_supported();
     // A live session that loses Apple Speech mid-way falls back to Whisper. If
     // that model is missing, the failed utterance has nowhere to go.
     let fallback_ready = minutes_core::live_transcript::live_whisper_fallback_available(config);
     let unavailable_reason = if !transport_available {
-        Some(minutes_core::pipeline::apple_speech_unavailable_reason())
+        Some(minutes_core::pipeline::apple_speech_unavailable_reason().to_string())
     } else if !runtime_supported {
-        Some(APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON)
+        Some(APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON.to_string())
     } else if !fallback_ready {
-        Some(APPLE_SPEECH_FALLBACK_UNAVAILABLE_REASON)
+        let model = if config.live_transcript.model.is_empty() {
+            &config.dictation.model
+        } else {
+            &config.live_transcript.model
+        };
+        Some(format!(
+            "the Whisper model live transcript falls back to (\"{model}\") is not installed; run `minutes setup --model {model}`"
+        ))
     } else {
         None
     };
@@ -698,11 +698,26 @@ fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
     })
 }
 
-/// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26.
+/// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26. The version alone
+/// is not proof: some macOS 26 machines (virtual Macs among them) lack the
+/// transcriber. The capability helper can say so, but it is compiled with
+/// `xcrun swiftc`, which most Macs lack, so only a definite "unsupported" from
+/// it counts; a helper that cannot run leaves the version check to decide.
+/// Without developer tools, `xcrun` would open Apple's install prompt, so the
+/// helper is only consulted when `xcode-select -p` finds them.
 fn apple_speech_runtime_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
+        let developer_tools = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .is_ok_and(|output| output.status.success());
         crate::call_capture::macos_major_version().is_some_and(|major| major >= 26)
+            && !(developer_tools
+                && matches!(
+                    minutes_core::apple_speech::probe_capabilities(),
+                    Ok(report) if !report.runtime_supported
+                ))
     }
     #[cfg(not(target_os = "macos"))]
     {
