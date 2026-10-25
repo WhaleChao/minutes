@@ -10619,10 +10619,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           { text: menuLabel('Open'), action: action('Open', () => openMeetingDetail(meeting.path)) },
           {
             text: menuLabel('Discuss with Agent'),
-            action: action('Discuss with Agent', async () => {
-              await openRecall('meeting', meeting.path);
-              setRecallPhase('debrief', meeting.title || 'Meeting');
-            }),
+            action: action('Discuss with Agent', () => discussMeetingWithAgent(meeting.path, meeting.title)),
           },
           { item: 'Separator' },
         );
@@ -11849,8 +11846,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           chatBtn.textContent = '\u279C';
           chatBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            await openRecall('meeting', m.path);
-            setRecallPhase('debrief', m.title || 'Meeting');
+            await discussMeetingWithAgent(m.path, m.title);
           });
 
           item.appendChild(info);
@@ -17185,9 +17181,26 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       const path = currentMeetingPath;
       const title = currentMeetingDetail ? currentMeetingDetail.title : 'Meeting';
       closeDetailView();
-      await openRecall('meeting', path);
-      setRecallPhase('debrief', title);
+      await discussMeetingWithAgent(path, title);
     });
+
+    // Every "Discuss with Agent" entry point. With the assistant already
+    // running in Terminal, opening Recall changes nothing on screen: the
+    // meeting is only queued for the next question, and a notice is no help
+    // because any terminal input dismisses it. Type a starter line naming the
+    // meeting at the prompt instead, without submitting it. The click visibly
+    // lands, the person can add a question or just press Return, and the
+    // context gate still holds: Minutes reads the meeting only on submit.
+    async function discussMeetingWithAgent(path, title) {
+      const name = title || 'Meeting';
+      await openRecall('meeting', path);
+      setRecallPhase('debrief', name);
+      if (!recallDevMode || !recallTerminal || !recallPtyAlive) return;
+      recallTerminal.focus();
+      // Never type over something the person already started.
+      if (recallTerminalInputDraft || !recallTerminalInputReliable) return;
+      recallTerminal.paste(`Discuss “${name}”: `);
+    }
 
     // ── Recording-aware phase transitions ──
     const originalCheckStatus = checkStatus;
