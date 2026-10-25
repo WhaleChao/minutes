@@ -2735,10 +2735,12 @@ fn transcribe_with_parakeet_for_live_sidecar(
 }
 
 /// Longest the capture consumer thread waits for one Apple Speech utterance.
-/// The audio channel buffers about 6.4 s, and a Whisper fallback may still
-/// need to load after a timeout, so this stays well under that.
+/// The audio channel buffers about 6.4 s. After a timeout the same thread loads
+/// the Whisper fallback and transcribes the utterance, as a Whisper live
+/// session always does, so the wait leaves most of that buffer for it. Apple
+/// Speech normally answers in well under a second.
 #[cfg(all(feature = "whisper", target_os = "macos"))]
-const APPLE_SPEECH_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+const APPLE_SPEECH_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(all(feature = "whisper", target_os = "macos"))]
 fn transcribe_with_apple_speech_for_live_sidecar(

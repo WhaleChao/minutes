@@ -698,26 +698,47 @@ fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
     })
 }
 
-/// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26. The version alone
-/// is not proof: some macOS 26 machines (virtual Macs among them) lack the
-/// transcriber. The capability helper can say so, but it is compiled with
-/// `xcrun swiftc`, which most Macs lack, so only a definite "unsupported" from
-/// it counts; a helper that cannot run leaves the version check to decide.
-/// Without developer tools, `xcrun` would open Apple's install prompt, so the
-/// helper is only consulted when `xcode-select -p` finds them.
-fn apple_speech_runtime_supported() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let developer_tools = std::process::Command::new("/usr/bin/xcode-select")
-            .arg("-p")
-            .output()
-            .is_ok_and(|output| output.status.success());
-        crate::call_capture::macos_major_version().is_some_and(|major| major >= 26)
-            && !(developer_tools
+#[cfg(target_os = "macos")]
+static APPLE_SPEECH_HELPER_UNAVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Cached, non-blocking capability verdict; see [`apple_speech_runtime_supported`].
+#[cfg(target_os = "macos")]
+fn apple_speech_helper_reports_unavailable() -> bool {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let developer_tools = std::process::Command::new("/usr/bin/xcode-select")
+                .arg("-p")
+                .output()
+                .is_ok_and(|output| output.status.success());
+            let unavailable = developer_tools
                 && matches!(
                     minutes_core::apple_speech::probe_capabilities(),
                     Ok(report) if !report.runtime_supported
-                ))
+                        || report.speech_transcriber.is_available == Some(false)
+                );
+            let _ = APPLE_SPEECH_HELPER_UNAVAILABLE.set(unavailable);
+        });
+    });
+    APPLE_SPEECH_HELPER_UNAVAILABLE
+        .get()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26. The version alone
+/// is not proof: some macOS 26 machines (virtual Macs among them) report the
+/// transcriber as unavailable. The capability helper can say so, but it is
+/// compiled with `xcrun swiftc`, which most Macs lack, and compiling or running
+/// it can take seconds. So it runs once, off the settings thread, only when
+/// `xcode-select -p` finds developer tools (otherwise `xcrun` opens Apple's
+/// install prompt). Until it answers, and on Macs without it, the version
+/// check decides; a definite "unavailable" from it blocks selection.
+fn apple_speech_runtime_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::call_capture::macos_major_version().is_some_and(|major| major >= 26)
+            && !apple_speech_helper_reports_unavailable()
     }
     #[cfg(not(target_os = "macos"))]
     {
