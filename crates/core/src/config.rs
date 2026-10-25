@@ -427,11 +427,6 @@ pub struct SummarizationConfig {
     /// agent path could hang the full (previously hardcoded 120s) budget on MCP
     /// init and ship meetings anonymous. Clamped to [5, 120] at the call site.
     pub speaker_mapping_timeout_secs: u64,
-    /// Optional model for the short agent calls after the summary (title
-    /// refinement and Level-1 speaker mapping). Empty keeps each agent CLI's
-    /// own default. Passed as `--model` to `claude` and `-m` to `codex`;
-    /// other agent CLIs ignore it. Example: `"haiku"` for `claude`.
-    pub agent_fast_model: String,
     pub chunk_max_tokens: usize,
     pub ollama_url: String,
     pub ollama_model: String,
@@ -1760,7 +1755,6 @@ impl Default for SummarizationConfig {
             agent_command: "claude".into(),
             agent_timeout_secs: 300,
             speaker_mapping_timeout_secs: 30,
-            agent_fast_model: String::new(),
             chunk_max_tokens: 4000,
             ollama_url: "http://localhost:11434".into(),
             ollama_model: "llama3.2".into(),

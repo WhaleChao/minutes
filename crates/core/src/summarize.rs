@@ -25,6 +25,11 @@ use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct Summary {
+    /// Meeting title written in the same model call as the summary. `None`
+    /// when the model omitted it or when the parsed text held more than one
+    /// title (concatenated chunk outputs), so the pipeline falls back to a
+    /// separate title call.
+    pub title: Option<String>,
     pub text: String,
     pub decisions: Vec<String>,
     pub action_items: Vec<String>,
@@ -625,6 +630,7 @@ Extract:
 4. Open questions (unresolved questions or unknowns that still need follow-up)
 5. Commitments (explicit promises, commitments, or owner statements made by someone)
 6. Participants (names of people present or mentioned in the conversation)
+7. Title (3-8 words, specific about the topic or outcome of the whole meeting: name the concrete products, projects or people discussed rather than a general category; never a generic title like "Meeting", "Call" or "Recording")
 
 For an empty section, leave its header with no bullet items. Never invent a
 "none", "no decisions were made" or translated absence bullet. Those are
@@ -632,6 +638,8 @@ section states, not decisions or tasks. MICROPHONE and SYSTEM are audio-source
 labels, not participant names. Preserve substantive negative decisions.
 
 Respond in this exact format:
+
+TITLE: Specific meeting title
 
 KEY POINTS:
 - point 1
@@ -694,12 +702,24 @@ fn parse_summary_response(response: &str) -> Summary {
     let mut open_questions = Vec::new();
     let mut commitments = Vec::new();
     let mut participants_raw = Vec::new();
+    let mut titles: Vec<String> = Vec::new();
+    let mut removed_title_line = false;
     let mut current_section = "";
     let mut fallback_lines = Vec::new();
     let mut removed_absence = false;
 
     for line in response.lines() {
         let trimmed = line.trim();
+
+        if let Some(title) = trimmed.strip_prefix("TITLE:") {
+            current_section = "title";
+            removed_title_line = true;
+            let title = title.trim();
+            if !title.is_empty() {
+                titles.push(title.to_string());
+            }
+            continue;
+        }
         fallback_lines.push(line);
 
         if trimmed.starts_with("KEY POINTS:") {
@@ -729,6 +749,10 @@ fn parse_summary_response(response: &str) -> Summary {
                 continue;
             }
             match current_section {
+                "title" => {
+                    fallback_lines.pop();
+                    titles.push(item.trim().to_string());
+                }
                 "key_points" => key_points.push(item.to_string()),
                 "decisions" => decisions.push(item.to_string()),
                 "action_items" => action_items.push(item.to_string()),
@@ -753,9 +777,17 @@ fn parse_summary_response(response: &str) -> Summary {
         .filter(|p| !p.is_empty())
         .collect();
 
+    // One response, one title. Engines that concatenate per-chunk outputs
+    // without a synthesis call produce several; none of them names the whole
+    // meeting, so the separate title call decides instead.
+    titles.retain(|title| !title.is_empty());
+    titles.dedup();
+    let title = (titles.len() == 1).then(|| titles.remove(0));
+
     Summary {
+        title,
         text: if key_points.is_empty() {
-            if removed_absence {
+            if removed_absence || removed_title_line {
                 fallback_lines.join("\n")
             } else {
                 response.to_string()
@@ -770,6 +802,17 @@ fn parse_summary_response(response: &str) -> Summary {
         key_points,
         participants,
     }
+}
+
+/// Parse per-chunk outputs that were concatenated without a synthesis call.
+/// Each chunk saw only part of the meeting, so a title from any one of them
+/// would name a fragment; leave it to the separate title call instead.
+fn parse_concatenated_chunk_summaries(all_text: &str, chunk_count: usize) -> Summary {
+    let mut summary = parse_summary_response(all_text);
+    if chunk_count > 1 {
+        summary.title = None;
+    }
+    summary
 }
 
 fn summary_output_chars(summary: &Summary) -> usize {
@@ -1783,26 +1826,6 @@ fn prepare_agent_invocation(
     })
 }
 
-/// Route a short agent call to `model` when the agent CLI takes a model flag.
-/// `claude` gets `--model`, `codex exec` gets `-m`; every other CLI keeps its
-/// own default because its flag spelling is not part of a stable contract here.
-/// An empty `model` leaves the invocation unchanged.
-fn apply_agent_model(invocation: &mut AgentInvocation, agent_cmd: &str, model: &str) {
-    let model = model.trim();
-    if model.is_empty() {
-        return;
-    }
-    if matches_agent_binary(agent_cmd, "claude") {
-        invocation
-            .args
-            .splice(1..1, ["--model".to_string(), model.to_string()]);
-    } else if matches_agent_binary(agent_cmd, "codex") {
-        invocation
-            .args
-            .splice(1..1, ["-m".to_string(), model.to_string()]);
-    }
-}
-
 /// Summarize using a specific agent command (used by the "auto" engine).
 fn summarize_with_agent_cmd(
     transcript: &str,
@@ -2671,7 +2694,7 @@ fn summarize_with_openai(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── Mistral API ─────────────────────────────────────────────
@@ -2923,7 +2946,7 @@ fn summarize_with_openai_compatible(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── Ollama (local) ───────────────────────────────────────────
@@ -2956,7 +2979,7 @@ fn summarize_with_apple_fm(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 fn summarize_with_ollama(
@@ -2984,7 +3007,7 @@ fn summarize_with_ollama(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── HTTP helper (ureq — pure Rust, no subprocess, no secrets in process args) ──
@@ -3119,11 +3142,7 @@ fn run_title_refinement_prompt(
             if crate::apple_fm::is_available() {
                 crate::apple_fm::generate("You generate concise meeting titles.", prompt)
             } else if let Some(agent) = detect_agent_cli() {
-                run_title_refinement_via_agent(
-                    prompt,
-                    &agent,
-                    &config.summarization.agent_fast_model,
-                )
+                run_title_refinement_via_agent(prompt, &agent)
             } else {
                 Err("no AI CLI found (claude, codex, gemini, opencode)".into())
             }
@@ -3137,11 +3156,7 @@ fn run_title_refinement_prompt(
             } else {
                 config.summarization.agent_command.clone()
             };
-            run_title_refinement_via_agent(
-                prompt,
-                &resolve_agent_path(&agent_cmd),
-                &config.summarization.agent_fast_model,
-            )
+            run_title_refinement_via_agent(prompt, &resolve_agent_path(&agent_cmd))
         }
         "claude" => {
             let api_key =
@@ -3237,25 +3252,17 @@ fn run_title_refinement_prompt(
 fn run_title_refinement_via_agent(
     prompt: &str,
     agent_cmd: &str,
-    model: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    run_title_refinement_via_agent_timeout(
-        prompt,
-        agent_cmd,
-        model,
-        std::time::Duration::from_secs(120),
-    )
+    run_title_refinement_via_agent_timeout(prompt, agent_cmd, std::time::Duration::from_secs(120))
 }
 
 fn run_title_refinement_via_agent_timeout(
     prompt: &str,
     agent_cmd: &str,
-    model: &str,
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // A title is a one-line text task: lean (no MCP, no tools) like speaker mapping.
-    let mut invocation = prepare_agent_invocation(agent_cmd, prompt, &[], true)?;
-    apply_agent_model(&mut invocation, agent_cmd, model);
+    let invocation = prepare_agent_invocation(agent_cmd, prompt, &[], true)?;
     let cleanup_path = invocation.cleanup_path.clone();
     let result = (|| {
         let mut command = crate::bounded_child::BoundedCommand::new(&invocation.cmd);
@@ -3573,12 +3580,7 @@ fn run_speaker_mapping_via_agent(
     let agent_cmd = resolve_agent_path(&agent_cmd);
     // Speaker mapping runs the agent in `lean` mode (no MCP, no tools): #382.
     // Lean is text-only — no screen_files by design (see prepare_agent_invocation).
-    let mut invocation = prepare_agent_invocation(&agent_cmd, prompt, &[], true)?;
-    apply_agent_model(
-        &mut invocation,
-        &agent_cmd,
-        &config.summarization.agent_fast_model,
-    );
+    let invocation = prepare_agent_invocation(&agent_cmd, prompt, &[], true)?;
     let cleanup_path = invocation.cleanup_path.clone();
     // Same fix as summarize_with_agent_impl_timeout (#288): file-arg agents
     // (pi, opencode) have no stdin payload, and an unclosed piped stdin makes
@@ -4357,6 +4359,56 @@ COMMITMENTS:
     }
 
     #[test]
+    fn parse_summary_response_reads_one_title_and_keeps_it_out_of_the_text() {
+        let summary = parse_summary_response(
+            "TITLE: Annual Billing Decision\n\nKEY POINTS:\n- Reviewed billing\n",
+        );
+        assert_eq!(summary.title.as_deref(), Some("Annual Billing Decision"));
+        assert_eq!(summary.key_points, vec!["Reviewed billing"]);
+
+        let bulleted = parse_summary_response("TITLE:\n- Pricing Review\n\nKEY POINTS:\n- A\n");
+        assert_eq!(bulleted.title.as_deref(), Some("Pricing Review"));
+
+        let freeform = parse_summary_response("TITLE: Pricing Review\nWe talked about pricing.");
+        assert_eq!(freeform.title.as_deref(), Some("Pricing Review"));
+        assert!(!freeform.text.contains("TITLE"));
+
+        assert!(parse_summary_response("KEY POINTS:\n- A\n").title.is_none());
+    }
+
+    #[test]
+    fn parse_summary_response_drops_titles_from_concatenated_chunks() {
+        // Engines without a synthesis call concatenate per-chunk outputs; no
+        // chunk title names the whole meeting.
+        let summary = parse_summary_response(
+            "TITLE: Opening Budget Talk\nKEY POINTS:\n- A\n\nTITLE: Hiring Plan Wrap-Up\nKEY POINTS:\n- B\n",
+        );
+        assert!(summary.title.is_none());
+        assert_eq!(summary.key_points, vec!["A", "B"]);
+
+        let repeated = parse_summary_response(
+            "TITLE: Hiring Plan\nKEY POINTS:\n- A\nTITLE: Hiring Plan\nKEY POINTS:\n- B\n",
+        );
+        assert_eq!(repeated.title.as_deref(), Some("Hiring Plan"));
+    }
+
+    #[test]
+    fn concatenated_chunk_outputs_never_supply_a_title() {
+        let text = "TITLE: Opening Budget Talk\nKEY POINTS:\n- A\n";
+        assert!(parse_concatenated_chunk_summaries(text, 2).title.is_none());
+        assert_eq!(
+            parse_concatenated_chunk_summaries(text, 1).title.as_deref(),
+            Some("Opening Budget Talk")
+        );
+    }
+
+    #[test]
+    fn summary_prompt_asks_for_a_title_section() {
+        let prompt = build_base_system_prompt("auto");
+        assert!(prompt.contains("TITLE: Specific meeting title"));
+    }
+
+    #[test]
     fn parse_summary_response_extracts_participants() {
         let response = "\
 KEY POINTS:
@@ -4377,6 +4429,7 @@ PARTICIPANTS:
     #[test]
     fn format_summary_produces_markdown() {
         let summary = Summary {
+            title: None,
             text: String::new(),
             key_points: vec!["Point one".into(), "Point two".into()],
             decisions: vec!["Decision A".into()],
@@ -4512,40 +4565,6 @@ PARTICIPANTS:
         let plain = prepare_agent_invocation("claude", "p", &[], false).unwrap();
         assert_eq!(plain.args, vec!["-p", "-"]);
         assert!(!plain.args.iter().any(|a| a == "--strict-mcp-config"));
-    }
-
-    #[test]
-    fn apply_agent_model_uses_each_cli_flag_and_leaves_others_alone() {
-        let mut claude = prepare_agent_invocation("claude", "p", &[], true).unwrap();
-        apply_agent_model(&mut claude, "claude", " haiku ");
-        assert_eq!(&claude.args[..3], ["-p", "--model", "haiku"]);
-        assert_eq!(claude.args.last().map(String::as_str), Some("-"));
-
-        let mut codex = prepare_agent_invocation("codex", "p", &[], true).unwrap();
-        apply_agent_model(&mut codex, "codex", "gpt-5-mini");
-        assert_eq!(&codex.args[..4], ["exec", "-m", "gpt-5-mini", "-"]);
-
-        for agent in ["gemini", "opencode", "pi", "agent"] {
-            let before = prepare_agent_invocation(agent, "p", &[], true).unwrap();
-            let mut after = prepare_agent_invocation(agent, "p", &[], true).unwrap();
-            apply_agent_model(&mut after, agent, "haiku");
-            assert_eq!(
-                after.args.len(),
-                before.args.len(),
-                "{agent} got a model flag"
-            );
-            for path in [before.cleanup_path, after.cleanup_path]
-                .into_iter()
-                .flatten()
-            {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-
-        let mut unset = prepare_agent_invocation("claude", "p", &[], true).unwrap();
-        let expected = unset.args.clone();
-        apply_agent_model(&mut unset, "claude", "");
-        assert_eq!(unset.args, expected);
     }
 
     #[test]
@@ -5010,6 +5029,31 @@ PARTICIPANTS:
                 assert!(chunks.iter().all(|chunk| chunk.len() <= cap));
             }
         }
+    }
+
+    #[test]
+    fn agent_long_meeting_title_comes_from_the_synthesis_not_a_chunk() {
+        let transcript = format!(
+            "{}\n[59:00] closing discussion",
+            "opening discussion\n".repeat(6_000)
+        );
+        let result = summarize_agent_with_runner(
+            &transcript,
+            None,
+            &[],
+            "system",
+            "fake",
+            std::time::Duration::from_secs(5),
+            |prompt, _, _| {
+                if prompt.contains("<partial_summary>") {
+                    return Ok("TITLE: Whole Meeting Title\nKEY POINTS:\n- Everything".into());
+                }
+                Ok("TITLE: Chunk Fragment Title\nKEY POINTS:\n- Part".into())
+            },
+        )
+        .unwrap();
+        assert!(result.coverage.source_chunks > 1);
+        assert_eq!(result.summary.title.as_deref(), Some("Whole Meeting Title"));
     }
 
     #[test]
@@ -5806,12 +5850,9 @@ EOF
         let script_path = write_stdin_draining_pi(dir.path(), "refined title");
 
         let start = std::time::Instant::now();
-        let result = run_title_refinement_via_agent(
-            "refine this title",
-            &script_path.display().to_string(),
-            "",
-        )
-        .expect("file-arg agent should not block on an unclosed stdin pipe");
+        let result =
+            run_title_refinement_via_agent("refine this title", &script_path.display().to_string())
+                .expect("file-arg agent should not block on an unclosed stdin pipe");
 
         assert_eq!(result, "refined title");
         assert!(
@@ -5830,7 +5871,6 @@ EOF
         let error = run_title_refinement_via_agent_timeout(
             "synthetic title",
             &script.display().to_string(),
-            "",
             std::time::Duration::from_secs(2),
         )
         .unwrap_err();
