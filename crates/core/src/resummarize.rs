@@ -1039,6 +1039,7 @@ mod tests {
         commitments: &[&str],
     ) -> Summary {
         Summary {
+            title: None,
             text: String::new(),
             decisions: decisions.iter().map(|s| s.to_string()).collect(),
             action_items: action_items.iter().map(|s| s.to_string()).collect(),

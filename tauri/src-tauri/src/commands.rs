@@ -2317,7 +2317,13 @@ pub fn load_activation_progress(config: &Config) -> Arc<Mutex<ActivationProgress
     }
 
     let model_file = model_file_for_config(config);
-    let latest_artifact = latest_saved_artifact_from_search(config);
+    // The search reads the whole corpus and runs before the window exists, so
+    // only pay for it while the first-artifact milestone is still missing.
+    let latest_artifact = progress
+        .first_artifact_saved_at
+        .is_none()
+        .then(|| latest_saved_artifact_from_search(config))
+        .flatten();
     changed |=
         backfill_activation_from_paths(&mut progress, &model_file, latest_artifact.as_deref());
 
@@ -2383,11 +2389,7 @@ fn activation_status_view(
     }
 }
 
-fn build_related_context(
-    config: &Config,
-    current_path: &Path,
-    frontmatter: &minutes_core::markdown::Frontmatter,
-) -> RelatedContextView {
+fn related_people_from(frontmatter: &minutes_core::markdown::Frontmatter) -> Vec<String> {
     let mut related_people = frontmatter.attendees.clone();
     for person in &frontmatter.people {
         if !related_people.iter().any(|existing| existing == person) {
@@ -2402,7 +2404,10 @@ fn build_related_context(
             related_people.push(entity.label.clone());
         }
     }
+    related_people
+}
 
+fn related_topics_from(frontmatter: &minutes_core::markdown::Frontmatter) -> Vec<String> {
     let mut related_topics = Vec::new();
     for decision in &frontmatter.decisions {
         if let Some(topic) = decision
@@ -2418,6 +2423,16 @@ fn build_related_context(
             }
         }
     }
+    related_topics
+}
+
+fn build_related_context(
+    config: &Config,
+    current_path: &Path,
+    frontmatter: &minutes_core::markdown::Frontmatter,
+) -> RelatedContextView {
+    let related_people = related_people_from(frontmatter);
+    let related_topics = related_topics_from(frontmatter);
 
     let mut related_meetings = Vec::new();
     let mut related_meeting_paths = std::collections::HashSet::new();
@@ -7440,6 +7455,13 @@ pub fn cmd_add_note(text: String) -> Result<String, String> {
     minutes_core::notes::add_note(&text)
 }
 
+/// Lets the note window say up front whether a note has anywhere to go,
+/// instead of failing only after the person has typed it.
+#[tauri::command]
+pub fn cmd_note_target() -> Option<&'static str> {
+    minutes_core::notes::note_target()
+}
+
 /// Start a no-capture sensitive meeting from the desktop app.
 #[tauri::command]
 pub fn cmd_sensitive_start(title: Option<String>) -> Result<serde_json::Value, String> {
@@ -7763,8 +7785,12 @@ fn capture_status_audio_level(
 }
 
 #[tauri::command]
-pub fn cmd_capture_status(state: tauri::State<AppState>) -> serde_json::Value {
-    status_value(&state, false)
+// Async so the 1–2 s status poll runs off the main thread (it reads pid,
+// session and config files every tick).
+pub async fn cmd_capture_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    Ok(status_value(&state, false))
 }
 
 #[tauri::command]
@@ -8246,18 +8272,31 @@ fn delete_meeting_artifacts(
     Ok(())
 }
 
+/// One file moved into the archive folder. The desktop app keeps these so an
+/// Undo can put every file back exactly where it came from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ArchivedFileMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
 fn archive_meeting_artifacts(
     md_path: &Path,
     archive_dir: &Path,
     audio_artifacts: &[PathBuf],
     with_audio: bool,
-) -> Result<(), String> {
+) -> Result<Vec<ArchivedFileMove>, String> {
+    let mut moves = Vec::new();
     let dest_md = archive_dir.join(
         md_path
             .file_name()
             .ok_or_else(|| format!("missing filename for {}", md_path.display()))?,
     );
     std::fs::rename(md_path, &dest_md).map_err(|e| e.to_string())?;
+    moves.push(ArchivedFileMove {
+        from: md_path.to_path_buf(),
+        to: dest_md,
+    });
 
     if with_audio {
         for path in audio_artifacts.iter().filter(|path| path.exists()) {
@@ -8266,10 +8305,114 @@ fn archive_meeting_artifacts(
                 .ok_or_else(|| format!("missing filename for {}", path.display()))?;
             let dest_audio = archive_dir.join(file_name);
             std::fs::rename(path, &dest_audio).map_err(|e| e.to_string())?;
+            moves.push(ArchivedFileMove {
+                from: path.clone(),
+                to: dest_audio,
+            });
         }
     }
 
+    Ok(moves)
+}
+
+/// Archive a meeting and its audio without a confirmation dialog. Archiving
+/// only moves files into `<output_dir>/archive`, so the desktop app offers
+/// Undo instead of asking first; the returned moves are what Undo reverses.
+#[tauri::command]
+pub fn cmd_archive_meeting(path: String) -> Result<Vec<ArchivedFileMove>, String> {
+    let md_path = PathBuf::from(&path);
+    if !md_path.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    let audio_artifacts = minutes_core::capture::meeting_audio_artifact_paths(&md_path);
+    let archive_dir = Config::load().output_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir).map_err(|e| e.to_string())?;
+    archive_meeting_artifacts(&md_path, &archive_dir, &audio_artifacts, true)
+}
+
+#[tauri::command]
+pub fn cmd_restore_archived_meeting(moves: Vec<ArchivedFileMove>) -> Result<(), String> {
+    let output_dir = Config::load().output_dir;
+    restore_archived_meeting(&output_dir, &moves)
+}
+
+/// Reverse an archive. Every move is checked before any file is touched: the
+/// source must still be in the archive folder, and the destination must be
+/// free and inside the meetings folder, so a stale or forged receipt can
+/// neither overwrite a file nor move one anywhere else.
+fn restore_archived_meeting(output_dir: &Path, moves: &[ArchivedFileMove]) -> Result<(), String> {
+    let output_dir = std::fs::canonicalize(output_dir).map_err(|e| e.to_string())?;
+    let archive_dir = output_dir.join("archive");
+    for item in moves {
+        let archived = std::fs::canonicalize(&item.to)
+            .map_err(|_| format!("{} is no longer in the archive", item.to.display()))?;
+        if archived.parent() != Some(archive_dir.as_path()) {
+            return Err(format!(
+                "{} is not in the archive folder",
+                item.to.display()
+            ));
+        }
+        let original_parent = item
+            .from
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or_else(|| format!("{} no longer exists", item.from.display()))?;
+        if !original_parent.starts_with(&output_dir) || original_parent.starts_with(&archive_dir) {
+            return Err(format!(
+                "{} is outside the meetings folder",
+                item.from.display()
+            ));
+        }
+        if item.from.exists() {
+            return Err(format!("{} already exists", item.from.display()));
+        }
+    }
+    for item in moves {
+        std::fs::rename(&item.to, &item.from).map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Copy a file's path. A menu action is not a user gesture to WebKit, so the
+/// web clipboard API would refuse it; the native clipboard does not.
+#[tauri::command]
+pub fn cmd_copy_path(path: String) -> Result<(), String> {
+    copy_to_clipboard(&path)
+}
+
+/// Show a file selected in Finder (or Explorer). Elsewhere, open its folder.
+#[tauri::command]
+pub fn cmd_reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(target.as_os_str());
+        std::process::Command::new("explorer")
+            .arg(select)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let folder = target.parent().unwrap_or(&target);
+        open_target(&app, &folder.to_string_lossy())
+    }
 }
 
 #[tauri::command]
@@ -8403,10 +8546,16 @@ fn notify_assistant_artifact_focus(
 }
 
 #[tauri::command]
-pub fn cmd_read_text_file(path: String) -> Result<String, String> {
-    let canonical = validate_text_file_path(Path::new(&path))?;
-    let path_str = canonical.to_string_lossy();
-    std::fs::read_to_string(&canonical).map_err(|e| format!("Cannot read {}: {}", path_str, e))
+pub async fn cmd_read_text_file(path: String) -> Result<String, String> {
+    // The open document is re-read on a timer to pick up external edits; a
+    // synchronous command ran that read on the main thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = validate_text_file_path(Path::new(&path))?;
+        let path_str = canonical.to_string_lossy();
+        std::fs::read_to_string(&canonical).map_err(|e| format!("Cannot read {}: {}", path_str, e))
+    })
+    .await
+    .map_err(|e| format!("cmd_read_text_file worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -8456,11 +8605,17 @@ pub fn cmd_recent_artifacts(limit: Option<usize>) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn cmd_list_documents(limit: Option<usize>) -> serde_json::Value {
-    let config = Config::load();
-    let workspace = crate::context::workspace_dir();
-    let views = list_documents_for_roots(&config, &workspace, limit.unwrap_or(200).min(200));
-    serde_json::to_value(views).unwrap_or_else(|_| serde_json::json!([]))
+// Async: the Documents view refreshes every 4 s, and each listing stats
+// every candidate file.
+pub async fn cmd_list_documents(limit: Option<usize>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = Config::load();
+        let workspace = crate::context::workspace_dir();
+        let views = list_documents_for_roots(&config, &workspace, limit.unwrap_or(200).min(200));
+        serde_json::to_value(views).unwrap_or_else(|_| serde_json::json!([]))
+    })
+    .await
+    .map_err(|e| format!("cmd_list_documents worker failed: {e}"))
 }
 
 #[tauri::command]
@@ -9139,13 +9294,20 @@ pub fn cmd_retry_recovery(
 // Corpus-wide reads run on the blocking pool: a sync Tauri command runs on
 // the main thread and freezes the window until every file read finishes.
 #[tauri::command]
-pub async fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
-    tauri::async_runtime::spawn_blocking(move || cmd_get_meeting_detail_blocking(path))
+/// `include_related: false` skips the cross-meeting lookups (person profiles
+/// and topic research, each a full authorized corpus pass), so the view can
+/// show the meeting at once and fetch related context in a second call.
+pub async fn cmd_get_meeting_detail(
+    path: String,
+    include_related: Option<bool>,
+) -> Result<MeetingDetail, String> {
+    let include_related = include_related.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || meeting_detail(path, include_related))
         .await
         .map_err(|e| format!("cmd_get_meeting_detail worker failed: {e}"))?
 }
 
-pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, String> {
+fn meeting_detail(path: String, include_related: bool) -> Result<MeetingDetail, String> {
     let config = Config::load();
     let meeting_path = std::path::PathBuf::from(&path);
     minutes_core::notes::validate_meeting_path(&meeting_path, &config.output_dir)?;
@@ -9217,7 +9379,17 @@ pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, St
         })
         .collect();
 
-    let related = build_related_context(&config, &meeting_path, &frontmatter);
+    let related = if include_related {
+        build_related_context(&config, &meeting_path, &frontmatter)
+    } else {
+        RelatedContextView {
+            related_people: related_people_from(&frontmatter),
+            related_topics: related_topics_from(&frontmatter),
+            related_meetings: Vec::new(),
+            related_commitments: Vec::new(),
+            adjacent_artifacts: Vec::new(),
+        }
+    };
 
     let capture_is_none = matches!(
         frontmatter.capture,
@@ -9232,7 +9404,11 @@ pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, St
         status,
         context: frontmatter.context,
         attendees: frontmatter.attendees,
-        calendar_event: frontmatter.calendar_event,
+        // Older files stored the free/busy placeholder ("Busy") as the event.
+        calendar_event: frontmatter
+            .calendar_event
+            .as_deref()
+            .and_then(minutes_core::pipeline::meaningful_calendar_title),
         action_items,
         decisions,
         related_people: related.related_people,
@@ -14868,6 +15044,7 @@ mod tests {
         commitments: &[&str],
     ) -> String {
         let summary = minutes_core::summarize::Summary {
+            title: None,
             text: String::new(),
             decisions: Vec::new(),
             action_items: Vec::new(),
@@ -18122,6 +18299,54 @@ mod tests {
     }
 
     #[test]
+    fn restore_archived_meeting_puts_every_file_back() {
+        let dir = TempDir::new().unwrap();
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let md = dir.path().join("2026-04-01-undo.md");
+        std::fs::write(&md, "---\ntitle: Undo\n---\n").unwrap();
+        let artifacts = minutes_core::capture::meeting_audio_artifact_paths(&md);
+        for path in &artifacts {
+            std::fs::write(path, "artifact").unwrap();
+        }
+
+        let moves = archive_meeting_artifacts(&md, &archive_dir, &artifacts, true).unwrap();
+        assert_eq!(moves.len(), 1 + artifacts.len());
+        restore_archived_meeting(dir.path(), &moves).unwrap();
+
+        assert!(md.exists());
+        for path in &artifacts {
+            assert!(path.exists(), "{} should be restored", path.display());
+        }
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn restore_archived_meeting_refuses_to_overwrite_or_escape() {
+        let dir = TempDir::new().unwrap();
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let md = dir.path().join("2026-04-01-taken.md");
+        std::fs::write(&md, "original").unwrap();
+        let moves = archive_meeting_artifacts(&md, &archive_dir, &[], false).unwrap();
+
+        // A new file now occupies the original path: Undo must not clobber it.
+        std::fs::write(&md, "newer").unwrap();
+        assert!(restore_archived_meeting(dir.path(), &moves).is_err());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "newer");
+        std::fs::remove_file(&md).unwrap();
+
+        // A receipt pointing outside the meetings folder is rejected.
+        let elsewhere = TempDir::new().unwrap();
+        let forged = vec![ArchivedFileMove {
+            from: elsewhere.path().join("escaped.md"),
+            to: moves[0].to.clone(),
+        }];
+        assert!(restore_archived_meeting(dir.path(), &forged).is_err());
+        assert!(moves[0].to.exists());
+    }
+
+    #[test]
     fn wait_for_path_removal_returns_false_after_timeout() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("still-there.pid");
@@ -20399,9 +20624,7 @@ mod tests {
             )
             .unwrap();
 
-            let detail =
-                cmd_get_meeting_detail_blocking(meeting_path.to_string_lossy().to_string())
-                    .unwrap();
+            let detail = meeting_detail(meeting_path.to_string_lossy().to_string(), true).unwrap();
 
             let alex = detail
                 .speaker_map
@@ -22358,7 +22581,10 @@ pub fn cmd_stop_live_transcript(state: tauri::State<AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::Value {
+// Async: polled with capture status, off the main thread.
+pub async fn cmd_live_transcript_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let in_app_active = state.live_transcript_active.load(Ordering::Relaxed);
     let status = minutes_core::live_transcript::session_status();
     let audio_level = if in_app_active {
@@ -22374,7 +22600,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         &minutes_core::copilot::current_window_environment(),
         Config::load().privacy.hide_from_screen_share,
     );
-    serde_json::json!({
+    Ok(serde_json::json!({
         "active": in_app_active || status.active,
         "line_count": status.line_count,
         "duration_secs": status.duration_secs,
@@ -22383,7 +22609,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         "source": status.source,
         "diagnostic": status.diagnostic,
         "copilotWindowContract": copilot_window_contract,
-    })
+    }))
 }
 
 /// Update the assistant instruction files to mention (or un-mention)

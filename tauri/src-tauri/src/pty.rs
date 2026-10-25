@@ -25,6 +25,15 @@ fn bundled_cli_directory(executable: &std::path::Path) -> Option<PathBuf> {
 /// bounded probe that must describe that exact session. GUI apps on macOS get
 /// a stripped PATH, so probing with the ambient process environment can report
 /// "not authenticated" even while the PTY can launch the same agent normally.
+/// Session-identity variables a parent Claude Code process sets for its own
+/// children. They describe that parent, never the assistant Minutes starts.
+const INHERITED_SESSION_MARKERS: [&str; 4] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+];
+
 pub fn assistant_process_environment() -> Vec<(String, String)> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let mut path_dirs: Vec<String> = vec![
@@ -202,6 +211,13 @@ impl PtyManager {
 
         for (name, value) in assistant_process_environment() {
             cmd.env(name, value);
+        }
+        // Minutes launched from inside a Claude Code session (an agent running
+        // the dev installer, or `open` from its shell) inherits that session's
+        // markers, and the assistant started here then believes it is a child
+        // session and turns off transcript saving. It is a fresh session.
+        for name in INHERITED_SESSION_MARKERS {
+            cmd.env_remove(name);
         }
         // Identify the host the way real terminals do. Codex's terminal
         // detection keys on TERM_PROGRAM (Ghostty, iTerm, Warp, kitty, ...)
