@@ -239,11 +239,27 @@ fn policy_verified_result(
     Some((result, is_restricted))
 }
 
+#[cfg(test)]
 fn retain_policy_verified_results(
     results: &mut Vec<SearchResult>,
     filters: &SearchFilters,
     query: &str,
     revision: &StableActiveCorpusRevision,
+) -> Result<(), SearchError> {
+    retain_policy_verified_ranked_results(results, filters, query, revision, &[])
+}
+
+/// `relaxed` names the leave-one-term-out queries some candidates matched
+/// through. Those rank below meetings that matched every term, except that a
+/// title match (tier 2+) still outranks words scattered through a transcript:
+/// "planning chaos desktop" should find *Planning Chaos Harnesses* above a
+/// call that happens to mention all three words.
+fn retain_policy_verified_ranked_results(
+    results: &mut Vec<SearchResult>,
+    filters: &SearchFilters,
+    query: &str,
+    revision: &StableActiveCorpusRevision,
+    relaxed: &[String],
 ) -> Result<(), SearchError> {
     let candidates = std::mem::take(results);
     let mut ranked = Vec::new();
@@ -257,18 +273,40 @@ fn retain_policy_verified_results(
         if let Some((result, _)) = policy_verified_result(result, &snapshot, filters, query) {
             let (_, body) = split_frontmatter(&snapshot.content);
             let ranked_query = result.matched_via_alias.as_deref().unwrap_or(query);
-            let score =
-                crate::retrieval::lexical_score(&result.title, body, ranked_query).unwrap_or(0.0);
-            let tier = crate::retrieval::lexical_tier(&result.title, body, ranked_query);
-            ranked.push((tier, score, result));
+            let complete = !result
+                .matched_via_alias
+                .as_ref()
+                .is_some_and(|alias| relaxed.contains(alias));
+            // A relaxed match ranks by the best leave-one-out query it
+            // satisfies, not whichever one found it first.
+            let rank_queries: Vec<&str> = if complete {
+                vec![ranked_query]
+            } else {
+                relaxed.iter().map(String::as_str).collect()
+            };
+            let (tier, score) = rank_queries
+                .into_iter()
+                .filter_map(|candidate| {
+                    let score = crate::retrieval::lexical_score(&result.title, body, candidate)
+                        .or((candidate == ranked_query).then_some(0.0))?;
+                    Some((
+                        crate::retrieval::lexical_tier(&result.title, body, candidate),
+                        score,
+                    ))
+                })
+                .max_by(|(a_tier, a_score), (b_tier, b_score)| {
+                    a_tier.cmp(b_tier).then_with(|| a_score.total_cmp(b_score))
+                })
+                .unwrap_or((0, 0.0));
+            ranked.push(((tier >= 2, complete, tier), score, result));
         }
     }
     // Empty-query listing retains its existing normal/restricted grouping.
     // Relevance ordering applies only to an actual text query.
     if !query.trim().is_empty() {
-        ranked.sort_by(|(a_tier, a_score, a), (b_tier, b_score, b)| {
-            b_tier
-                .cmp(a_tier)
+        ranked.sort_by(|(a_rank, a_score, a), (b_rank, b_score, b)| {
+            b_rank
+                .cmp(a_rank)
                 .then_with(|| b_score.total_cmp(a_score))
                 .then_with(|| {
                     let epoch = |value: &str| {
@@ -2033,32 +2071,99 @@ fn search_with_mode_and_vocabulary_once(
         );
     }
 
+    // Stopwords are optional ("planning a ch"); when nothing matches every
+    // remaining term, retry leaving one term out, through the same per-alias
+    // live gate the vocabulary expansions use.
+    let query = &crate::retrieval::content_query(query);
     let expansions = vocabulary_search_expansions(query, vocabulary_override);
     if expansions.len() <= 1 {
-        let search_started = std::time::Instant::now();
-        let mut results = index.search(query, filters, None)?;
-        if filters.include_restricted {
-            results
-                .extend(index.search_restricted_live_for_active_corpus(query, filters, revision)?);
-        }
-        let search_duration = search_started.elapsed();
-        // Normal and explicit-override restricted candidates pass through one
-        // identical live-snapshot, filter, and exact-FTS authorization gate.
-        let policy_started = std::time::Instant::now();
-        retain_policy_verified_results(&mut results, filters, query, revision)?;
-        let policy_duration = policy_started.elapsed();
-        tracing::debug!(
-            list_mode = query.trim().is_empty(),
-            open_duration_ms = open_duration.as_millis() as u64,
-            sync_duration_ms = sync_duration.as_millis() as u64,
-            search_duration_ms = search_duration.as_millis() as u64,
-            policy_duration_ms = policy_duration.as_millis() as u64,
-            result_count = results.len(),
-            "meeting search phases"
+        return search_single_query(
+            query,
+            filters,
+            &index,
+            revision,
+            open_duration,
+            sync_duration,
         );
+    }
+    let results = search_expansion_set(query, expansions, filters, &index, revision, false)?;
+    if !results.is_empty() {
         return Ok(results);
     }
+    let relaxed = crate::retrieval::relaxed_queries(query);
+    if relaxed.is_empty() {
+        return Ok(results);
+    }
+    search_expansion_set(query, relaxed, filters, &index, revision, true)
+}
 
+/// Below this many full matches, leave-one-term-out matches fill in after
+/// them (one misremembered word should not hide the meeting you meant).
+const RELAXED_FILL_BELOW: usize = 10;
+
+fn search_single_query(
+    query: &str,
+    filters: &SearchFilters,
+    index: &crate::search_index::SearchIndex,
+    revision: &StableActiveCorpusRevision,
+    open_duration: std::time::Duration,
+    sync_duration: std::time::Duration,
+) -> Result<Vec<SearchResult>, SearchError> {
+    let search_started = std::time::Instant::now();
+    let mut results = index.search(query, filters, None)?;
+    let relaxed = if results.len() < RELAXED_FILL_BELOW {
+        crate::retrieval::relaxed_queries(query)
+    } else {
+        Vec::new()
+    };
+    let mut seen_paths: std::collections::HashSet<_> =
+        results.iter().map(|result| result.path.clone()).collect();
+    for relaxed_query in &relaxed {
+        for mut result in index.search(relaxed_query, filters, None)? {
+            if seen_paths.insert(result.path.clone()) {
+                result.matched_via_alias = Some(relaxed_query.clone());
+                results.push(result);
+            }
+        }
+    }
+    if filters.include_restricted {
+        results.extend(index.search_restricted_live_for_active_corpus(query, filters, revision)?);
+    }
+    let search_duration = search_started.elapsed();
+    // Normal and explicit-override restricted candidates pass through one
+    // identical live-snapshot, filter, and exact-FTS authorization gate
+    // (relaxed candidates against the relaxed query they matched).
+    let policy_started = std::time::Instant::now();
+    retain_policy_verified_ranked_results(&mut results, filters, query, revision, &relaxed)?;
+    let policy_duration = policy_started.elapsed();
+    tracing::debug!(
+        list_mode = query.trim().is_empty(),
+        open_duration_ms = open_duration.as_millis() as u64,
+        sync_duration_ms = sync_duration.as_millis() as u64,
+        search_duration_ms = search_duration.as_millis() as u64,
+        policy_duration_ms = policy_duration.as_millis() as u64,
+        result_count = results.len(),
+        "meeting search phases"
+    );
+    Ok(results)
+}
+
+/// Search several literal queries (vocabulary aliases or relaxed fallbacks)
+/// and merge them; each result is verified and ranked against the query that
+/// matched it.
+fn search_expansion_set(
+    query: &str,
+    expansions: Vec<String>,
+    filters: &SearchFilters,
+    index: &crate::search_index::SearchIndex,
+    revision: &StableActiveCorpusRevision,
+    relaxed: bool,
+) -> Result<Vec<SearchResult>, SearchError> {
+    let relaxed_queries = if relaxed {
+        expansions.clone()
+    } else {
+        Vec::new()
+    };
     let original_key = search_expansion_key(query);
     let mut merged = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
@@ -2110,7 +2215,7 @@ fn search_with_mode_and_vocabulary_once(
         }
     }
 
-    retain_policy_verified_results(&mut merged, filters, query, revision)?;
+    retain_policy_verified_ranked_results(&mut merged, filters, query, revision, &relaxed_queries)?;
     Ok(merged)
 }
 
@@ -3228,6 +3333,76 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matched_via_alias.as_deref(), Some("Automatic"));
+    }
+
+    #[test]
+    fn search_ignores_stopwords_and_falls_back_when_one_word_is_off() {
+        let _guard = crate::test_support::home_env_lock();
+        let home = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+        }
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "chaos.md",
+            "---\ntitle: Planning Chaos Harnesses for Codex\ndate: 2026-10-24\ntype: meeting\n---\n\nShort call.",
+        );
+        create_test_file(
+            dir.path(),
+            "chatty.md",
+            "---\ntitle: Weekly Check-in\ndate: 2026-03-19\ntype: meeting\n---\n\nA chat about a plan, a change, a check, planning a chart and a channel.",
+        );
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let filters = SearchFilters::default();
+        let titles = |query: &str| -> Vec<String> {
+            search_with_mode(query, &config, &filters, SyncMode::Force)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.title)
+                .collect()
+        };
+
+        // "a" is optional, so the title match wins instead of the transcript
+        // with the most a/ch* words.
+        assert_eq!(
+            titles("planning a ch").first().map(String::as_str),
+            Some("Planning Chaos Harnesses for Codex")
+        );
+        // One word that is nowhere in the corpus no longer means no results.
+        assert_eq!(
+            titles("planning chaos desktop"),
+            vec!["Planning Chaos Harnesses for Codex"]
+        );
+        // A title that matches all but one word still outranks a transcript
+        // that happens to contain every word.
+        create_test_file(
+            dir.path(),
+            "mentions.md",
+            "---\ntitle: Desktop Release Review\ndate: 2026-05-02\ntype: meeting\n---\n\nWe kept planning around the chaos of the desktop build.",
+        );
+        assert_eq!(
+            titles("planning chaos desktop"),
+            vec![
+                "Planning Chaos Harnesses for Codex",
+                "Desktop Release Review"
+            ]
+        );
+        // Plurals count for title ranking, and a relaxed match ranks by its
+        // best leave-one-out query ("harness" vs the *Harnesses* title).
+        assert_eq!(
+            titles("planning chaos harness desktop")
+                .first()
+                .map(String::as_str),
+            Some("Planning Chaos Harnesses for Codex")
+        );
+        // A nonsense word is left out; two of them still find nothing.
+        assert_eq!(titles("zzqx desktop"), vec!["Desktop Release Review"]);
+        assert!(titles("zzqx qqzx").is_empty());
     }
 
     #[test]

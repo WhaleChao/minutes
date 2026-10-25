@@ -133,7 +133,7 @@ pub fn lexical_tier(title: &str, body: &str, query: &str) -> u8 {
     if wanted.iter().enumerate().all(|(index, term)| {
         title_tokens
             .iter()
-            .any(|token| token_matches(token, term, index == last))
+            .any(|token| tier_token_matches(token, term, index == last))
     }) {
         return 2;
     }
@@ -153,8 +153,63 @@ fn contains_phrase(tokens: &[String], wanted: &[String]) -> bool {
             .iter()
             .zip(wanted)
             .enumerate()
-            .all(|(index, (token, term))| token_matches(token, term, index == last))
+            .all(|(index, (token, term))| tier_token_matches(token, term, index == last))
     })
+}
+
+/// Ranking-only leniency: "harness" ranks a *Harnesses* title like the full
+/// text match does (the FTS projection stems; the literal match does not).
+fn tier_token_matches(token: &str, wanted: &str, final_token: bool) -> bool {
+    token_matches(token, wanted, final_token)
+        || token
+            .strip_prefix(wanted)
+            .is_some_and(|rest| rest == "s" || rest == "es")
+}
+
+/// Function words that make a typed query fail or rank by noise ("planning a
+/// ch" required the word "a"). Folded forms; see [`content_query`].
+pub const SEARCH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or",
+    "our", "the", "this", "that", "to", "was", "with", "my", "your",
+];
+
+/// The query a person means: stopwords are dropped except the final token
+/// (still being typed, and a prefix) and except when nothing else would remain.
+/// Returns folded tokens joined by spaces, which tokenize back identically.
+pub fn content_query(query: &str) -> String {
+    let tokens = search_tokens(query);
+    let last = tokens.len().saturating_sub(1);
+    let kept: Vec<&str> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(index, token)| *index == last || !SEARCH_STOPWORDS.contains(&token.as_str()))
+        .map(|(_, token)| token.as_str())
+        .collect();
+    if kept.iter().all(|token| SEARCH_STOPWORDS.contains(token)) {
+        return tokens.join(" ");
+    }
+    kept.join(" ")
+}
+
+/// Fallback queries when nothing matches every term: each leaves out one
+/// term, so one wrong or misremembered word no longer means zero results.
+/// The final token stays a prefix only when it is still last.
+pub fn relaxed_queries(query: &str) -> Vec<String> {
+    let tokens = search_tokens(query);
+    if !(2..=8).contains(&tokens.len()) {
+        return Vec::new();
+    }
+    (0..tokens.len())
+        .map(|skip| {
+            tokens
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != skip)
+                .map(|(_, token)| token.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
 }
 
 /// Select a bounded original-text excerpt only after the full match succeeds.
@@ -235,6 +290,41 @@ mod tests {
         assert_eq!(lexical_tier("Malso let me", "", query), 0);
         // Final term is a prefix, like the match itself.
         assert_eq!(lexical_tier("Also let media go", "", query), 3);
+    }
+
+    #[test]
+    fn plural_title_words_rank_like_the_stemmed_full_text_match() {
+        let title = "Planning Chaos Harnesses for Codex";
+        assert_eq!(lexical_tier(title, "", "chaos harness codex"), 2);
+        assert_eq!(lexical_tier(title, "", "chaos harness for"), 3);
+        assert_eq!(lexical_tier("Harnessing Chaos", "", "harness chaos"), 0);
+    }
+
+    #[test]
+    fn stopwords_are_optional_unless_they_are_all_there_is() {
+        // Reported: "planning a ch" while typing "Planning Chaos Harnesses".
+        assert_eq!(content_query("Planning a ch"), "planning ch");
+        let title = "Planning Chaos Harnesses for Codex and Claude Code";
+        assert_eq!(lexical_tier(title, "", &content_query("planning a ch")), 3);
+        assert_eq!(
+            lexical_tier(title, "", &content_query("planning a chaos harness")),
+            3
+        );
+        // The final token is still being typed, so it stays (a prefix).
+        assert_eq!(content_query("pricing for"), "pricing for");
+        assert_eq!(content_query("The Office"), "office");
+        assert_eq!(content_query("to be or"), "to be or");
+        assert_eq!(content_query("a"), "a");
+    }
+
+    #[test]
+    fn relaxed_queries_leave_out_one_term_each() {
+        assert_eq!(
+            relaxed_queries("planning chaos desktop"),
+            vec!["chaos desktop", "planning desktop", "planning chaos"]
+        );
+        assert!(relaxed_queries("planning").is_empty());
+        assert!(relaxed_queries("a b c d e f g h i").is_empty());
     }
 
     #[test]
