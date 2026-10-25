@@ -1195,6 +1195,62 @@ fn run_with_partials_internal(
     }
 }
 
+/// Chunks the relay holds while the live loop is busy transcribing: about two
+/// minutes at 100 ms per chunk (~8 MB). The capture channel itself holds only
+/// ~6.4 s, so without the relay a slow utterance (a stalled engine, Whisper on
+/// a slow Mac, a model loading for fallback) drops audio from the saved WAV as
+/// well as from the transcript.
+const LIVE_AUDIO_RELAY_CHUNKS: usize = 1_200;
+
+/// Drain `source` on its own thread into a larger bounded queue, so capture
+/// never waits on transcription. The live loop still writes the WAV and runs
+/// VAD in order, only later. Disconnection passes through once the queue is
+/// drained, which keeps the loop's reconnect handling unchanged.
+fn relay_live_audio(
+    source: crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+) -> crossbeam_channel::Receiver<crate::streaming::AudioChunk> {
+    relay_live_audio_with_capacity(source, LIVE_AUDIO_RELAY_CHUNKS)
+}
+
+fn relay_live_audio_with_capacity(
+    source: crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+    capacity: usize,
+) -> crossbeam_channel::Receiver<crate::streaming::AudioChunk> {
+    let (tx, rx) = crossbeam_channel::bounded(capacity);
+    let relay_source = source.clone();
+    let spawned = std::thread::Builder::new()
+        .name("live-audio-relay".into())
+        .spawn(move || {
+            let mut dropped: u64 = 0;
+            for chunk in relay_source.iter() {
+                match tx.try_send(chunk) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        // Over two minutes behind: drop rather than stall the
+                        // capture channel, and say so.
+                        dropped += 1;
+                        if dropped == 1 || dropped.is_multiple_of(100) {
+                            persist_sidecar_log(
+                                "warn",
+                                "live_audio_relay_overflow",
+                                "live transcript fell more than two minutes behind capture; dropping audio",
+                                serde_json::json!({ "dropped_chunks": dropped }),
+                            );
+                        }
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+                }
+            }
+        });
+    match spawned {
+        Ok(_) => rx,
+        Err(error) => {
+            tracing::warn!(error = %error, "live audio relay thread failed to start; reading capture directly");
+            source
+        }
+    }
+}
+
 #[cfg(feature = "whisper")]
 fn run_inner(
     stop_flag: Arc<AtomicBool>,
@@ -1215,6 +1271,7 @@ fn run_inner(
     }
 
     let mut stream = AudioStream::start(device_override)?;
+    let mut audio_rx = relay_live_audio(stream.receiver.clone());
     tracing::info!(device = %stream.device_name, "live transcript audio stream started");
     // The desktop app installs no tracing subscriber, so record the input in
     // the shared log too. Standalone Live captures this one device only; when
@@ -1485,6 +1542,7 @@ fn run_inner(
                     );
                     device_monitor.update_device(&new_stream.device_name);
                     stream = new_stream;
+                    audio_rx = relay_live_audio(stream.receiver.clone());
                     // Discard any partial utterance — mic dropped mid-speech,
                     // pre-reconnect audio is unreliable. Splicing pre+post
                     // reconnect samples into one JSONL line would be silent
@@ -1552,10 +1610,7 @@ fn run_inner(
         }
 
         // Receive audio chunk (100ms timeout for stop checks)
-        let chunk = match stream
-            .receiver
-            .recv_timeout(std::time::Duration::from_millis(100))
-        {
+        let chunk = match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(chunk) => chunk,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -1570,6 +1625,7 @@ fn run_inner(
                         );
                         device_monitor.update_device(&new_stream.device_name);
                         stream = new_stream;
+                        audio_rx = relay_live_audio(stream.receiver.clone());
                         // Discard partial utterance — see comment above the
                         // device-change reconnect branch for rationale.
                         if utterance_samples > 0 {
@@ -4144,6 +4200,52 @@ mod tests {
     #[cfg(not(feature = "parakeet"))]
     use super::PARAKEET_LIVE_SCOPE_WARNING;
     use super::*;
+
+    fn test_chunk(index: u64) -> crate::streaming::AudioChunk {
+        crate::streaming::AudioChunk {
+            samples: vec![0.0; 1_600],
+            rms: 0.0,
+            timestamp: std::time::Instant::now(),
+            index,
+            source: crate::streaming::SourceRole::Default,
+        }
+    }
+
+    #[test]
+    fn a_stalled_live_loop_loses_no_audio_behind_the_relay() {
+        // Capture sends with try_send into a 64-chunk channel and drops when it
+        // is full. The relay must keep draining it while the loop is stalled.
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(64);
+        let relayed = relay_live_audio(capture_rx);
+        let mut dropped_at_capture = 0;
+        for index in 0..500 {
+            if capture_tx.try_send(test_chunk(index)).is_err() {
+                dropped_at_capture += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(capture_tx);
+        // Only now does the "stalled" loop start reading.
+        let received: Vec<u64> = relayed.iter().map(|chunk| chunk.index).collect();
+        assert_eq!(dropped_at_capture, 0);
+        assert_eq!(received, (0..500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_relay_passes_a_capture_disconnect_through_after_draining() {
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(64);
+        let relayed = relay_live_audio(capture_rx);
+        capture_tx.send(test_chunk(7)).unwrap();
+        drop(capture_tx);
+        let first = relayed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(first.index, 7);
+        assert!(matches!(
+            relayed.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
 
     #[test]
     fn a_stalled_apple_speech_call_costs_at_most_its_deadline() {
