@@ -1214,15 +1214,20 @@ fn relay_live_audio(
 
 /// Hand every chunk still queued in the relay to `sink` (the WAV writer), so a
 /// stop or a device change never discards audio that capture already took.
-/// `until_disconnected` waits for a closed capture stream's relay to finish
-/// forwarding; otherwise only what is queued right now is taken.
+/// Callers close the capture stream first; `until_disconnected` then waits for
+/// its relay to finish forwarding, otherwise only what is queued now is taken.
+/// The relay's capacity plus the capture channel bounds the work, and a
+/// deadline keeps a slow disk from holding the stop open indefinitely.
 fn drain_relay_backlog(
     audio_rx: &crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
     until_disconnected: bool,
     mut sink: impl FnMut(&[f32]),
 ) -> usize {
+    const MAX_CHUNKS: usize = LIVE_AUDIO_RELAY_CHUNKS + 256;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
     let mut drained = 0;
-    loop {
+    while drained < MAX_CHUNKS && started.elapsed() < DEADLINE {
         let next = if until_disconnected {
             audio_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
@@ -1485,8 +1490,10 @@ fn run_inner(
         writer.maybe_write_heartbeat();
         // Check stop flag
         if stop_flag.load(Ordering::Relaxed) {
-            // Audio the relay still holds belongs in the WAV the stop preserves.
-            drain_relay_backlog(&audio_rx, false, |samples| writer.write_audio(samples));
+            // Stop capture first so the backlog is finite, then put everything
+            // capture already took into the WAV the stop preserves.
+            drop(stream);
+            drain_relay_backlog(&audio_rx, true, |samples| writer.write_audio(samples));
             // Finalize any in-progress utterance
             if utterance_samples > 0 {
                 let line_count_before = writer.line_count;
@@ -1527,7 +1534,8 @@ fn run_inner(
 
         // Check for stop sentinel (from `minutes stop`)
         if pid::check_and_clear_sentinel() {
-            drain_relay_backlog(&audio_rx, false, |samples| writer.write_audio(samples));
+            drop(stream);
+            drain_relay_backlog(&audio_rx, true, |samples| writer.write_audio(samples));
             if utterance_samples > 0 {
                 let line_count_before = writer.line_count;
                 #[cfg(feature = "parakeet")]
@@ -4277,7 +4285,7 @@ mod tests {
         for index in 0..40 {
             capture_tx.send(test_chunk(index)).unwrap();
         }
-        // Stop: take what is queued now, without waiting on a live stream.
+        // Not-yet-closed capture: take what is queued now.
         std::thread::sleep(std::time::Duration::from_millis(100));
         let mut written = 0;
         assert_eq!(
@@ -4286,8 +4294,8 @@ mod tests {
         );
         assert_eq!(written, 40 * 1_600);
 
-        // Device change: the old stream closes, then everything it captured is
-        // written before the relay reports the disconnect.
+        // Stop and device change both close capture first, then everything it
+        // captured is written before the relay reports the disconnect.
         for index in 40..60 {
             capture_tx.send(test_chunk(index)).unwrap();
         }
