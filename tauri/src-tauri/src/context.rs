@@ -290,10 +290,36 @@ pub fn generate_meeting_context(meeting_path: &Path, config: &Config) -> Result<
     if let Some(ref ctx) = fm.context {
         md.push_str(&format!("- **Context**: {}\n", ctx));
     }
-    if let Some(ref cal) = fm.calendar_event {
+    // A free/busy placeholder ("Busy") names no meeting; older files stored it.
+    if let Some(cal) = fm
+        .calendar_event
+        .as_deref()
+        .and_then(minutes_core::pipeline::meaningful_calendar_title)
+    {
         md.push_str(&format!("- **Calendar**: {}\n", cal));
     }
     md.push('\n');
+
+    // Say up front when processing or capture was degraded (for example a
+    // single-mic room recording whose speakers could not be separated), so the
+    // agent neither trusts speaker labels nor spends calls working out why
+    // owners are missing.
+    let capture_warnings = fm
+        .recording_health
+        .as_ref()
+        .map(|health| health.capture_warnings.as_slice())
+        .unwrap_or_default();
+    if !fm.processing_warnings.is_empty() || !capture_warnings.is_empty() {
+        md.push_str("## Processing Notes\n");
+        for warning in &fm.processing_warnings {
+            let detail = warning.message.as_deref().unwrap_or(&warning.reason);
+            md.push_str(&format!("- {}: {}\n", warning.step, detail));
+        }
+        for warning in capture_warnings {
+            md.push_str(&format!("- capture: {}\n", warning.message));
+        }
+        md.push('\n');
+    }
 
     // Decisions
     if !fm.decisions.is_empty() {
@@ -769,6 +795,21 @@ mod tests {
         assert_eq!(line, header.lines().count() + 1 + 1 + kept_last);
         assert!(source.lines().nth(line - 1).unwrap().starts_with("[0:01]"));
         assert!(!md.contains("The complete meeting transcript follows"));
+    }
+
+    #[test]
+    fn meeting_context_surfaces_degraded_processing_and_hides_busy() {
+        let (corpus, config) = test_config();
+        let path = corpus.path().join("2026-10-24-room.md");
+        std::fs::write(
+            &path,
+            "---\ntitle: Room chat\ntype: meeting\ndate: 2026-10-24T16:29:00-04:00\nduration: 20m\nstatus: degraded\ncalendar_event: Busy\nprocessing_warnings:\n- step: attribution\n  reason: diarization_collapsed\n  message: Attribution is unreliable, so owners were withheld.\n---\n## Transcript\n[MICROPHONE 0:00] hello\n",
+        )
+        .unwrap();
+        let md = generate_meeting_context(&path, &config).unwrap();
+        assert!(md.contains("## Processing Notes"));
+        assert!(md.contains("- attribution: Attribution is unreliable, so owners were withheld."));
+        assert!(!md.contains("**Calendar**"));
     }
 
     #[test]
