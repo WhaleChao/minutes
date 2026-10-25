@@ -2621,6 +2621,17 @@ fn transcribe_utterance_for_sidecar(
 /// problem (#756). The message is rewritten here to name the whole chain and
 /// both ways out, since `backend = "inherit"` sitting directly above `model`
 /// makes inheriting the natural assumption.
+/// Whether the Whisper model that live transcript falls back to is installed.
+/// Quiet counterpart of [`resolve_live_model_path`] for status surfaces: it
+/// neither logs nor warns, it only answers whether a fallback could load.
+pub fn live_whisper_fallback_available(config: &Config) -> bool {
+    if config.live_transcript.model.is_empty() {
+        crate::transcribe::resolve_model_path_for_dictation(config).is_ok()
+    } else {
+        crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config).is_ok()
+    }
+}
+
 fn resolve_live_model_path(config: &Config) -> Result<std::path::PathBuf, MinutesError> {
     if !config.live_transcript.model.is_empty() {
         let resolved =
@@ -2743,11 +2754,14 @@ where
     }
 
     let locale = crate::apple_speech::live_locale_hint(config.transcription.language.as_deref());
+    // Never wait for an asset download here: this runs on the capture
+    // consumer thread, and the audio channel only buffers a few seconds. With
+    // assets missing the worker fails fast and the session falls back.
     let result = transcribe_fn(
         samples,
         locale.as_deref(),
         crate::apple_speech::AppleSpeechMode::Speech,
-        true,
+        false,
     )?;
 
     if let Some(error) = result.error {
@@ -4077,6 +4091,23 @@ mod tests {
     #[cfg(not(feature = "parakeet"))]
     use super::PARAKEET_LIVE_SCOPE_WARNING;
     use super::*;
+
+    #[test]
+    fn live_apple_speech_never_waits_for_an_asset_download() {
+        // The call runs on the capture consumer thread; waiting on an asset
+        // download there would overflow the few seconds the audio channel holds.
+        let mut asked_for_assets = None;
+        let result = transcribe_with_apple_speech_for_live_sidecar_impl(
+            &vec![0.0; APPLE_SPEECH_LIVE_MIN_SAMPLES],
+            &Config::default(),
+            |_, _, _, ensure_assets| {
+                asked_for_assets = Some(ensure_assets);
+                Err(MinutesError::Io(std::io::Error::other("assets missing")))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(asked_for_assets, Some(false));
+    }
     use chrono::Duration as ChronoDuration;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;

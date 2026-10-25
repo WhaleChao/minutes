@@ -8180,7 +8180,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
       if (selectedBackend === 'apple-speech') {
         if (resolvedBackend === 'apple-speech') {
-          return `Standalone live transcript uses Apple Speech (experimental) through Minutes' signed speech worker; no utterance is written to a file. If Apple Speech fails, the session switches to the next engine. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
+          return `Standalone live transcript uses Apple Speech (experimental) through Minutes' signed speech worker, which receives audio in memory rather than through temporary files. The session's own audio is still saved when live_transcript.save_wav is on (the default). If Apple Speech fails, the session switches to the next engine. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
         }
         return `The retained Apple Speech preference cannot receive secure private audio yet, so standalone live transcript resolves to ${backendLabel(resolvedBackend)}. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
       }
