@@ -365,6 +365,7 @@ Call detection keeps one audio-check helper alive between polls and skips audio 
 
 | key | default | meaning |
 |---|---|---|
+| `backend` | empty, meaning inherit `transcription.engine` | Live transcript engine. `"apple-speech"` uses Apple's on-device SpeechAnalyzer for standalone Live mode only, and only in the signed Developer ID desktop app on macOS 26 or later; Settings greys it out elsewhere. If Apple Speech fails or its speech assets are missing, the session falls back to Parakeet or Whisper and logs `live_transcript_apple_fallback`. Live text during a normal recording (the sidecar) does not use it. See `docs/architecture/apple-speech.md`. |
 | `model` | empty, meaning `dictation.model` | Whisper model for live mode. An empty value uses `dictation.model`, **not** `transcription.model`: live transcription is real-time and wants a small fast model, while batch transcription can afford a slower, more accurate one. Set this explicitly to decouple them. |
 | `max_utterance_secs` | `30` | Force-finalize an utterance at this length |
 | `save_wav` | `true` | Save raw WAV so the stopped session can be preserved or processed |
