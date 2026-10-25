@@ -1706,10 +1706,32 @@ pub const fn parakeet_private_audio_transport_supported() -> bool {
 
 /// Whether this exact running app can authenticate the bundled one-purpose
 /// Apple Speech XPC service before sending private utterance bytes.
+///
+/// True only inside a trusted signed Minutes app whose embedded worker
+/// authority binds: Developer ID distribution, the integrity manifest matching
+/// the worker cdhash embedded at build time, and the peer-requirement XPC API.
+/// Source, ad-hoc, and symlinked CLI processes stay false and keep the sealed
+/// Whisper path. Each surface layers its own selection policy on top: today
+/// only standalone live transcript selects Apple Speech
+/// (see [`apple_speech_dictation_selectable`]; batch always resolves to Whisper).
 pub fn apple_speech_private_audio_transport_supported() -> bool {
-    // The service implementation and packaging are present, but product
-    // selection remains fail-closed until the exact reviewed SHA passes the
-    // separately authorized signed-macOS hostile-holder/runtime gate.
+    #[cfg(target_os = "macos")]
+    {
+        crate::apple_speech_worker::signed_worker_authority_available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Whether dictation may send utterances to Apple Speech.
+///
+/// Stays false even when the transport is available. The activation plan
+/// orders surfaces live transcript, then batch, then dictation
+/// (docs/plans/apple-speech-activation-2026-08-10.md), and only live transcript
+/// has been opened so far.
+pub const fn apple_speech_dictation_selectable() -> bool {
     false
 }
 

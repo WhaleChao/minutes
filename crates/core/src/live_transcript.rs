@@ -142,11 +142,18 @@ fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
         return ("whisper", None);
     }
     if backend.eq_ignore_ascii_case("apple-speech") {
+        let reason = if live_supports_apple_speech() {
+            "Apple Speech runs only in standalone live transcript".to_string()
+        } else {
+            format!(
+                "Apple Speech {}",
+                crate::pipeline::apple_speech_unavailable_reason()
+            )
+        };
         return (
             "whisper",
             Some(format!(
-                "live_transcript.backend retained apple-speech, but Apple Speech {}; using sealed local Whisper for recording sidecar",
-                crate::pipeline::apple_speech_unavailable_reason()
+                "live_transcript.backend retained apple-speech, but {reason}; using sealed local Whisper for recording sidecar"
             )),
         );
     }
@@ -1238,7 +1245,6 @@ fn run_inner(
     // Only now create the writer (which truncates the JSONL and WAV files)
     let mut writer =
         LiveTranscriptWriter::new(config, context_session_id, TranscriptSource::Standalone)?;
-    writer.enable_shadow(config);
     writer.mark_healthy();
     crate::events::append_event(crate::events::recording_started_event(
         writer.session_id.clone(),
@@ -1259,8 +1265,34 @@ fn run_inner(
     #[cfg(target_os = "macos")]
     let mut apple_live_enabled =
         standalone_backend.eq_ignore_ascii_case("apple-speech") && live_supports_apple_speech();
+    // A failed Apple Speech utterance is re-transcribed by Whisper. Without
+    // that model the utterance would have nowhere to go, so a hand-edited or
+    // retained preference does not enable Apple Speech either.
+    #[cfg(target_os = "macos")]
+    if apple_live_enabled && !live_whisper_fallback_available(config) {
+        apple_live_enabled = false;
+        emit_apple_speech_fallback_warning(
+            "standalone",
+            "the Whisper fallback model for live transcript is not installed",
+        );
+    }
     #[cfg(not(target_os = "macos"))]
     let mut apple_live_enabled = false;
+
+    // Shadow scores Apple Speech against the Whisper line that ships. When Apple
+    // Speech is itself the shipped live engine there is no Whisper line to score,
+    // so the session records why it is not measuring instead of arming a runner
+    // that would never be fed.
+    if apple_live_enabled {
+        if crate::apple_speech_shadow::shadow_enabled(config) {
+            crate::apple_speech_shadow::log_shadow_disabled(
+                "standalone",
+                "apple-speech is the shipped live engine for this session",
+            );
+        }
+    } else {
+        writer.enable_shadow(config);
+    }
 
     // Parakeet engine dispatch — mirrors run_sidecar_inner_mpsc. When the user
     // configures `engine = "parakeet"` and the parakeet feature is compiled in,
@@ -1295,6 +1327,20 @@ fn run_inner(
     }
     if apple_live_enabled {
         eprintln!("[minutes] Apple Speech live transcript enabled (experimental, standalone only)");
+        // The fallback and scope warnings only record when Apple Speech is NOT
+        // used; this durable line is the positive record that it was.
+        crate::logging::append_log(&serde_json::json!({
+            "ts": Local::now().to_rfc3339(),
+            "level": "info",
+            "step": "live_transcript_backend",
+            "file": "",
+            "message": "standalone live transcript uses apple-speech",
+            "extra": {
+                "backend": "apple-speech",
+                "source": "standalone",
+            }
+        }))
+        .ok();
     }
 
     // Warm the parakeet sidecar at session start so the first utterance doesn't
@@ -2586,6 +2632,17 @@ fn transcribe_utterance_for_sidecar(
 /// problem (#756). The message is rewritten here to name the whole chain and
 /// both ways out, since `backend = "inherit"` sitting directly above `model`
 /// makes inheriting the natural assumption.
+/// Whether the Whisper model that live transcript falls back to is installed.
+/// Quiet counterpart of [`resolve_live_model_path`] for status surfaces: it
+/// neither logs nor warns, it only answers whether a fallback could load.
+pub fn live_whisper_fallback_available(config: &Config) -> bool {
+    if config.live_transcript.model.is_empty() {
+        crate::transcribe::resolve_model_path_for_dictation(config).is_ok()
+    } else {
+        crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config).is_ok()
+    }
+}
+
 fn resolve_live_model_path(config: &Config) -> Result<std::path::PathBuf, MinutesError> {
     if !config.live_transcript.model.is_empty() {
         let resolved =
@@ -2677,16 +2734,58 @@ fn transcribe_with_parakeet_for_live_sidecar(
     }
 }
 
+/// Longest the capture consumer thread waits for one Apple Speech utterance.
+/// The audio channel buffers about 6.4 s. After a timeout the same thread loads
+/// the Whisper fallback and transcribes the utterance, as a Whisper live
+/// session always does, so the wait leaves most of that buffer for it. Apple
+/// Speech normally answers in well under a second.
+#[cfg(all(feature = "whisper", target_os = "macos"))]
+const APPLE_SPEECH_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(all(feature = "whisper", target_os = "macos"))]
 fn transcribe_with_apple_speech_for_live_sidecar(
     samples: &[f32],
     config: &Config,
 ) -> Result<Option<(String, f64)>, MinutesError> {
-    transcribe_with_apple_speech_for_live_sidecar_impl(
-        samples,
-        config,
-        crate::apple_speech_worker::transcribe_samples,
-    )
+    // The worker's own deadline is 180 s. Run the call on its own thread so a
+    // stalled worker costs this session at most the deadline below, then the
+    // caller latches the fallback engine; a late result is discarded.
+    let owned = zeroize::Zeroizing::new(samples.to_vec());
+    let config = config.clone();
+    call_with_deadline(APPLE_SPEECH_LIVE_DEADLINE, move || {
+        transcribe_with_apple_speech_for_live_sidecar_impl(
+            &owned,
+            &config,
+            crate::apple_speech_worker::transcribe_samples,
+        )
+    })
+}
+
+/// Run `call` on its own thread and wait at most `deadline` for it. A call
+/// that overruns keeps running detached; its result is dropped.
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
+fn call_with_deadline<T, F>(deadline: std::time::Duration, call: F) -> Result<T, MinutesError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MinutesError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("apple-speech-live".into())
+        .spawn(move || {
+            let _ = tx.send(call());
+        })
+        .map_err(MinutesError::Io)?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(MinutesError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Apple Speech did not answer within {} ms",
+                deadline.as_millis()
+            ),
+        ))),
+    }
 }
 
 #[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
@@ -2708,11 +2807,14 @@ where
     }
 
     let locale = crate::apple_speech::live_locale_hint(config.transcription.language.as_deref());
+    // Never wait for an asset download here: this runs on the capture
+    // consumer thread, and the audio channel only buffers a few seconds. With
+    // assets missing the worker fails fast and the session falls back.
     let result = transcribe_fn(
         samples,
         locale.as_deref(),
         crate::apple_speech::AppleSpeechMode::Speech,
-        true,
+        false,
     )?;
 
     if let Some(error) = result.error {
@@ -4042,6 +4144,39 @@ mod tests {
     #[cfg(not(feature = "parakeet"))]
     use super::PARAKEET_LIVE_SCOPE_WARNING;
     use super::*;
+
+    #[test]
+    fn a_stalled_apple_speech_call_costs_at_most_its_deadline() {
+        let started = std::time::Instant::now();
+        let result: Result<u8, MinutesError> =
+            call_with_deadline(std::time::Duration::from_millis(100), || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                Ok(1)
+            });
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            call_with_deadline(std::time::Duration::from_secs(5), || Ok(7)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn live_apple_speech_never_waits_for_an_asset_download() {
+        // The call runs on the capture consumer thread; waiting on an asset
+        // download there would overflow the few seconds the audio channel holds.
+        let mut asked_for_assets = None;
+        let result = transcribe_with_apple_speech_for_live_sidecar_impl(
+            &vec![0.0; APPLE_SPEECH_LIVE_MIN_SAMPLES],
+            &Config::default(),
+            |_, _, _, ensure_assets| {
+                asked_for_assets = Some(ensure_assets);
+                Err(MinutesError::Io(std::io::Error::other("assets missing")))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(asked_for_assets, Some(false));
+    }
     use chrono::Duration as ChronoDuration;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;

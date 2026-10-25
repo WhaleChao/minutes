@@ -484,7 +484,7 @@ fn parse_macos_major_version(version: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_major_version() -> Option<u32> {
+pub(crate) fn macos_major_version() -> Option<u32> {
     let output = Command::new("sw_vers")
         .arg("-productVersion")
         .output()

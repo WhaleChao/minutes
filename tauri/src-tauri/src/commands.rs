@@ -654,29 +654,111 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
     minutes_core::transcription_coordinator::parakeet_backend_status(config)
 }
 
+/// Shown while the background capability check is still running.
+const APPLE_SPEECH_RUNTIME_CHECK_PENDING_REASON: &str =
+    "Minutes is still checking whether this Mac can run Apple Speech; reopen Settings in a moment";
+
+/// Shown when the signed transport binds but this Mac's Speech framework
+/// cannot run the transcriber, so the reason is not blamed on the transport.
+const APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON: &str =
+    "the Speech framework on this Mac cannot run the speech transcriber (macOS 26 or later is required)";
+
+/// Apple Speech availability for the desktop settings surface. `selectable`
+/// covers standalone live transcript only, the one surface the product gate
+/// opens; dictation and the main engine keep rejecting it.
 fn apple_speech_status_view() -> serde_json::Value {
+    apple_speech_status_view_for(&Config::load())
+}
+
+fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
     let transport_available =
         minutes_core::pipeline::apple_speech_private_audio_transport_supported();
-    match minutes_core::apple_speech::probe_capabilities() {
-        Ok(report) => serde_json::json!({
-            "supported": report.runtime_supported,
-            "selectable": false,
-            "transport_available": transport_available,
-            "unavailable_reason": if transport_available && report.runtime_supported {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(
-                    minutes_core::pipeline::apple_speech_unavailable_reason().into()
-                )
-            },
-            "report": report,
-        }),
-        Err(error) => serde_json::json!({
-            "supported": false,
-            "selectable": false,
-            "unavailable_reason": minutes_core::pipeline::apple_speech_unavailable_reason(),
-            "error": error.to_string(),
-        }),
+    let runtime_supported = transport_available && apple_speech_runtime_supported();
+    #[cfg(target_os = "macos")]
+    let runtime_check_pending =
+        transport_available && apple_speech_helper_reports_unavailable().is_none();
+    #[cfg(not(target_os = "macos"))]
+    let runtime_check_pending = false;
+    // A live session that loses Apple Speech mid-way falls back to Whisper. If
+    // that model is missing, the failed utterance has nowhere to go.
+    let fallback_ready = minutes_core::live_transcript::live_whisper_fallback_available(config);
+    let unavailable_reason = if !transport_available {
+        Some(minutes_core::pipeline::apple_speech_unavailable_reason().to_string())
+    } else if runtime_check_pending {
+        Some(APPLE_SPEECH_RUNTIME_CHECK_PENDING_REASON.to_string())
+    } else if !runtime_supported {
+        Some(APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON.to_string())
+    } else if !fallback_ready {
+        let model = if config.live_transcript.model.is_empty() {
+            &config.dictation.model
+        } else {
+            &config.live_transcript.model
+        };
+        Some(format!(
+            "the Whisper model live transcript falls back to (\"{model}\") is not installed; run `minutes setup --model {model}`"
+        ))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "supported": runtime_supported,
+        "selectable": unavailable_reason.is_none(),
+        "transport_available": transport_available,
+        "fallback_ready": fallback_ready,
+        "unavailable_reason": unavailable_reason,
+    })
+}
+
+#[cfg(target_os = "macos")]
+static APPLE_SPEECH_HELPER_UNAVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Cached, non-blocking capability verdict; see [`apple_speech_runtime_supported`].
+/// `None` while the helper is still running: selection waits for its answer
+/// rather than letting an unsupported Mac pick Apple Speech in the meantime.
+#[cfg(target_os = "macos")]
+fn apple_speech_helper_reports_unavailable() -> Option<bool> {
+    static DEVELOPER_TOOLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    // `xcode-select -p` only prints a path, so it is cheap enough to ask here.
+    let developer_tools = *DEVELOPER_TOOLS.get_or_init(|| {
+        std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+    if !developer_tools {
+        return Some(false);
+    }
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let unavailable = matches!(
+                minutes_core::apple_speech::probe_capabilities(),
+                Ok(report) if !report.runtime_supported
+                    || report.speech_transcriber.is_available == Some(false)
+            );
+            let _ = APPLE_SPEECH_HELPER_UNAVAILABLE.set(unavailable);
+        });
+    });
+    APPLE_SPEECH_HELPER_UNAVAILABLE.get().copied()
+}
+
+/// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26. The version alone
+/// is not proof: some macOS 26 machines (virtual Macs among them) report the
+/// transcriber as unavailable. The capability helper can say so, but it is
+/// compiled with `xcrun swiftc`, which most Macs lack, and compiling or running
+/// it can take seconds. So it runs once, off the settings thread, only when
+/// `xcode-select -p` finds developer tools (otherwise `xcrun` opens Apple's
+/// install prompt). Until it answers, and on Macs without it, the version
+/// check decides; a definite "unavailable" from it blocks selection.
+fn apple_speech_runtime_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::call_capture::macos_major_version().is_some_and(|major| major >= 26)
+            && apple_speech_helper_reports_unavailable() == Some(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -13464,7 +13546,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "parakeet_selectable": parakeet_capability.selectable,
             "parakeet_unavailable_reason": parakeet_capability.unavailable_reason(),
             "parakeet_status": parakeet_status_view(&config),
-            "apple_speech_status": apple_speech_status_view(),
+            "apple_speech_status": apple_speech_status_view_for(&config),
         },
         "diarization": {
             "engine": config.diarization.engine,
@@ -13759,6 +13841,25 @@ fn reject_unselectable_apple_speech(value: &str, setting: &str) -> Result<(), St
     ))
 }
 
+/// Standalone live transcript is the one surface Apple Speech may be chosen
+/// for, and only when this signed app can reach the worker and the Speech
+/// runtime can transcribe.
+fn reject_unselectable_live_apple_speech(value: &str) -> Result<(), String> {
+    if !value.eq_ignore_ascii_case("apple-speech") {
+        return Ok(());
+    }
+    let status = apple_speech_status_view();
+    if status["selectable"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    let reason = status["unavailable_reason"]
+        .as_str()
+        .unwrap_or(minutes_core::pipeline::apple_speech_unavailable_reason());
+    Err(format!(
+        "Apple Speech cannot be selected as the live transcript backend: {reason}. Use Whisper; an existing Apple Speech preference is retained but resolves to Whisper."
+    ))
+}
+
 #[tauri::command]
 pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<String, String> {
     let mut config = Config::load();
@@ -14011,7 +14112,7 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
                     VALID_LIVE_TRANSCRIPT_BACKENDS.join(", ")
                 ));
             }
-            reject_unselectable_apple_speech(&value, "live transcript backend")?;
+            reject_unselectable_live_apple_speech(&value)?;
             reject_unselectable_parakeet(&value, "live transcript backend")?;
             config.live_transcript.backend = value.clone();
         }
@@ -18160,6 +18261,29 @@ mod tests {
         assert_eq!(live_readiness.configured_backend, "parakeet");
         assert_eq!(live_readiness.fallback_order, vec!["whisper"]);
         assert_eq!(primary.engine, "whisper");
+    }
+
+    #[test]
+    fn live_apple_speech_selection_requires_the_signed_transport() {
+        // Unit tests never run inside a trusted signed bundle, so the transport
+        // gate is closed and the live backend setter must refuse Apple Speech.
+        assert!(!minutes_core::pipeline::apple_speech_private_audio_transport_supported());
+        let error = reject_unselectable_live_apple_speech("apple-speech").unwrap_err();
+        assert!(error.contains("live transcript backend"));
+        assert!(error.contains("secure private audio"));
+        assert!(reject_unselectable_live_apple_speech("whisper").is_ok());
+        assert_eq!(apple_speech_status_view()["selectable"], false);
+    }
+
+    #[test]
+    fn apple_speech_status_reports_a_missing_whisper_fallback() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.transcription.model_path = dir.path().to_path_buf();
+        let status = apple_speech_status_view_for(&config);
+        assert_eq!(status["fallback_ready"], false);
+        assert_eq!(status["selectable"], false);
+        assert!(status["unavailable_reason"].is_string());
     }
 
     #[test]

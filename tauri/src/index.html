@@ -8148,22 +8148,28 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       return list.map(backendLabel).join(' -> ');
     }
 
-    function describeLiveBackendSelection(selectedBackend, resolvedBackend, fallbackOrder, batchEngine) {
+    function describeLiveBackendSelection(selectedBackend, resolvedBackend, fallbackOrder, batchEngine, appleSpeechSelectable = false) {
       const fallbackText = fallbackOrderLabel(fallbackOrder);
       const batchLabel = backendLabel(batchEngine);
+      const appleHint = appleSpeechSelectable && resolvedBackend !== 'apple-speech'
+        ? ' Apple Speech is available on this Mac and is recommended for live transcript.'
+        : '';
       if (selectedBackend === 'inherit') {
-        return `Standalone live transcript currently inherits ${backendLabel(resolvedBackend)} from the main transcription engine. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription stay on ${batchLabel}.`;
+        return `Standalone live transcript currently inherits ${backendLabel(resolvedBackend)} from the main transcription engine. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription stay on ${batchLabel}.${appleHint}`;
       }
       if (selectedBackend === 'apple-speech') {
+        if (resolvedBackend === 'apple-speech') {
+          return `Standalone live transcript uses Apple Speech (experimental) through Minutes' signed speech worker, which receives audio in memory rather than through temporary files. The session's own audio is still saved when live_transcript.save_wav is on (the default). If Apple Speech fails, the session switches to the next engine. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
+        }
         return `The retained Apple Speech preference cannot receive secure private audio yet, so standalone live transcript resolves to ${backendLabel(resolvedBackend)}. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
       }
       if (selectedBackend === 'parakeet') {
         if (resolvedBackend !== 'parakeet') {
           return `The retained Parakeet preference is unavailable, so standalone live transcript resolves to ${backendLabel(resolvedBackend)}. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
         }
-        return `Standalone live transcript uses Parakeet. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
+        return `Standalone live transcript uses Parakeet. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.${appleHint}`;
       }
-      return `Standalone live transcript will use Whisper. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.`;
+      return `Standalone live transcript will use Whisper. Fallback order: ${fallbackText}. Recording-sidecar live and batch transcription remain on ${batchLabel}.${appleHint}`;
     }
 
     function currentModeLabel(mode) {
@@ -12987,7 +12993,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           const appleSelectable = Boolean(appleSpeechStatus && appleSpeechStatus.selectable);
           liveAppleOpt.disabled = !appleSelectable;
           liveAppleOpt.textContent = appleSelectable
-            ? 'Apple Speech — experimental standalone live transcript'
+            ? 'Apple Speech — recommended on this Mac'
             : (liveBackend === 'apple-speech'
               ? 'Apple Speech — unavailable, using Whisper'
               : 'Apple Speech — unavailable');
@@ -13001,6 +13007,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             resolvedLiveBackend,
             liveFallbackOrder,
             resolvedBatchEngine,
+            Boolean(appleSpeechStatus && appleSpeechStatus.selectable),
           );
         }
         const batchUsesWhisper = resolvedBatchEngine === 'whisper';

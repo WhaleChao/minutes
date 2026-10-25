@@ -995,6 +995,12 @@ fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
 }
 
 fn apple_speech_dictation_ready(_config: &Config) -> bool {
+    if !crate::pipeline::apple_speech_dictation_selectable() {
+        tracing::warn!(
+            "apple-speech dictation preference retained; dictation is not yet opened to Apple Speech, using sealed Whisper fallback"
+        );
+        return false;
+    }
     let ready = crate::pipeline::apple_speech_private_audio_transport_supported();
     if !ready {
         tracing::warn!(
@@ -2229,6 +2235,9 @@ mod tests {
         );
         #[cfg(not(target_os = "macos"))]
         assert!(!crate::pipeline::apple_speech_private_audio_transport_supported());
+        // Dictation stays closed on its own switch, independent of whether the
+        // signed transport is available to standalone live transcript.
+        assert!(!crate::pipeline::apple_speech_dictation_selectable());
     }
 
     #[test]

@@ -39,8 +39,9 @@ model = "small"           # Whisper meeting baseline: small (466MB); base, mediu
                           # tiny (75MB) is an explicit advanced low-resource choice with lower accuracy
 # language = "ur"          # Force transcription language (ISO 639-1 code, e.g. "en", "ur", "es", "zh")
                           # Default: auto-detect. Set this for similar-sounding languages (Urdu/Hindi, etc.)
-# engine = "apple-speech"  # Retained for compatibility; currently resolves to Whisper until signed runtime acceptance passes.
-#                          # See docs/architecture/apple-speech.md for the candidate byte-transport boundary.
+# engine = "apple-speech"  # Batch transcription still resolves to Whisper. Standalone live transcript can use
+#                          # Apple Speech in the signed app on macOS 26+: set [live_transcript] backend = "apple-speech".
+#                          # See docs/architecture/apple-speech.md.
 # engine = "parakeet"      # Retained for compatibility, but currently resolves to Whisper until secure byte transport lands.
 # parakeet_model = "tdt-600m"                    # parakeet: tdt-ctc-110m (English), tdt-600m (multilingual v3)
 # parakeet_binary = "parakeet"                   # Path to parakeet.cpp binary (or name in PATH)
