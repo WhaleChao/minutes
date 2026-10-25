@@ -444,6 +444,10 @@ where
     let run_start = Instant::now();
     startup_debug("run_inner_start", Some(&config.dictation.model), None, None);
     let final_backend = dictation_final_backend(config);
+    // A session keeps the backend it started with. If Parakeet v3 was switched
+    // off meanwhile, free its recognizer when this session ends, however it ends.
+    #[cfg(feature = "engine-sherpa")]
+    let _sherpa_release = SherpaReleaseOnEnd(final_backend == DictationFinalBackend::Sherpa);
     // Session-scoped Apple Speech capability latch: the worker runs in a separate
     // XPC process, so a crash on an incapable device is failure-isolated and we
     // fall back to Whisper. Without this latch each utterance would re-spawn the
@@ -1266,7 +1270,20 @@ fn sherpa_model_identity(config: &Config) -> SherpaModelIdentity {
     (dir, files)
 }
 
+#[cfg(feature = "engine-sherpa")]
+struct SherpaReleaseOnEnd(bool);
+
+#[cfg(feature = "engine-sherpa")]
+impl Drop for SherpaReleaseOnEnd {
+    fn drop(&mut self) {
+        if self.0 && Config::load().dictation.backend != "sherpa" {
+            release_sherpa_dictation_recognizer();
+        }
+    }
+}
+
 /// Drop the cached Parakeet v3 recognizer, for when dictation stops using it.
+/// Blocks while a decode holds the recognizer, so call it off the UI thread.
 pub fn release_sherpa_dictation_recognizer() {
     #[cfg(feature = "engine-sherpa")]
     {
@@ -1339,6 +1356,10 @@ fn read_recovery_samples(path: &std::path::Path) -> Result<Vec<f32>, MinutesErro
 fn preload_sherpa_recognizer(config: &Config) {
     if let Err(error) = with_sherpa_dictation_recognizer(config, |_| Ok(())) {
         tracing::warn!(error = %error, "parakeet v3 dictation preload failed");
+    }
+    // Switched back to Whisper while this was loading: do not keep it.
+    if Config::load().dictation.backend != "sherpa" {
+        release_sherpa_dictation_recognizer();
     }
 }
 

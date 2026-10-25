@@ -14079,8 +14079,9 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
                     }
                 });
             } else {
-                // Free Parakeet v3's memory once dictation no longer uses it.
-                minutes_core::dictation::release_sherpa_dictation_recognizer();
+                // Free Parakeet v3's memory once dictation no longer uses it. Off
+                // this thread: release waits for any decode holding the recognizer.
+                std::thread::spawn(minutes_core::dictation::release_sherpa_dictation_recognizer);
             }
         }
         ("dictation", "model") => {
