@@ -14078,6 +14078,9 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
                         eprintln!("[dictation] model re-preload failed: {}", e);
                     }
                 });
+            } else {
+                // Free Parakeet v3's memory once dictation no longer uses it.
+                minutes_core::dictation::release_sherpa_dictation_recognizer();
             }
         }
         ("dictation", "model") => {
