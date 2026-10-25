@@ -1316,6 +1316,20 @@ fn run_inner(
     }
     if apple_live_enabled {
         eprintln!("[minutes] Apple Speech live transcript enabled (experimental, standalone only)");
+        // The fallback and scope warnings only record when Apple Speech is NOT
+        // used; this durable line is the positive record that it was.
+        crate::logging::append_log(&serde_json::json!({
+            "ts": Local::now().to_rfc3339(),
+            "level": "info",
+            "step": "live_transcript_backend",
+            "file": "",
+            "message": "standalone live transcript uses apple-speech",
+            "extra": {
+                "backend": "apple-speech",
+                "source": "standalone",
+            }
+        }))
+        .ok();
     }
 
     // Warm the parakeet sidecar at session start so the first utterance doesn't
