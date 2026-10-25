@@ -296,7 +296,7 @@ window.__MINUTES_I18N['pt-BR'] = {
 
     // ── Settings: live transcript ───────────────────────────────────
     "Inherit main transcription engine": "Herdar o motor de transcrição principal",
-    "Apple Speech — experimental standalone live transcript": "Apple Speech: transcrição ao vivo independente, experimental",
+    "Apple Speech — recommended on this Mac": "Apple Speech: recomendado neste Mac",
     "Standalone live transcript currently inherits your main transcription engine.": "A transcrição ao vivo independente está herdando o seu motor de transcrição principal.",
     "Live transcript failed": "Falha na transcrição ao vivo",
     "Live transcript stopped unexpectedly": "A transcrição ao vivo parou inesperadamente",

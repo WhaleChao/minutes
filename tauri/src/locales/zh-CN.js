@@ -296,7 +296,7 @@ window.__MINUTES_I18N['zh-CN'] = {
 
     // ── Settings: live transcript ───────────────────────────────────
     "Inherit main transcription engine": "沿用主转写引擎",
-    "Apple Speech — experimental standalone live transcript": "Apple Speech —— 实验性独立实时转写",
+    "Apple Speech — recommended on this Mac": "Apple Speech —— 本机推荐",
     "Standalone live transcript currently inherits your main transcription engine.": "独立实时转写当前沿用你的主转写引擎。",
     "Live transcript failed": "实时转写失败",
     "Live transcript stopped unexpectedly": "实时转写意外停止",
