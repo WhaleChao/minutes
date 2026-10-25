@@ -654,6 +654,10 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
     minutes_core::transcription_coordinator::parakeet_backend_status(config)
 }
 
+/// Shown while the background capability check is still running.
+const APPLE_SPEECH_RUNTIME_CHECK_PENDING_REASON: &str =
+    "Minutes is still checking whether this Mac can run Apple Speech; reopen Settings in a moment";
+
 /// Shown when the signed transport binds but this Mac's Speech framework
 /// cannot run the transcriber, so the reason is not blamed on the transport.
 const APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON: &str =
@@ -670,11 +674,18 @@ fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
     let transport_available =
         minutes_core::pipeline::apple_speech_private_audio_transport_supported();
     let runtime_supported = transport_available && apple_speech_runtime_supported();
+    #[cfg(target_os = "macos")]
+    let runtime_check_pending =
+        transport_available && apple_speech_helper_reports_unavailable().is_none();
+    #[cfg(not(target_os = "macos"))]
+    let runtime_check_pending = false;
     // A live session that loses Apple Speech mid-way falls back to Whisper. If
     // that model is missing, the failed utterance has nowhere to go.
     let fallback_ready = minutes_core::live_transcript::live_whisper_fallback_available(config);
     let unavailable_reason = if !transport_available {
         Some(minutes_core::pipeline::apple_speech_unavailable_reason().to_string())
+    } else if runtime_check_pending {
+        Some(APPLE_SPEECH_RUNTIME_CHECK_PENDING_REASON.to_string())
     } else if !runtime_supported {
         Some(APPLE_SPEECH_RUNTIME_UNAVAILABLE_REASON.to_string())
     } else if !fallback_ready {
@@ -702,28 +713,33 @@ fn apple_speech_status_view_for(config: &Config) -> serde_json::Value {
 static APPLE_SPEECH_HELPER_UNAVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Cached, non-blocking capability verdict; see [`apple_speech_runtime_supported`].
+/// `None` while the helper is still running: selection waits for its answer
+/// rather than letting an unsupported Mac pick Apple Speech in the meantime.
 #[cfg(target_os = "macos")]
-fn apple_speech_helper_reports_unavailable() -> bool {
+fn apple_speech_helper_reports_unavailable() -> Option<bool> {
+    static DEVELOPER_TOOLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
+    // `xcode-select -p` only prints a path, so it is cheap enough to ask here.
+    let developer_tools = *DEVELOPER_TOOLS.get_or_init(|| {
+        std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+    if !developer_tools {
+        return Some(false);
+    }
     STARTED.call_once(|| {
         std::thread::spawn(|| {
-            let developer_tools = std::process::Command::new("/usr/bin/xcode-select")
-                .arg("-p")
-                .output()
-                .is_ok_and(|output| output.status.success());
-            let unavailable = developer_tools
-                && matches!(
-                    minutes_core::apple_speech::probe_capabilities(),
-                    Ok(report) if !report.runtime_supported
-                        || report.speech_transcriber.is_available == Some(false)
-                );
+            let unavailable = matches!(
+                minutes_core::apple_speech::probe_capabilities(),
+                Ok(report) if !report.runtime_supported
+                    || report.speech_transcriber.is_available == Some(false)
+            );
             let _ = APPLE_SPEECH_HELPER_UNAVAILABLE.set(unavailable);
         });
     });
-    APPLE_SPEECH_HELPER_UNAVAILABLE
-        .get()
-        .copied()
-        .unwrap_or(false)
+    APPLE_SPEECH_HELPER_UNAVAILABLE.get().copied()
 }
 
 /// SpeechAnalyzer's `SpeechTranscriber` ships with macOS 26. The version alone
@@ -738,7 +754,7 @@ fn apple_speech_runtime_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
         crate::call_capture::macos_major_version().is_some_and(|major| major >= 26)
-            && !apple_speech_helper_reports_unavailable()
+            && apple_speech_helper_reports_unavailable() == Some(false)
     }
     #[cfg(not(target_os = "macos"))]
     {
