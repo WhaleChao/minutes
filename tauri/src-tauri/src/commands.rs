@@ -14965,6 +14965,7 @@ mod tests {
         commitments: &[&str],
     ) -> String {
         let summary = minutes_core::summarize::Summary {
+            title: None,
             text: String::new(),
             decisions: Vec::new(),
             action_items: Vec::new(),

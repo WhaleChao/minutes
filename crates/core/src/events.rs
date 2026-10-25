@@ -2568,6 +2568,7 @@ mod tests {
     fn emit_insights_from_summary_is_idempotent_for_same_meeting() {
         with_temp_home(|_| {
             let summary = crate::summarize::Summary {
+                title: None,
                 text: "summary".into(),
                 decisions: vec!["We decided to ship it".into()],
                 action_items: vec!["@mat: Send the recap by Friday".into()],
@@ -2599,6 +2600,7 @@ mod tests {
     fn emit_insights_from_summary_adds_only_new_items_on_retry() {
         with_temp_home(|_| {
             let initial = crate::summarize::Summary {
+                title: None,
                 text: "summary".into(),
                 decisions: vec!["We decided to ship it".into()],
                 action_items: vec!["@mat: Send the recap by Friday".into()],
@@ -2608,6 +2610,7 @@ mod tests {
                 participants: vec!["Mat".into(), "Alex".into()],
             };
             let retried = crate::summarize::Summary {
+                title: None,
                 text: "summary".into(),
                 decisions: vec![
                     "We decided to ship it".into(),

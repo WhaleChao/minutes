@@ -6744,6 +6744,26 @@ where
     let attempted_model = summarize::title_refinement_model(config);
     let input_chars = summarize::title_refinement_input_chars(summary_text, raw_summary, entities);
 
+    // The summary call already wrote a title with the whole transcript in
+    // view. Use it when it passes the same quality gate as a refined title;
+    // otherwise spend the separate title call as before.
+    if let Some(cleaned) = raw_summary
+        .title
+        .as_deref()
+        .map(sanitize_llm_title_candidate)
+        .filter(|cleaned| llm_title_passes_quality(cleaned))
+    {
+        return TitleGenerationDecision {
+            final_title: cleaned.clone(),
+            refined_title: Some(cleaned),
+            outcome: "llm",
+            model: attempted_model,
+            input_chars: 0,
+            detail: Some("from-summary".into()),
+            llm_duration_ms: 0,
+        };
+    }
+
     let llm_started = std::time::Instant::now();
     let refine_result = refine(summary_text, raw_summary, entities, config);
     let llm_duration_ms = llm_started.elapsed().as_millis() as u64;
@@ -8880,6 +8900,7 @@ mod tests {
             detail: "All source chunks delivered.".into(),
         };
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec!["Meeting point".into()],
             decisions: vec![],
@@ -9581,6 +9602,7 @@ mod tests {
 
     fn sample_summary() -> summarize::Summary {
         summarize::Summary {
+            title: None,
             text: "Discussed Command RX codebase walkthrough and next steps.".into(),
             key_points: vec![
                 "Walked through the Command RX codebase".into(),
@@ -9697,6 +9719,47 @@ mod tests {
         let transcript = "Okay, this is a meeting that we're gonna be doing here";
         let title = generate_title(transcript, None);
         assert_eq!(title, "Untitled Recording");
+    }
+
+    #[test]
+    fn summary_title_skips_the_separate_title_call() {
+        let mut summary = sample_summary();
+        summary.title = Some("Command RX Codebase Walkthrough".into());
+        let decision = maybe_refine_title_with_llm(
+            "Untitled Recording",
+            None,
+            Some("Command RX walkthrough with implementation planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &Config::default(),
+            |_, _, _, _| panic!("title call must not run when the summary has a title"),
+        );
+        assert_eq!(decision.final_title, "Command RX Codebase Walkthrough");
+        assert_eq!(decision.outcome, "llm");
+        assert_eq!(decision.detail.as_deref(), Some("from-summary"));
+    }
+
+    #[test]
+    fn generic_summary_title_falls_back_to_the_title_call() {
+        let mut summary = sample_summary();
+        summary.title = Some("Meeting".into());
+        let decision = maybe_refine_title_with_llm(
+            "Untitled Recording",
+            None,
+            Some("Command RX walkthrough with implementation planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &Config::default(),
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Command RX Codebase Walkthrough".into(),
+                    model: "agent:claude".into(),
+                    input_chars: 128,
+                })
+            },
+        );
+        assert_eq!(decision.final_title, "Command RX Codebase Walkthrough");
+        assert_eq!(decision.detail, None);
     }
 
     #[test]
@@ -10153,6 +10216,7 @@ mod tests {
     #[test]
     fn extract_action_items_parses_assignee_and_task() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec![],
@@ -10347,6 +10411,7 @@ mod tests {
     #[test]
     fn extract_decisions_with_topic_inference() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec![
@@ -10413,6 +10478,7 @@ mod tests {
     #[test]
     fn withheld_owners_leave_the_rendered_body_too() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec!["point".into()],
             decisions: vec![],
@@ -11337,6 +11403,7 @@ mod tests {
     #[test]
     fn extract_intents_builds_typed_entries() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec!["Use REST over GraphQL for the new API".into()],
