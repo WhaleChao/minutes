@@ -3629,6 +3629,10 @@
       margin-bottom: 6px;
     }
 
+    .empty-state .empty-state-action {
+      margin-top: 14px;
+    }
+
     .empty-state .sub {
       font-size: var(--text-xs);
       margin-top: 6px;
@@ -10620,6 +10624,18 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         );
       }
       items.push(
+        { text: menuLabel('Rename…'), action: action('Rename', () => renameMeeting(meeting)) },
+        {
+          text: menuLabel('Copy as Markdown'),
+          action: action('Copy as Markdown', async () => {
+            await invoke('palette_execute', {
+              ui: { currentMeeting: meeting.path },
+              action: { id: 'copy-meeting-markdown' },
+            });
+            showActionToast('Copied as Markdown');
+          }),
+        },
+        { item: 'Separator' },
         { text: menuLabel('Open in Editor'), action: action('Open in Editor', () => invoke('cmd_open_file', { path: meeting.path })) },
         {
           text: menuLabel(desktopCapabilities.folderRevealLabel || 'Show in Folder'),
@@ -10639,6 +10655,27 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       // On macOS popup() resolves when the menu closes, which is what lets
       // callers hold a highlight on the row or button for exactly that long.
       await menu.popup(at ? new LogicalPosition(at.x, at.y) : undefined);
+    }
+
+    // Same action the ⌘K palette runs: renames the file and its title, and
+    // refreshes the assistant's CURRENT_MEETING.md pointer.
+    async function renameMeeting(meeting) {
+      const newTitle = await showInputModal({
+        title: 'Rename meeting',
+        label: 'Title',
+        value: meeting.title || '',
+        confirmText: 'Rename',
+      });
+      if (!newTitle || newTitle === meeting.title) return;
+      const result = await invoke('palette_execute', {
+        ui: { currentMeeting: meeting.path },
+        action: { id: 'rename-current-meeting', new_title: newTitle },
+      });
+      const newPath = result?.newPath || meeting.path;
+      const wasShowing = isDetailViewShowing(meeting.path);
+      loadMeetings();
+      if (wasShowing) await openMeetingDetail(newPath);
+      showActionToast(`Renamed to “${newTitle}”`);
     }
 
     async function archiveMeeting(meeting) {
@@ -10795,6 +10832,17 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     });
 
+    // The typed note stays in the field; say why it was not saved.
+    function showNoteFailure(error) {
+      const message = String(error?.message || error || '');
+      showActionToast(
+        /no recording/i.test(message)
+          ? 'Note not saved: nothing is recording right now.'
+          : `Note not saved: ${message}`,
+        { tone: 'error' },
+      );
+    }
+
     async function saveInlineNote() {
       const text = noteInput.value.trim();
       if (!text) return;
@@ -10804,6 +10852,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         quickNote.classList.remove('active');
       } catch (e) {
         console.error('Note:', e);
+        showNoteFailure(e);
       }
     }
 
@@ -11271,10 +11320,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           const btn = document.createElement('button');
           btn.className = 'detail-chip-btn';
           btn.textContent = person;
-          btn.addEventListener('click', () => {
-            searchInput.value = person;
-            searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          });
+          btn.addEventListener('click', () => searchFromDetail(person));
           peopleRow.appendChild(btn);
         }
         peopleCard.appendChild(peopleLabel);
@@ -11294,10 +11340,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           const btn = document.createElement('button');
           btn.className = 'detail-chip-btn';
           btn.textContent = topic;
-          btn.addEventListener('click', () => {
-            searchInput.value = topic;
-            searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          });
+          btn.addEventListener('click', () => searchFromDetail(topic));
           topicsRow.appendChild(btn);
         }
         topicsCard.appendChild(topicsLabel);
@@ -11370,7 +11413,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         artifactsCard.className = 'detail-context';
         const artifactsLabel = document.createElement('div');
         artifactsLabel.className = 'detail-context-label';
-        artifactsLabel.textContent = 'Adjacent Artifacts';
+        artifactsLabel.textContent = 'Drafts';
         const artifactsList = document.createElement('div');
         artifactsList.className = 'detail-action-list';
         for (const artifact of detail.adjacent_artifacts) {
@@ -11378,7 +11421,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           row.className = 'detail-action-item';
           const textSpan = document.createElement('span');
           textSpan.className = 'detail-action-text';
-          const review = artifact.review_available ? ' · review ready' : '';
+          const review = artifact.review_available ? ' · ready to review' : '';
           setHighlightedText(textSpan, `${artifact.filename} · ${artifact.kind}${review}`, activeSearchQuery);
           row.appendChild(textSpan);
 
@@ -11395,6 +11438,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
               });
             } catch (e) {
               console.error('Open adjacent artifact:', e);
+              showActionToast(`Could not open that draft: ${e?.message || e}`, { tone: 'error' });
             }
           });
           row.appendChild(openBtn);
@@ -11541,12 +11585,15 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       // in flight) shows a stale, wrongly-sized control.
       resetResummarizeButton();
       try {
-        const detail = await invoke('cmd_get_meeting_detail', { path });
+        // The meeting itself first; related context costs several corpus
+        // passes, so it fills in afterwards (loadRelatedForDetail).
+        const detail = await invoke('cmd_get_meeting_detail', { path, includeRelated: false });
         // A newer open superseded this one while the fetch was in flight.
         // Rendering now would put the older meeting back on screen.
         if (requestId !== detailOpenRequestId) return 'superseded';
         renderDetailSections(detail);
         refreshResummarizeButton();
+        loadRelatedForDetail(path, requestId);
         return 'rendered';
       } catch (e) {
         console.error('Detail:', e);
@@ -11558,8 +11605,10 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         // outcome is still reported honestly as 'failed'.
         try {
           await invoke('cmd_open_file', { path });
+          showActionToast('Minutes could not show this meeting, so it opened in your editor.', { tone: 'error' });
         } catch (openError) {
           console.error('Detail fallback open:', openError);
+          showActionToast(`Could not open this meeting: ${e?.message || e}`, { tone: 'error' });
         }
         // Re-check after that await too. A newer open can render fresh content
         // while the external editor is being launched; reporting 'failed' then
@@ -11738,6 +11787,12 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       meetingsScroll.replaceChildren();
 
       if (!meetings || meetings.length === 0) {
+        // No matches is not "no meetings": the first-run screen here hid the
+        // record controls and read like a reset app.
+        if (activeSearchQuery) {
+          renderNoSearchResults(activeSearchQuery);
+          return;
+        }
         footer.classList.add('footer-hidden');
         renderSetupEmptyState();
         return;
@@ -11895,6 +11950,30 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         (message.includes('capacity') || message.includes('already active'));
     }
 
+    // One meeting-list scan at a time, shared by every caller. The backend is
+    // single-flight anyway; before this, a UI deadline or an overlapping
+    // refresh discarded the running scan's result and then started another
+    // full scan once it finished. A caller that wants data newer than the
+    // running scan (a file just changed) gets that scan's result and one
+    // queued follow-up refresh.
+    let meetingInventoryInFlight = null;
+    let meetingInventoryRefreshQueued = false;
+
+    function requestMeetingInventory({ fresh = true } = {}) {
+      if (meetingInventoryInFlight) {
+        if (fresh) meetingInventoryRefreshQueued = true;
+        return meetingInventoryInFlight;
+      }
+      meetingInventoryInFlight = invoke('cmd_list_meetings', { limit: 30 }).finally(() => {
+        meetingInventoryInFlight = null;
+        if (meetingInventoryRefreshQueued) {
+          meetingInventoryRefreshQueued = false;
+          scheduleMeetingInventoryRetry();
+        }
+      });
+      return meetingInventoryInFlight;
+    }
+
     function scheduleMeetingInventoryRetry() {
       if (meetingInventoryRetryTimer) return;
       meetingInventoryRetryTimer = setTimeout(() => {
@@ -11918,10 +11997,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
                 setMeetingInventoryWaitingOnBusy(true);
               }
             })
-          : await withUiDeadline(
-              invoke('cmd_list_meetings', { limit: 30 }),
-              'Meeting inventory'
-            );
+          : await withUiDeadline(requestMeetingInventory(), 'Meeting inventory');
         if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         meetingInventoryFingerprint = nextFingerprint;
@@ -11963,13 +12039,54 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     }
 
+    // A chip search fills the sidebar, which the full-window detail overlay
+    // covers; close it (and leave Documents) so the results are visible.
+    function searchFromDetail(term) {
+      closeDetailView();
+      if (documentsViewActive) setDocumentsView(false);
+      if (document.body.classList.contains('sidebar-collapsed')) {
+        document.getElementById('btn-sidebar-expand')?.click();
+      }
+      searchInput.value = term;
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const RELATED_DETAIL_FIELDS = ['related_meetings', 'related_commitments', 'adjacent_artifacts'];
+
+    function renderDetailKeepingScroll(detail) {
+      const scrollTop = detailScroll.scrollTop;
+      renderDetailSections(detail);
+      detailScroll.scrollTop = scrollTop;
+    }
+
+    // Cross-meeting context for the open meeting, fetched after it renders.
+    // Waits for a meeting-list scan already in flight: both need the
+    // single-flight corpus lease, and the list is what the user is waiting on.
+    async function loadRelatedForDetail(path, requestId) {
+      try {
+        if (meetingInventoryInFlight) await meetingInventoryInFlight.catch(() => {});
+        if (requestId !== detailOpenRequestId || !isDetailViewShowing(path)) return;
+        const full = await invoke('cmd_get_meeting_detail', { path, includeRelated: true });
+        if (requestId !== detailOpenRequestId || !isDetailViewShowing(path)) return;
+        const merged = { ...currentMeetingDetail };
+        for (const field of RELATED_DETAIL_FIELDS) merged[field] = full[field];
+        renderDetailKeepingScroll(merged);
+      } catch (e) {
+        console.error('Related context:', e);
+      }
+    }
+
+    // Re-render the open meeting (e.g. to re-highlight a new search) without
+    // recomputing related context it already has.
     async function refreshOpenMeetingDetail() {
       if (!currentMeetingDetail || !detailOverlay.classList.contains('active')) return;
       const path = currentMeetingDetail.path;
       if (!path) return;
       try {
-        const detail = await invoke('cmd_get_meeting_detail', { path });
-        renderDetailSections(detail);
+        const detail = await invoke('cmd_get_meeting_detail', { path, includeRelated: false });
+        if (!isDetailViewShowing(path)) return;
+        for (const field of RELATED_DETAIL_FIELDS) detail[field] = currentMeetingDetail[field];
+        renderDetailKeepingScroll(detail);
       } catch (e) {
         console.error('Detail refresh:', e);
         renderDetailSections(currentMeetingDetail);
@@ -12018,20 +12135,23 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     let searchTimeout;
     let searchRequestId = 0;
     documentsToggle.addEventListener('click', () => setDocumentsView(!documentsViewActive));
-    searchInput.addEventListener('input', (e) => {
-      if (documentsViewActive) return;
-      clearTimeout(searchTimeout);
-      const query = e.target.value.trim();
-      activeSearchQuery = query;
-      const reqId = ++searchRequestId;
-      if (!query) {
-        scheduleMeetingsRefresh(0);
+    // Each backend search reads the whole corpus and searches run one at a
+    // time behind a single lease, so firing one per keystroke queued them:
+    // typing a short word took 20+ seconds to show anything. Wait for a pause,
+    // keep one search in flight, and when it lands run only the latest query.
+    let searchInFlight = false;
+    let searchQueued = null;
+
+    function runLatestSearch(query, reqId) {
+      if (searchInFlight) {
+        searchQueued = { query, reqId };
         return;
       }
-      searchTimeout = setTimeout(async () => {
+      searchInFlight = true;
+      (async () => {
         try {
           const results = await invoke('cmd_search', { query });
-          if (reqId !== searchRequestId) return; // stale response, newer one in flight
+          if (reqId !== searchRequestId) return; // a newer query superseded this one
           setSearchError(null);
           renderMeetings(results);
           await refreshOpenMeetingDetail();
@@ -12047,8 +12167,27 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             return;
           }
           setSearchError(e);
+        } finally {
+          searchInFlight = false;
+          const next = searchQueued;
+          searchQueued = null;
+          if (next && next.reqId === searchRequestId) runLatestSearch(next.query, next.reqId);
         }
-      }, 80);
+      })();
+    }
+
+    searchInput.addEventListener('input', (e) => {
+      if (documentsViewActive) return;
+      clearTimeout(searchTimeout);
+      const query = e.target.value.trim();
+      activeSearchQuery = query;
+      const reqId = ++searchRequestId;
+      if (!query) {
+        searchQueued = null;
+        scheduleMeetingsRefresh(0);
+        return;
+      }
+      searchTimeout = setTimeout(() => runLatestSearch(query, reqId), 250);
     });
 
     // ── Search error banner ──
@@ -12237,7 +12376,8 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       const deadline = Date.now() + budgetMs;
       while (true) {
         try {
-          return await invoke('cmd_list_meetings', { limit: 30 });
+          // Joins a scan already in flight rather than starting another.
+          return await requestMeetingInventory({ fresh: false });
         } catch (e) {
           const busy = String((e && e.message) || e || '').toLowerCase()
             .includes('still checking');
@@ -12246,6 +12386,29 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           await new Promise((resolve) => window.setTimeout(resolve, 1000));
         }
       }
+    }
+
+    function renderNoSearchResults(query) {
+      footer.classList.remove('footer-hidden');
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.textContent = 'No meetings match';
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = `“${query}”`;
+      const clear = document.createElement('button');
+      clear.type = 'button';
+      clear.className = 'btn btn-secondary btn-sm empty-state-action';
+      clear.textContent = 'Clear search';
+      clear.addEventListener('click', () => {
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input'));
+        searchInput.focus();
+      });
+      empty.append(title, sub, clear);
+      meetingsScroll.replaceChildren(empty);
     }
 
     function renderSetupEmptyState() {
@@ -12281,7 +12444,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             <div class="onboarding-step disabled" id="step-first-artifact">
               <div class="step-header">
                 <span class="step-num">2</span>
-                <span class="step-title">Create your first artifact</span>
+                <span class="step-title">Make your first recording</span>
                 <span class="step-status" id="step-first-artifact-status"></span>
               </div>
               <div class="step-body">
@@ -14623,6 +14786,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     const SESSION_ID = 'assistant';
 
     let recallExpanded = false;
+    let recallLastOutputAt = 0;
     let recallTerminal = null;
     let recallFitAddon = null;
     let recallPtyAlive = false;
@@ -14786,6 +14950,9 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         return { mode, meetingPath };
       }
       recallSelectedMeetingPath = mode === 'meeting' ? meetingPath : null;
+      recallChatInput.placeholder = recallSelectedMeetingPath
+        ? 'Ask about this meeting…'
+        : 'Ask about your meetings…';
       let readiness;
       try {
         readiness = await refreshRecallReadiness();
@@ -15369,6 +15536,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       ptyListenersRegistered = true;
 
       await currentWindow.listen('pty:data:' + SESSION_ID, (event) => {
+        recallLastOutputAt = Date.now();
         if (!recallTerminal) return;
         const raw = atob(event.payload);
         const bytes = new Uint8Array(raw.length);
@@ -17057,14 +17225,34 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       collapseRecallPanel();
     });
 
+    // Ending a session while the agent is still writing loses the answer, and
+    // the button sits beside Weekly. While output is arriving, the first click
+    // only arms it; an idle session ends at once.
+    let recallEndArmTimer = null;
     recallEndBtn.addEventListener('click', async () => {
+      const busy = recallPtyAlive && Date.now() - recallLastOutputAt < 3000;
+      if (busy && !recallEndArmTimer) {
+        recallEndBtn.style.minWidth = `${recallEndBtn.offsetWidth}px`;
+        recallEndBtn.textContent = 'End now?';
+        recallEndArmTimer = setTimeout(resetRecallEndButton, 4000);
+        return;
+      }
+      resetRecallEndButton();
       try {
         await invoke('cmd_pty_kill', { sessionId: SESSION_ID });
         recallPtyAlive = false;
       } catch (e) {
         console.error('End session:', e);
+        showActionToast(`Could not end the session: ${e?.message || e}`, { tone: 'error' });
       }
     });
+
+    function resetRecallEndButton() {
+      if (recallEndArmTimer) clearTimeout(recallEndArmTimer);
+      recallEndArmTimer = null;
+      recallEndBtn.textContent = 'End Session';
+      recallEndBtn.style.minWidth = '';
+    }
 
     function disposeRecallTerminal() {
       if (recallResizeObserver) {
@@ -17108,6 +17296,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         recallNoteInput.value = '';
       } catch (e) {
         console.error('Recall note:', e);
+        showNoteFailure(e);
       }
     }
 
@@ -17967,9 +18156,16 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     }
 
+    // External edits show up within a second while Minutes is in front; in
+    // the background a slower check is enough, and a hidden window needs none.
+    let openArtifactPollTicks = 0;
     function startOpenArtifactPolling() {
       if (openArtifactPollTimer) clearInterval(openArtifactPollTimer);
+      openArtifactPollTicks = 0;
       openArtifactPollTimer = setInterval(() => {
+        openArtifactPollTicks += 1;
+        if (document.hidden) return;
+        if (!document.hasFocus() && openArtifactPollTicks % 5 !== 0) return;
         refreshOpenArtifactIfChanged();
       }, 1000);
     }

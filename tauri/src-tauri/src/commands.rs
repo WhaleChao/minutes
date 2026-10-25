@@ -2289,7 +2289,13 @@ pub fn load_activation_progress(config: &Config) -> Arc<Mutex<ActivationProgress
     }
 
     let model_file = model_file_for_config(config);
-    let latest_artifact = latest_saved_artifact_from_search(config);
+    // The search reads the whole corpus and runs before the window exists, so
+    // only pay for it while the first-artifact milestone is still missing.
+    let latest_artifact = progress
+        .first_artifact_saved_at
+        .is_none()
+        .then(|| latest_saved_artifact_from_search(config))
+        .flatten();
     changed |=
         backfill_activation_from_paths(&mut progress, &model_file, latest_artifact.as_deref());
 
@@ -2355,11 +2361,7 @@ fn activation_status_view(
     }
 }
 
-fn build_related_context(
-    config: &Config,
-    current_path: &Path,
-    frontmatter: &minutes_core::markdown::Frontmatter,
-) -> RelatedContextView {
+fn related_people_from(frontmatter: &minutes_core::markdown::Frontmatter) -> Vec<String> {
     let mut related_people = frontmatter.attendees.clone();
     for person in &frontmatter.people {
         if !related_people.iter().any(|existing| existing == person) {
@@ -2374,7 +2376,10 @@ fn build_related_context(
             related_people.push(entity.label.clone());
         }
     }
+    related_people
+}
 
+fn related_topics_from(frontmatter: &minutes_core::markdown::Frontmatter) -> Vec<String> {
     let mut related_topics = Vec::new();
     for decision in &frontmatter.decisions {
         if let Some(topic) = decision
@@ -2390,6 +2395,16 @@ fn build_related_context(
             }
         }
     }
+    related_topics
+}
+
+fn build_related_context(
+    config: &Config,
+    current_path: &Path,
+    frontmatter: &minutes_core::markdown::Frontmatter,
+) -> RelatedContextView {
+    let related_people = related_people_from(frontmatter);
+    let related_topics = related_topics_from(frontmatter);
 
     let mut related_meetings = Vec::new();
     let mut related_meeting_paths = std::collections::HashSet::new();
@@ -7742,8 +7757,12 @@ fn capture_status_audio_level(
 }
 
 #[tauri::command]
-pub fn cmd_capture_status(state: tauri::State<AppState>) -> serde_json::Value {
-    status_value(&state, false)
+// Async so the 1–2 s status poll runs off the main thread (it reads pid,
+// session and config files every tick).
+pub async fn cmd_capture_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    Ok(status_value(&state, false))
 }
 
 #[tauri::command]
@@ -8499,10 +8518,16 @@ fn notify_assistant_artifact_focus(
 }
 
 #[tauri::command]
-pub fn cmd_read_text_file(path: String) -> Result<String, String> {
-    let canonical = validate_text_file_path(Path::new(&path))?;
-    let path_str = canonical.to_string_lossy();
-    std::fs::read_to_string(&canonical).map_err(|e| format!("Cannot read {}: {}", path_str, e))
+pub async fn cmd_read_text_file(path: String) -> Result<String, String> {
+    // The open document is re-read on a timer to pick up external edits; a
+    // synchronous command ran that read on the main thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = validate_text_file_path(Path::new(&path))?;
+        let path_str = canonical.to_string_lossy();
+        std::fs::read_to_string(&canonical).map_err(|e| format!("Cannot read {}: {}", path_str, e))
+    })
+    .await
+    .map_err(|e| format!("cmd_read_text_file worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -8552,11 +8577,17 @@ pub fn cmd_recent_artifacts(limit: Option<usize>) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn cmd_list_documents(limit: Option<usize>) -> serde_json::Value {
-    let config = Config::load();
-    let workspace = crate::context::workspace_dir();
-    let views = list_documents_for_roots(&config, &workspace, limit.unwrap_or(200).min(200));
-    serde_json::to_value(views).unwrap_or_else(|_| serde_json::json!([]))
+// Async: the Documents view refreshes every 4 s, and each listing stats
+// every candidate file.
+pub async fn cmd_list_documents(limit: Option<usize>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = Config::load();
+        let workspace = crate::context::workspace_dir();
+        let views = list_documents_for_roots(&config, &workspace, limit.unwrap_or(200).min(200));
+        serde_json::to_value(views).unwrap_or_else(|_| serde_json::json!([]))
+    })
+    .await
+    .map_err(|e| format!("cmd_list_documents worker failed: {e}"))
 }
 
 #[tauri::command]
@@ -9235,13 +9266,20 @@ pub fn cmd_retry_recovery(
 // Corpus-wide reads run on the blocking pool: a sync Tauri command runs on
 // the main thread and freezes the window until every file read finishes.
 #[tauri::command]
-pub async fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
-    tauri::async_runtime::spawn_blocking(move || cmd_get_meeting_detail_blocking(path))
+/// `include_related: false` skips the cross-meeting lookups (person profiles
+/// and topic research, each a full authorized corpus pass), so the view can
+/// show the meeting at once and fetch related context in a second call.
+pub async fn cmd_get_meeting_detail(
+    path: String,
+    include_related: Option<bool>,
+) -> Result<MeetingDetail, String> {
+    let include_related = include_related.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || meeting_detail(path, include_related))
         .await
         .map_err(|e| format!("cmd_get_meeting_detail worker failed: {e}"))?
 }
 
-pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, String> {
+fn meeting_detail(path: String, include_related: bool) -> Result<MeetingDetail, String> {
     let config = Config::load();
     let meeting_path = std::path::PathBuf::from(&path);
     minutes_core::notes::validate_meeting_path(&meeting_path, &config.output_dir)?;
@@ -9313,7 +9351,17 @@ pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, St
         })
         .collect();
 
-    let related = build_related_context(&config, &meeting_path, &frontmatter);
+    let related = if include_related {
+        build_related_context(&config, &meeting_path, &frontmatter)
+    } else {
+        RelatedContextView {
+            related_people: related_people_from(&frontmatter),
+            related_topics: related_topics_from(&frontmatter),
+            related_meetings: Vec::new(),
+            related_commitments: Vec::new(),
+            adjacent_artifacts: Vec::new(),
+        }
+    };
 
     let capture_is_none = matches!(
         frontmatter.capture,
@@ -20515,9 +20563,7 @@ mod tests {
             )
             .unwrap();
 
-            let detail =
-                cmd_get_meeting_detail_blocking(meeting_path.to_string_lossy().to_string())
-                    .unwrap();
+            let detail = meeting_detail(meeting_path.to_string_lossy().to_string(), true).unwrap();
 
             let alex = detail
                 .speaker_map
@@ -22474,7 +22520,10 @@ pub fn cmd_stop_live_transcript(state: tauri::State<AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::Value {
+// Async: polled with capture status, off the main thread.
+pub async fn cmd_live_transcript_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let in_app_active = state.live_transcript_active.load(Ordering::Relaxed);
     let status = minutes_core::live_transcript::session_status();
     let audio_level = if in_app_active {
@@ -22490,7 +22539,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         &minutes_core::copilot::current_window_environment(),
         Config::load().privacy.hide_from_screen_share,
     );
-    serde_json::json!({
+    Ok(serde_json::json!({
         "active": in_app_active || status.active,
         "line_count": status.line_count,
         "duration_secs": status.duration_secs,
@@ -22499,7 +22548,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         "source": status.source,
         "diagnostic": status.diagnostic,
         "copilotWindowContract": copilot_window_contract,
-    })
+    }))
 }
 
 /// Update the assistant instruction files to mention (or un-mention)
