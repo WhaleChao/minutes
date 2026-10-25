@@ -773,6 +773,28 @@ fn batch_transcription_readiness_view(config: &Config) -> SurfaceReadinessView {
         };
     }
 
+    // `engine = "sherpa"` and an `auto` that resolves to sherpa both run the
+    // in-process Parakeet v3 engine. Reporting Whisper here made Settings show
+    // the Whisper model picker for a user who was not using Whisper.
+    if minutes_core::transcribe::transcription_engine_resolution(config).engine == "sherpa" {
+        let sherpa_model_dir = minutes_core::sherpa_engine::model_dir(config);
+        return SurfaceReadinessView {
+            configured_backend: config.transcription.engine.clone(),
+            resolved_backend: "sherpa".into(),
+            ready: true,
+            model_name: sherpa_model_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "parakeet-v3".into()),
+            detail: format!(
+                "Batch and recording transcription use built-in Parakeet v3, installed at {}. Whisper answers if Parakeet fails on a recording.",
+                sherpa_model_dir.display()
+            ),
+            next_action: "none".into(),
+            fallback_order: vec!["sherpa".into(), "whisper".into()],
+        };
+    }
+
     SurfaceReadinessView {
         configured_backend: config.transcription.engine.clone(),
         resolved_backend: "whisper".into(),
@@ -991,6 +1013,12 @@ fn mark_model_ready_for_surface(
             let model_file = whisper_model_file(config, &readiness.model_name);
             if model_file.exists() {
                 mark_activation_model_ready(activation_progress, &model_file);
+            }
+        }
+        "sherpa" => {
+            let model_dir = minutes_core::sherpa_engine::model_dir(config);
+            if minutes_core::sherpa_engine::model_files_present(&model_dir) {
+                mark_activation_model_ready(activation_progress, &model_dir);
             }
         }
         _ => {}
@@ -13408,6 +13436,8 @@ pub fn cmd_get_settings() -> serde_json::Value {
     let parakeet_capability =
         minutes_core::pipeline::parakeet_capability(cfg!(feature = "parakeet"));
     let auto_engine = minutes_core::transcribe::auto_transcription_engine_resolution(&config);
+    let sherpa_selectable =
+        auto_engine.engine == "sherpa" || batch_readiness.resolved_backend == "sherpa";
 
     serde_json::json!({
         "config_path": path.display().to_string(),
@@ -13419,6 +13449,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "engine": config.transcription.engine,
             "resolved_engine": batch_readiness.resolved_backend,
             "auto_engine_reason": auto_engine.reason,
+            "sherpa_selectable": sherpa_selectable,
             "model": config.transcription.model,
             "downloaded_models": downloaded_models,
             "language": config.transcription.language,
@@ -18156,6 +18187,36 @@ mod tests {
         assert!(status["unavailable_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("secure private audio")));
+    }
+
+    #[test]
+    fn uninstalled_sherpa_reports_its_whisper_fallback() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        config.transcription.model_path = dir.path().to_path_buf();
+        config.transcription.sherpa_model_dir = dir.path().join("no-sherpa").display().to_string();
+
+        let readiness = batch_transcription_readiness_view(&config);
+
+        assert_eq!(readiness.configured_backend, "sherpa");
+        assert_eq!(readiness.resolved_backend, "whisper");
+        assert_eq!(readiness.next_action, "download-model");
+    }
+
+    #[test]
+    fn settings_engine_select_offers_sherpa_and_hides_retired_parakeet() {
+        let html = include_str!("../../src/index.html");
+        assert!(
+            html.contains(r#"<option value="sherpa" disabled>Parakeet v3 — unavailable</option>"#)
+        );
+        assert!(html.contains(
+            "setSettingsOptionPresent(engineSelect, sherpaOpt, sherpaSelectable || eng === 'sherpa'"
+        ));
+        assert!(html.contains(
+            "setSettingsOptionPresent(engineSelect, parakeetOpt, parakeetSelectable || eng === 'parakeet'"
+        ));
+        assert!(html.contains("case 'sherpa': return 'Parakeet v3';"));
     }
 
     #[test]
