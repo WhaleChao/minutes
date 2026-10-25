@@ -593,18 +593,28 @@
       flex: 1;
       min-height: 0;
       overflow: hidden;
-      /* fit() rounds rows against the padded box; without this the last row
-         (the TUI status line) sat half under the pane edge. */
-      padding-bottom: 6px;
       margin: 0;
       border-radius: 0;
       border: none;
       background: var(--bg);
     }
 
-    .recall-terminal .xterm-screen {
-      padding-top: 10px;
-      padding-left: 5px;
+    /* Outline, not an inset shadow: xterm's canvas covers the box's own paint,
+       and outlines draw above content. */
+    .recall-terminal.is-drop-target {
+      outline: 2px solid var(--accent-border-strong);
+      outline-offset: -2px;
+    }
+
+    /* Inset the grid with padding on .xterm and nowhere else. FitAddon sizes
+       rows from the container's computed height (which, with border-box,
+       already includes the container's own padding) minus the padding of
+       .xterm itself. Padding on .xterm-screen or on the container is invisible
+       to it, so the rows it proposed overflowed by that much and the last one
+       (the TUI status line) sat half under the pane edge. */
+    .recall-terminal .xterm {
+      height: 100%;
+      padding: 10px 0 6px 5px;
     }
 
     .recall-terminal .xterm .xterm-viewport {
@@ -1913,6 +1923,16 @@
       margin-right: 6px;
     }
 
+    /* Open, Recall has its own header and close button beside the list, so
+       the toggle only repeats it. Show it as the way in, not the way out. */
+    .recall-toggle-btn[aria-expanded="true"] {
+      display: none;
+    }
+
+    .recall-toggle-btn[aria-expanded="true"] + .list-toggle-btn {
+      margin-left: auto;
+    }
+
     .sidebar-collapse-btn {
       width: 28px;
       height: 28px;
@@ -2909,6 +2929,11 @@
       box-shadow: 0 1px 4px var(--shadow-soft);
     }
 
+    /* Finder-style ring on the row a context menu is acting on. */
+    .meeting-item.is-menu-target {
+      box-shadow: inset 0 0 0 1.5px var(--accent-border-strong);
+    }
+
     .document-item {
       display: flex;
       align-items: center;
@@ -3073,7 +3098,8 @@
 
     .detail-close-x {
       position: absolute;
-      top: 12px;
+      /* Centred on the header's action row (18px padding + 28px controls). */
+      top: 18px;
       right: 14px;
       width: 28px;
       height: 28px;
@@ -3110,9 +3136,13 @@
       letter-spacing: -0.2px;
       color: var(--text);
       margin-bottom: 6px;
-      white-space: nowrap;
+      line-height: 1.2;
+      /* Two lines before truncating: long meeting titles are the norm. */
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
       overflow: hidden;
-      text-overflow: ellipsis;
+      overflow-wrap: anywhere;
     }
 
     .detail-meta {
@@ -3132,33 +3162,110 @@
 
     .detail-actions {
       display: flex;
-      flex-wrap: wrap;
+      flex: none;
+      align-items: center;
       gap: 8px;
-      justify-content: flex-end;
-      padding-right: 28px;
-      /* This row declares no `flex` shorthand, so it is `flex: 0 1 auto` and its
-         flex base size is its MAX-CONTENT width — every button on one line,
-         even though flex-wrap then wraps them onto two. Space is distributed
-         from those base sizes, so when a fifth button pushed the row's base
-         past what the header had, the header stopped handing leftovers to
-         .detail-header-copy and started shrinking it instead, until the copy
-         froze on its 16.5ch min-width while the wrapped row sat half empty.
-         Measured at the normal 762px card: 33 title characters with four
-         buttons, 21 with five.
-         max-width does not change the base size — the base is computed first,
-         then clamped — but clamping the row's hypothetical size is enough to
-         put the header back into "distribute the leftovers", and the leftovers
-         go to the title. The 22rem term is a floor on the cap, not on the row:
-         on narrow cards the row already needs more than half the header, and
-         capping it there would only force another wrapped line and a taller
-         header. So the effective rule is "half the header, but never less than
-         22rem" — above ~44rem of header the 50% term wins, below it the 22rem
-         term does. rem, not px, because UI zoom drives :root font-size.
-         Known cost, measured: at zoom >= 20 with a window wide enough that all
-         five buttons would have fitted on one line, the cap wraps them onto two
-         and the header grows 3-5px. At the default zoom there is no such width
-         — the row never fits on one line there. */
-      max-width: max(50%, 22rem);
+      /* Clears the absolutely positioned close button. */
+      padding-right: 32px;
+    }
+
+    /* The app's secondary buttons are uppercase, which put two casings side
+       by side with "Create Draft" here. Match the primary's sentence case. */
+    .detail-actions .btn-secondary {
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: var(--text-xs);
+      font-weight: 500;
+    }
+
+    .detail-more-btn {
+      width: 28px;
+      height: 28px;
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--text-secondary);
+      fill: currentColor;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      -webkit-app-region: no-drag;
+    }
+
+    .detail-more-btn:hover,
+    .detail-more-btn[aria-expanded="true"] {
+      background: var(--bg-hover);
+      border-color: var(--border-mid);
+      color: var(--text);
+    }
+
+    .detail-more-btn:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px var(--focus-ring);
+    }
+
+    .action-toast {
+      position: fixed;
+      left: 50%;
+      bottom: 20px;
+      z-index: 400;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      max-width: min(460px, calc(100vw - 32px));
+      padding: 9px 10px 9px 16px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-mid);
+      box-shadow: 0 12px 32px var(--shadow-strong);
+      color: var(--text);
+      font-size: var(--text-body);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 8px);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    .action-toast.is-visible {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0);
+    }
+
+    .action-toast.is-error {
+      border-color: var(--red-border-strong);
+    }
+
+    .action-toast-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .action-toast-btn {
+      flex: none;
+      padding: 4px 10px;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .action-toast-btn:hover,
+    .action-toast-btn:focus-visible {
+      background: var(--accent-tint);
+      outline: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .action-toast { transition: none; }
     }
 
     .detail-scroll {
@@ -4488,63 +4595,6 @@
       flex-shrink: 0;
     }
 
-    .ambient-context-card {
-      margin: 10px 0 14px;
-      padding: 12px 14px;
-      border-radius: 12px;
-      background: var(--bg-elevated);
-      border: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .ambient-context-title {
-      font-size: var(--text-meta);
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      color: var(--text-tertiary);
-    }
-
-    .ambient-chip {
-      display: inline-block;
-      margin: 0 6px 6px 0;
-      padding: 3px 8px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: var(--bg);
-      color: var(--text-secondary);
-      font-family: var(--font-mono);
-      font-size: var(--text-2xs);
-      letter-spacing: 0.04em;
-    }
-
-    .ambient-chip-btn {
-      cursor: pointer;
-      color: var(--text);
-      border-color: var(--border-mid);
-    }
-
-    .ambient-chip-btn:hover,
-    .ambient-chip-btn:focus-visible {
-      border-color: var(--accent);
-      outline: none;
-    }
-
-    .ambient-context-summary {
-      font-size: var(--text-body);
-      line-height: 1.5;
-      color: var(--text-secondary);
-      white-space: pre-wrap;
-    }
-
-    .ambient-context-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
     /* ── Call detected banner ──
        Single-row notification (matches macOS-native call notification pattern):
        icon + title + Record CTA + corner ✕. Previously had a subtitle, an
@@ -5351,12 +5401,13 @@
       gap: 12px;
     }
 
-    /* On non-macOS (Windows/Linux) the OS window stays wide when the panel is
-       collapsed, so the `padding: 16px` above — combined with `width: 0` and
-       `box-sizing: border-box` — leaves a ~32px phantom column on the right.
-       On macOS the window shrinks to 520px on collapse (below any threshold),
-       so this was never visible there. Zero the padding only when collapsed. */
-    html:not([data-platform="macos"]) .recall-panel:not(.expanded) {
+    /* With the panel collapsed, the `padding: 16px` above — combined with
+       `width: 0` and `box-sizing: border-box` — leaves a ~32px phantom column
+       on the right. This used to be gated to non-macOS on the theory that the
+       Mac window shrinks to 520px on collapse; it does not when the window
+       keeps its saved width, and the column showed as a gray strip. Zero the
+       padding whenever collapsed, on every platform. */
+    .recall-panel:not(.expanded) {
       padding: 0;
     }
 
@@ -6283,11 +6334,14 @@
           <div class="detail-meta" id="detail-meta"></div>
         </div>
         <div class="detail-actions">
-          <button class="btn btn-primary btn-sm" id="btn-create-artifact">Create Draft</button>
           <button class="btn btn-secondary btn-sm" id="btn-discuss-ai">Discuss with Agent</button>
-          <button class="btn btn-secondary btn-sm" id="btn-resummarize">Resummarize</button>
-          <button class="btn btn-secondary btn-sm" id="btn-open-external">Open in Editor</button>
-          <button class="btn btn-danger btn-sm" id="btn-delete-meeting">Delete</button>
+          <button class="btn btn-primary btn-sm" id="btn-create-artifact">Create Draft</button>
+          <button class="detail-more-btn" id="btn-detail-more" type="button" aria-haspopup="menu" aria-label="More actions" title="More actions">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="3.5" cy="8" r="1.35"/><circle cx="8" cy="8" r="1.35"/><circle cx="12.5" cy="8" r="1.35"/></svg>
+          </button>
+          <!-- Resummarize keeps its state machine on this button; the ⋯ menu
+               drives it, so it stays in the DOM without taking header space. -->
+          <button class="btn btn-secondary btn-sm" id="btn-resummarize" hidden>Resummarize</button>
         </div>
       </div>
       <div class="detail-feedback" id="detail-feedback" hidden></div>
@@ -6295,6 +6349,11 @@
         <div class="detail-empty">Select a meeting to view transcript and notes.</div>
       </div>
     </div>
+  </div>
+
+  <div class="action-toast" id="action-toast" role="status" aria-live="polite">
+    <span class="action-toast-text" id="action-toast-text"></span>
+    <button class="action-toast-btn" id="action-toast-undo" type="button" hidden>Undo</button>
   </div>
 
   <div class="artifact-template-overlay" id="artifact-template-overlay">
@@ -7673,7 +7732,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     const detailCard = document.querySelector('.detail-card');
     const detailScroll = document.getElementById('detail-scroll');
     const resummarizeBtn = document.getElementById('btn-resummarize');
-    const openExternalBtn = document.getElementById('btn-open-external');
     const aboutOverlay = document.getElementById('about-overlay');
     const aboutVersion = document.getElementById('about-version');
     const aboutWebsiteButton = document.getElementById('btn-about-website');
@@ -7769,10 +7827,12 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     let meetingsRefreshTimer = null;
     let currentSetup = null;
     let activationState = null;
-    let proactiveContextBundle = null;
     let latestOutput = null;
     let detailFeedbackTimer = null;
     let resummarizeConfirmTimer = null;
+    // Set by the ⋯ menu: choosing Resummarize there is already a deliberate
+    // second step, so the inline Confirm? round is skipped.
+    let resummarizeSkipConfirm = false;
     let resummarizeStatusPollTimer = null;
     let resummarizeStatusRequestId = 0;
     let detailOpenRequestId = 0;
@@ -7884,116 +7944,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       } catch (e) {
         console.error('Activation nudge marker:', e);
       }
-    }
-
-    let proactiveContextLoadedAt = 0;
-    let proactiveContextLoadPromise = null;
-    let proactiveContextLoadGeneration = -1;
-    let proactiveContextGeneration = 0;
-    async function loadProactiveContextBundle() {
-      const now = Date.now();
-      if (proactiveContextBundle && now - proactiveContextLoadedAt < 60_000) {
-        return proactiveContextBundle;
-      }
-      if (proactiveContextLoadPromise) {
-        const inFlight = proactiveContextLoadPromise;
-        if (proactiveContextLoadGeneration === proactiveContextGeneration) {
-          return inFlight;
-        }
-        await inFlight;
-        return loadProactiveContextBundle();
-      }
-      const generation = proactiveContextGeneration;
-      const loadPromise = (async () => {
-        try {
-          const bundle = await invoke('cmd_proactive_context_bundle');
-          if (generation === proactiveContextGeneration) {
-            proactiveContextBundle = bundle;
-            proactiveContextLoadedAt = Date.now();
-          }
-        } catch (e) {
-          console.error('Proactive context bundle:', e);
-          if (generation === proactiveContextGeneration) {
-            proactiveContextBundle = null;
-          }
-        }
-        return proactiveContextBundle;
-      })();
-      proactiveContextLoadPromise = loadPromise;
-      proactiveContextLoadGeneration = generation;
-      try {
-        return await loadPromise;
-      } finally {
-        if (proactiveContextLoadPromise === loadPromise) {
-          proactiveContextLoadPromise = null;
-          proactiveContextLoadGeneration = -1;
-        }
-      }
-    }
-
-    function invalidateProactiveContextBundle() {
-      proactiveContextGeneration += 1;
-      proactiveContextBundle = null;
-      proactiveContextLoadedAt = 0;
-    }
-
-    function appendProactiveContextCard() {
-      if (!proactiveContextBundle) return;
-      const total =
-        (proactiveContextBundle.recentMeetingCount || 0) +
-        (proactiveContextBundle.recentMemoCount || 0) +
-        (proactiveContextBundle.staleCommitmentCount || 0) +
-        (proactiveContextBundle.losingTouchCount || 0);
-      if (total === 0) return;
-
-      const card = document.createElement('div');
-      card.className = 'ambient-context-card';
-
-      const title = document.createElement('div');
-      title.className = 'ambient-context-title';
-      title.textContent = 'Ambient Context';
-
-      const summary = document.createElement('div');
-      summary.className = 'ambient-context-summary';
-      // Counts as chips. Only the ones that lead somewhere are buttons:
-      // stale commitments have a section in the weekly brief, memos live in
-      // the Documents view. Losing-touch has no surface yet, so it stays a
-      // number rather than a tap that goes nowhere.
-      const chip = (label, onClick) => {
-        const el = document.createElement(onClick ? 'button' : 'span');
-        el.className = 'ambient-chip' + (onClick ? ' ambient-chip-btn' : '');
-        if (onClick) { el.type = 'button'; el.addEventListener('click', onClick); }
-        el.textContent = label;
-        return el;
-      };
-      const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-      const b = proactiveContextBundle;
-      const chips = [];
-      if (b.recentMeetingCount) chips.push(chip(plural(b.recentMeetingCount, 'meeting', 'meetings')));
-      if (b.recentMemoCount) chips.push(chip(plural(b.recentMemoCount, 'memo', 'memos'), () => setDocumentsView(true)));
-      if (b.staleCommitmentCount) chips.push(chip(plural(b.staleCommitmentCount, 'stale commitment', 'stale commitments'), () => openWeeklyPhase()));
-      if (b.losingTouchCount) chips.push(chip(plural(b.losingTouchCount, 'losing-touch alert', 'losing-touch alerts')));
-      if (chips.length) summary.replaceChildren(...chips);
-      else summary.textContent = b.summary || 'Recent context is available.';
-
-      const actions = document.createElement('div');
-      actions.className = 'ambient-context-actions';
-
-      // Open Recall used to live here too; Recall now has a permanent home in
-      // the list header, so the card keeps only what is unique to it.
-      const weeklyBtn = document.createElement('button');
-      weeklyBtn.className = 'btn btn-secondary btn-sm';
-      weeklyBtn.textContent = 'Weekly';
-      weeklyBtn.addEventListener('click', () => {
-        openWeeklyPhase();
-      });
-
-      actions.appendChild(weeklyBtn);
-
-      card.appendChild(title);
-      card.appendChild(summary);
-      card.appendChild(actions);
-      meetingsScroll.appendChild(card);
     }
 
     function applyActivationState(root, activation) {
@@ -10080,31 +10030,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       }
     });
 
-    // ── Delete meeting ──
-    document.getElementById('btn-delete-meeting').addEventListener('click', async () => {
-      const pathToDelete = currentMeetingPath;
-      if (!pathToDelete) return;
-      try {
-        // Confirmation dialog is shown natively by the Rust command
-        const result = await invoke('cmd_delete_meeting', {
-          path: pathToDelete,
-          withAudio: true,
-          force: false,
-        });
-        if (result === 'Cancelled') return;
-        console.log(result);
-        closeDetailView();
-        loadMeetings();
-      } catch (e) {
-        console.error('Delete:', e);
-      }
-    });
-
     // The card is centred in the overlay (.detail-overlay { align-items:
     // center }), so a card shorter than its max-height grows symmetrically
     // when content is added — moving the header, and the wrapping
     // .detail-actions row with it, UP by half the growth. That is how a
-    // resting pointer ends up over the red Delete button. Holding the card's
+    // resting pointer ends up over a different action. Holding the card's
     // height makes .detail-scroll (overflow-y: auto) absorb the change
     // instead. The hold is owned by the banner lifecycle and nothing else:
     // showDetailFeedback() takes it, clearDetailFeedback() releases it. Those
@@ -10261,22 +10191,24 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     resummarizeBtn.addEventListener('click', async () => {
       const path = currentMeetingPath;
       if (!path) return;
+      const skipConfirm = resummarizeSkipConfirm;
+      resummarizeSkipConfirm = false;
       if (resummarizeBtn.disabled) {
         showDetailFeedback('Another meeting is being resummarized — try again when it finishes.');
         return;
       }
       // Two-step inline confirm: the AI pass has real cost, so an accidental
       // click must not fire it. Never window.confirm — WKWebView breaks it.
-      if (!resummarizeConfirmTimer) {
+      if (!resummarizeConfirmTimer && !skipConfirm) {
         // Pin the current width before shortening the label. "Confirm?" is
         // narrower than "Resummarize", and without this the actions row
-        // reflows and slides "Open in Editor" under the cursor — so the
+        // reflows and slides the next button under the cursor — so the
         // second click of a double-click lands on the wrong button.
         resummarizeBtn.style.minWidth = `${resummarizeBtn.offsetWidth}px`;
         // The vertical twin of the width pin above is handled for us:
         // showDetailFeedback() holds the card height before it shows the hint
         // banner below, so the growing banner cannot slide this row up under
-        // the cursor and put "Delete" where the second click lands.
+        // the cursor and put another action where the second click lands.
         resummarizeBtn.textContent = 'Confirm?';
         showDetailFeedback(
           'Click again to regenerate the AI summary. A timestamped backup will be saved.',
@@ -10660,6 +10592,165 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     document.getElementById('btn-create-artifact').addEventListener('click', async () => {
       if (!currentMeetingDetail?.path) return;
       await createArtifactFromMeetingPath(currentMeetingDetail.path, 'debrief-memo');
+    });
+
+    // ── Meeting actions menu ──
+    // One list of actions behind both the detail view's ⋯ button and a
+    // right-click on a sidebar row. It is a native menu, so it looks, scrolls
+    // and keyboard-navigates like Finder's. Archive sits last, past a
+    // separator, and needs no confirmation: it only moves files into the
+    // archive folder, and the Undo toast that follows puts them back.
+    const { Menu } = window.__TAURI__.menu;
+    const { LogicalPosition } = window.__TAURI__.dpi;
+    const menuLabel = (text) => window.MinutesI18n?.t(text) || text;
+
+    async function showMeetingActionsMenu(meeting, { context, at } = {}) {
+      const action = (label, fn) => async () => {
+        try {
+          await fn();
+        } catch (e) {
+          console.error(`${label}:`, e);
+          showActionToast(`${label} failed: ${e?.message || e}`, { tone: 'error' });
+        }
+      };
+      const items = [];
+      if (context === 'sidebar') {
+        items.push(
+          { text: menuLabel('Open'), action: action('Open', () => openMeetingDetail(meeting.path)) },
+          {
+            text: menuLabel('Discuss with Agent'),
+            action: action('Discuss with Agent', async () => {
+              await openRecall('meeting', meeting.path);
+              setRecallPhase('debrief', meeting.title || 'Meeting');
+            }),
+          },
+          { item: 'Separator' },
+        );
+      } else {
+        const running = resummarizeBtn.disabled;
+        items.push(
+          {
+            text: menuLabel(running ? 'Resummarizing…' : 'Resummarize'),
+            enabled: !running,
+            action: () => {
+              resummarizeSkipConfirm = true;
+              resummarizeBtn.click();
+            },
+          },
+          { item: 'Separator' },
+        );
+      }
+      items.push(
+        { text: menuLabel('Open in Editor'), action: action('Open in Editor', () => invoke('cmd_open_file', { path: meeting.path })) },
+        {
+          text: menuLabel(desktopCapabilities.folderRevealLabel || 'Show in Folder'),
+          action: action('Reveal', () => invoke('cmd_reveal_path', { path: meeting.path })),
+        },
+        {
+          text: menuLabel('Copy Path'),
+          action: action('Copy Path', async () => {
+            await invoke('cmd_copy_path', { path: meeting.path });
+            showActionToast('Path copied');
+          }),
+        },
+        { item: 'Separator' },
+        { text: menuLabel('Archive'), action: action('Archive', () => archiveMeeting(meeting)) },
+      );
+      const menu = await Menu.new({ items });
+      // On macOS popup() resolves when the menu closes, which is what lets
+      // callers hold a highlight on the row or button for exactly that long.
+      await menu.popup(at ? new LogicalPosition(at.x, at.y) : undefined);
+    }
+
+    async function archiveMeeting(meeting) {
+      const moves = await invoke('cmd_archive_meeting', { path: meeting.path });
+      if (isDetailViewShowing(meeting.path)) closeDetailView();
+      loadMeetings();
+      showActionToast(`Archived “${meeting.title || 'Untitled'}”`, {
+        undoLabel: 'Undo',
+        onUndo: async () => {
+          await invoke('cmd_restore_archived_meeting', { moves });
+          loadMeetings();
+          showActionToast(`Restored “${meeting.title || 'Untitled'}”`);
+        },
+      });
+    }
+
+    const detailMoreBtn = document.getElementById('btn-detail-more');
+    detailMoreBtn.addEventListener('click', async () => {
+      if (!currentMeetingPath) return;
+      const rect = detailMoreBtn.getBoundingClientRect();
+      detailMoreBtn.setAttribute('aria-expanded', 'true');
+      try {
+        await showMeetingActionsMenu(
+          { path: currentMeetingPath, title: currentMeetingDetail?.title },
+          { context: 'detail', at: { x: rect.left, y: rect.bottom + 6 } },
+        );
+      } catch (e) {
+        console.error('Meeting actions menu:', e);
+      } finally {
+        detailMoreBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    // ── Action toast ──
+    // A short confirmation at the bottom of the window, with an optional Undo.
+    // ⌘Z also undoes while it is showing, unless focus is in a text field,
+    // which keeps its own undo.
+    const actionToast = document.getElementById('action-toast');
+    const actionToastText = document.getElementById('action-toast-text');
+    const actionToastUndo = document.getElementById('action-toast-undo');
+    const ACTION_TOAST_MS = 3200;
+    const ACTION_TOAST_UNDO_MS = 8000;
+    let actionToastTimer = null;
+    let actionToastUndoHandler = null;
+
+    function hideActionToast() {
+      clearTimeout(actionToastTimer);
+      actionToastTimer = null;
+      actionToastUndoHandler = null;
+      actionToast.classList.remove('is-visible');
+    }
+
+    function scheduleActionToastHide() {
+      clearTimeout(actionToastTimer);
+      actionToastTimer = setTimeout(hideActionToast, actionToastUndoHandler ? ACTION_TOAST_UNDO_MS : ACTION_TOAST_MS);
+    }
+
+    function showActionToast(message, { undoLabel, onUndo, tone } = {}) {
+      actionToastText.textContent = message;
+      actionToastUndoHandler = onUndo || null;
+      actionToastUndo.hidden = !onUndo;
+      actionToastUndo.textContent = undoLabel || 'Undo';
+      actionToast.classList.toggle('is-error', tone === 'error');
+      actionToast.classList.add('is-visible');
+      scheduleActionToastHide();
+    }
+
+    async function runActionToastUndo() {
+      const undo = actionToastUndoHandler;
+      if (!undo) return;
+      hideActionToast();
+      try {
+        await undo();
+      } catch (e) {
+        console.error('Undo:', e);
+        showActionToast(`Could not undo: ${e?.message || e}`, { tone: 'error' });
+      }
+    }
+
+    actionToastUndo.addEventListener('click', runActionToastUndo);
+    // Hovering holds the toast so a reach for Undo never races the timer.
+    actionToast.addEventListener('mouseenter', () => clearTimeout(actionToastTimer));
+    actionToast.addEventListener('mouseleave', () => {
+      if (actionToast.classList.contains('is-visible')) scheduleActionToastHide();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (!actionToastUndoHandler || !event.metaKey || event.shiftKey || event.key.toLowerCase() !== 'z') return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      event.preventDefault();
+      runActionToastUndo();
     });
 
     readinessButton.addEventListener('click', () => {
@@ -11677,7 +11768,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         return;
       }
       meetingsScroll.replaceChildren();
-      appendProactiveContextCard();
 
       if (!meetings || meetings.length === 0) {
         footer.classList.add('footer-hidden');
@@ -11699,6 +11789,17 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           item.className = 'meeting-item';
           item.addEventListener('click', () => {
             openMeetingDetail(m.path);
+          });
+          item.addEventListener('contextmenu', async (event) => {
+            event.preventDefault();
+            item.classList.add('is-menu-target');
+            try {
+              await showMeetingActionsMenu(m, { context: 'sidebar' });
+            } catch (e) {
+              console.error('Meeting actions menu:', e);
+            } finally {
+              item.classList.remove('is-menu-target');
+            }
           });
 
           const info = document.createElement('div');
@@ -11856,9 +11957,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             );
         if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
-        if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
-          invalidateProactiveContextBundle();
-        }
         meetingInventoryFingerprint = nextFingerprint;
         finishMeetingInventoryLoading();
         setSearchError(null);
@@ -11906,18 +12004,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         renderInventoryUnavailableState();
         return;
       }
-      // The proactive context bundle runs several corpus-wide scans and is only
-      // needed for the ambient-context card, not the meetings list itself. Load
-      // it in the background and re-render once it resolves, so first paint is
-      // never gated on it. (It was previously awaited *before* the list — the
-      // dominant cause of the blank window at startup.)
-      loadProactiveContextBundle()
-        .then(() => {
-          if (!documentsViewActive && generation === meetingInventoryGeneration) {
-            renderMeetings(meetings);
-          }
-        })
-        .catch((e) => console.error('Proactive bundle:', e));
     }
 
     async function refreshOpenMeetingDetail() {
@@ -12140,7 +12226,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     function renderInventoryUnavailableState() {
       if (documentsViewActive) return;
       meetingsScroll.replaceChildren();
-      appendProactiveContextCard();
       footer.classList.remove('footer-hidden');
       const failed = document.createElement('div');
       failed.className = 'empty-state';
@@ -14500,14 +14585,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         return;
       }
     });
-    openExternalBtn.addEventListener('click', async () => {
-      if (!currentMeetingPath) return;
-      try {
-        await invoke('cmd_open_file', { path: currentMeetingPath });
-      } catch (e) {
-        console.error('Open external:', e);
-      }
-    });
 
     // ══════════════════════════════════════════════════════════════
     // ── Recall panel ──
@@ -14587,7 +14664,6 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     const assistantBtn = document.getElementById('btn-assistant');
     const splitHandle = document.getElementById('split-handle');
 
-    const COLLAPSED_WIDTH = 520;
     const EXPANDED_WIDTH = 960;
 
     function getZoomRatio() {
@@ -15160,6 +15236,64 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             setRecallProviderNotice(String(error), 'error');
           });
       });
+
+      registerRecallTerminalFileDrop().catch((error) => {
+        console.error('Recall terminal file drop:', error);
+      });
+    }
+
+    // Tauri's window-level drag-drop handler consumes native file drops before
+    // the DOM sees them and reports the dropped paths as a window event, so
+    // HTML drop listeners never fire. Do what Terminal.app and Ghostty do with
+    // a dropped file: type its shell-escaped path at the prompt. Agents like
+    // Claude Code turn a pasted image path into an attachment, which is how a
+    // dragged screenshot reaches them in a normal terminal.
+    // Escape what Terminal.app escapes: ASCII shell metacharacters. Non-ASCII
+    // stays as is, including the U+202F narrow space macOS puts before "PM" in
+    // screenshot names; a backslash there stops agents recognizing the path.
+    function shellEscapeDroppedPath(path) {
+      return path.replace(/[ !"#$&'()*;<>?[\\\]^`{|}~]/g, '\\$&');
+    }
+
+    function recallTerminalDropRect() {
+      if (!recallTerminal || !recallPtyAlive) return null;
+      if (recallTerminalContainer.classList.contains('hidden')) return null;
+      const rect = recallTerminalContainer.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 ? rect : null;
+    }
+
+    function isOverRecallTerminal(position) {
+      const rect = recallTerminalDropRect();
+      if (!rect || !position) return false;
+      // Tauri labels the drag position physical, but on macOS wry reports
+      // AppKit points (wry src/wkwebview/drag_drop.rs), which already equal
+      // CSS pixels. Dividing by the 2x scale there put every drop on the
+      // left half of the window, over the sidebar, so none landed.
+      const scale = document.documentElement.dataset.platform === 'macos' ? 1 : window.devicePixelRatio;
+      const x = position.x / scale;
+      const y = position.y / scale;
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    }
+
+    async function registerRecallTerminalFileDrop() {
+      let draggingFiles = false;
+      // Relayed from the main window's native drag handler (main.rs). x/y are
+      // physical pixels relative to the window.
+      await window.__TAURI__.event.listen('recall:file-drag', (event) => {
+        const { type, paths, x, y } = event.payload || {};
+        if (type === 'enter') draggingFiles = Array.isArray(paths) && paths.length > 0;
+        const over = draggingFiles && isOverRecallTerminal(x == null ? null : { x, y });
+        recallTerminalContainer.classList.toggle('is-drop-target', over && type !== 'drop' && type !== 'leave');
+        if (type === 'leave') draggingFiles = false;
+        if (type !== 'drop') return;
+        draggingFiles = false;
+        if (!over || !paths?.length) return;
+        recallTerminal.focus();
+        // paste() routes through onData as user input, so the PTY write queue
+        // and shadow line see it like any other paste, and bracketed paste is
+        // applied when the TUI asked for it.
+        recallTerminal.paste(paths.map(shellEscapeDroppedPath).join(' ') + ' ');
+      });
     }
 
     async function forwardRecallTerminalData(data, isUserInput) {
@@ -15408,25 +15542,51 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     }
 
     // ── Expand / collapse with window resize ──
-    function applyRecallWindowLayout(width, options = {}) {
-      // Windows: skip OS resize — the flex layout reflows correctly without it,
-      // and forcing a width on collapse (520px) is jarring when the user had a
-      // different window size. macOS/Linux behavior is unchanged.
-      if (IS_WINDOWS) return Promise.resolve();
-      const ratio = getZoomRatio();
-      return invoke('cmd_apply_recall_window_layout', {
-        width: Math.round(width * ratio),
-        height: Math.round(640 * ratio),
+    // Recall needs room for two panes. Opening it widens a window that is too
+    // narrow for both; closing it gives back exactly the width it took, and
+    // only if the window has not been resized since. A size someone chose is
+    // never shrunk, and height is never touched. This used to force 960x640 on
+    // open and 520x640 on close (and again on every text-size change), so the
+    // window kept snapping back to a small size.
+    let recallGrewWindow = null; // { from, to } logical widths
+
+    async function currentWindowLogicalWidth() {
+      const [size, scale] = await Promise.all([currentWindow.outerSize(), currentWindow.scaleFactor()]);
+      return size.width / scale;
+    }
+
+    async function ensureRecallWindowRoom(options = {}) {
+      if (IS_WINDOWS) return;
+      const needed = Math.round(EXPANDED_WIDTH * getZoomRatio());
+      const width = await currentWindowLogicalWidth();
+      if (width + 1 >= needed) return;
+      await invoke('cmd_apply_recall_window_layout', {
+        width: needed,
+        height: null,
         avoidRightEdge: !!options.avoidRightEdge,
+      });
+      // Keep the first "from" across repeated grows (a text-size bump while
+      // open), so closing returns to the size the person actually had.
+      recallGrewWindow = { from: recallGrewWindow?.from ?? width, to: needed };
+    }
+
+    async function returnRecallWindowRoom() {
+      const grew = recallGrewWindow;
+      recallGrewWindow = null;
+      if (IS_WINDOWS || !grew) return;
+      const width = await currentWindowLogicalWidth();
+      if (Math.abs(width - grew.to) > 2) return;
+      await invoke('cmd_apply_recall_window_layout', {
+        width: grew.from,
+        height: null,
+        avoidRightEdge: false,
       });
     }
 
     document.addEventListener('uizoomchange', async () => {
-      if (IS_WINDOWS) return;
+      if (!recallExpanded) return;
       const isFullscreen = await currentWindow.isFullscreen().catch(() => false);
-      if (isFullscreen) return;
-      const targetWidth = recallExpanded ? EXPANDED_WIDTH : COLLAPSED_WIDTH;
-      applyRecallWindowLayout(targetWidth).catch(() => {});
+      if (!isFullscreen) ensureRecallWindowRoom().catch(() => {});
     });
 
     async function expandRecallPanel() {
@@ -15438,7 +15598,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       const isFullscreen = await currentWindow.isFullscreen().catch(() => false);
 
       if (!isFullscreen) {
-        await applyRecallWindowLayout(EXPANDED_WIDTH, { avoidRightEdge: true }).catch((e) => {
+        await ensureRecallWindowRoom({ avoidRightEdge: true }).catch((e) => {
           console.error('Recall expand layout:', e);
         });
       }
@@ -15484,7 +15644,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
 
       setTimeout(async () => {
         if (!isFullscreen) {
-          await applyRecallWindowLayout(COLLAPSED_WIDTH).catch(() => { });
+          await returnRecallWindowRoom().catch(() => { });
         }
         recallExpanded = false;
         expandAnimating = false;
@@ -16938,7 +17098,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     currentWindow.onResized(async () => {
       const fs = await currentWindow.isFullscreen().catch(() => false);
       if (wasFullscreen && !fs && recallExpanded) {
-        await applyRecallWindowLayout(EXPANDED_WIDTH).catch(() => { });
+        await ensureRecallWindowRoom().catch(() => { });
         if (recallFitAddon) recallFitAddon.fit();
       }
       wasFullscreen = fs;

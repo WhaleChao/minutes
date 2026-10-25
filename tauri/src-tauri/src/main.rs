@@ -436,7 +436,8 @@ fn cmd_show_main_window(app: tauri::AppHandle) {
 fn cmd_apply_recall_window_layout(
     app: tauri::AppHandle,
     width: f64,
-    height: f64,
+    // None keeps the window's current height: Recall only ever needs width.
+    height: Option<f64>,
     avoid_right_edge: bool,
 ) -> Result<(), String> {
     const MIN_WIDTH: f64 = 460.0;
@@ -445,7 +446,7 @@ fn cmd_apply_recall_window_layout(
     const MAX_HEIGHT: f64 = 1000.0;
     const FRAME_EPSILON: f64 = 1.0;
 
-    if !width.is_finite() || !height.is_finite() {
+    if !width.is_finite() || height.is_some_and(|height| !height.is_finite()) {
         return Err("invalid recall window layout size".into());
     }
 
@@ -460,9 +461,13 @@ fn cmd_apply_recall_window_layout(
     }
 
     let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
-    let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
     let monitor = win.current_monitor().ok().flatten();
     let scale = monitor.as_ref().map(|monitor| monitor.scale_factor());
+    let height = match (height, win.inner_size(), scale) {
+        (Some(height), _, _) => height.clamp(MIN_HEIGHT, MAX_HEIGHT),
+        (None, Ok(size), Some(scale)) => size.height as f64 / scale,
+        (None, _, _) => return Err("could not read the window height".into()),
+    };
 
     if avoid_right_edge {
         if let (Some(monitor), Some(scale)) = (monitor.as_ref(), scale) {
@@ -484,7 +489,7 @@ fn cmd_apply_recall_window_layout(
         }
     }
 
-    let size_needs_update = match (win.outer_size(), scale) {
+    let size_needs_update = match (win.inner_size(), scale) {
         (Ok(size), Some(scale)) => {
             let logical_width = size.width as f64 / scale;
             let logical_height = size.height as f64 / scale;
@@ -3117,6 +3122,47 @@ fn main() {
                     api.prevent_close();
                     window.hide().ok();
                 }
+                // Native file drops never reach the DOM: Tauri's drag handler
+                // takes them first. Relay them to the page on the app-wide
+                // event channel (the one every other main-window event uses)
+                // so the Recall terminal can type a dropped file's path, and
+                // log the edges so a drop that goes nowhere is diagnosable.
+                tauri::WindowEvent::DragDrop(drag) if window.label() == "main" => {
+                    let (kind, paths, position) = match drag {
+                        tauri::DragDropEvent::Enter { paths, position } => {
+                            ("enter", Some(paths), Some(position))
+                        }
+                        tauri::DragDropEvent::Over { position } => ("over", None, Some(position)),
+                        tauri::DragDropEvent::Drop { paths, position } => {
+                            ("drop", Some(paths), Some(position))
+                        }
+                        tauri::DragDropEvent::Leave => ("leave", None, None),
+                        _ => return,
+                    };
+                    if kind != "over" {
+                        let _ = minutes_core::logging::append_log(&serde_json::json!({
+                            "ts": chrono::Local::now().to_rfc3339(),
+                            "level": "info",
+                            "step": "desktop_file_drag",
+                            "file": "",
+                            "extra": {
+                                "event": kind,
+                                "paths": paths.map(|p| p.len()),
+                                "x": position.map(|p| p.x),
+                                "y": position.map(|p| p.y),
+                            },
+                        }));
+                    }
+                    let _ = window.emit(
+                        "recall:file-drag",
+                        serde_json::json!({
+                            "type": kind,
+                            "paths": paths,
+                            "x": position.map(|p| p.x),
+                            "y": position.map(|p| p.y),
+                        }),
+                    );
+                }
                 tauri::WindowEvent::Focused(false) if window.label() == "palette" => {
                     let app_handle = window.app_handle().clone();
                     let state = app_handle.state::<commands::AppState>();
@@ -3158,6 +3204,7 @@ fn main() {
             commands::cmd_list_meetings,
             commands::cmd_search,
             commands::cmd_add_note,
+            commands::cmd_note_target,
             commands::cmd_sensitive_start,
             commands::cmd_sensitive_stop,
             commands::cmd_run_meeting_debrief,
@@ -3202,6 +3249,10 @@ fn main() {
             commands::cmd_list_devices,
             commands::cmd_remember_dictation_hud_position,
             commands::cmd_delete_meeting,
+            commands::cmd_archive_meeting,
+            commands::cmd_restore_archived_meeting,
+            commands::cmd_reveal_path,
+            commands::cmd_copy_path,
             commands::cmd_get_meeting_detail,
             commands::cmd_resummarize_meeting,
             commands::cmd_resummarize_status,
