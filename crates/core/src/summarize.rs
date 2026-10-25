@@ -25,6 +25,11 @@ use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct Summary {
+    /// Meeting title written in the same model call as the summary. `None`
+    /// when the model omitted it or when the parsed text held more than one
+    /// title (concatenated chunk outputs), so the pipeline falls back to a
+    /// separate title call.
+    pub title: Option<String>,
     pub text: String,
     pub decisions: Vec<String>,
     pub action_items: Vec<String>,
@@ -625,6 +630,7 @@ Extract:
 4. Open questions (unresolved questions or unknowns that still need follow-up)
 5. Commitments (explicit promises, commitments, or owner statements made by someone)
 6. Participants (names of people present or mentioned in the conversation)
+7. Title (3-8 words, specific about the topic or outcome of the whole meeting: name the concrete products, projects or people discussed rather than a general category; never a generic title like "Meeting", "Call" or "Recording")
 
 For an empty section, leave its header with no bullet items. Never invent a
 "none", "no decisions were made" or translated absence bullet. Those are
@@ -632,6 +638,8 @@ section states, not decisions or tasks. MICROPHONE and SYSTEM are audio-source
 labels, not participant names. Preserve substantive negative decisions.
 
 Respond in this exact format:
+
+TITLE: Specific meeting title
 
 KEY POINTS:
 - point 1
@@ -694,12 +702,24 @@ fn parse_summary_response(response: &str) -> Summary {
     let mut open_questions = Vec::new();
     let mut commitments = Vec::new();
     let mut participants_raw = Vec::new();
+    let mut titles: Vec<String> = Vec::new();
+    let mut removed_title_line = false;
     let mut current_section = "";
     let mut fallback_lines = Vec::new();
     let mut removed_absence = false;
 
     for line in response.lines() {
         let trimmed = line.trim();
+
+        if let Some(title) = trimmed.strip_prefix("TITLE:") {
+            current_section = "title";
+            removed_title_line = true;
+            let title = title.trim();
+            if !title.is_empty() {
+                titles.push(title.to_string());
+            }
+            continue;
+        }
         fallback_lines.push(line);
 
         if trimmed.starts_with("KEY POINTS:") {
@@ -729,6 +749,10 @@ fn parse_summary_response(response: &str) -> Summary {
                 continue;
             }
             match current_section {
+                "title" => {
+                    fallback_lines.pop();
+                    titles.push(item.trim().to_string());
+                }
                 "key_points" => key_points.push(item.to_string()),
                 "decisions" => decisions.push(item.to_string()),
                 "action_items" => action_items.push(item.to_string()),
@@ -753,9 +777,17 @@ fn parse_summary_response(response: &str) -> Summary {
         .filter(|p| !p.is_empty())
         .collect();
 
+    // One response, one title. Engines that concatenate per-chunk outputs
+    // without a synthesis call produce several; none of them names the whole
+    // meeting, so the separate title call decides instead.
+    titles.retain(|title| !title.is_empty());
+    titles.dedup();
+    let title = (titles.len() == 1).then(|| titles.remove(0));
+
     Summary {
+        title,
         text: if key_points.is_empty() {
-            if removed_absence {
+            if removed_absence || removed_title_line {
                 fallback_lines.join("\n")
             } else {
                 response.to_string()
@@ -770,6 +802,17 @@ fn parse_summary_response(response: &str) -> Summary {
         key_points,
         participants,
     }
+}
+
+/// Parse per-chunk outputs that were concatenated without a synthesis call.
+/// Each chunk saw only part of the meeting, so a title from any one of them
+/// would name a fragment; leave it to the separate title call instead.
+fn parse_concatenated_chunk_summaries(all_text: &str, chunk_count: usize) -> Summary {
+    let mut summary = parse_summary_response(all_text);
+    if chunk_count > 1 {
+        summary.title = None;
+    }
+    summary
 }
 
 fn summary_output_chars(summary: &Summary) -> usize {
@@ -2122,7 +2165,11 @@ fn run_summary_agent_call(
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::Write;
-    let invocation = prepare_agent_invocation(agent_cmd, prompt, selected_screens, false)?;
+    // Text-only summaries run lean (no MCP servers, no tools): the prompt
+    // carries the whole transcript, and starting the user's MCP servers only
+    // adds startup time. Screenshots need the Read tool, so they stay full.
+    let lean = existing_screen_files(selected_screens).is_empty();
+    let invocation = prepare_agent_invocation(agent_cmd, prompt, selected_screens, lean)?;
     let cleanup_path = invocation.cleanup_path.clone();
 
     // AIDEV-NOTE: Use Stdio::null() when no stdin payload is needed (e.g. pi, opencode
@@ -2647,7 +2694,7 @@ fn summarize_with_openai(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── Mistral API ─────────────────────────────────────────────
@@ -2899,7 +2946,7 @@ fn summarize_with_openai_compatible(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── Ollama (local) ───────────────────────────────────────────
@@ -2932,7 +2979,7 @@ fn summarize_with_apple_fm(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 fn summarize_with_ollama(
@@ -2960,7 +3007,7 @@ fn summarize_with_ollama(
         all_text.push('\n');
     }
 
-    Ok(parse_summary_response(&all_text))
+    Ok(parse_concatenated_chunk_summaries(&all_text, chunks.len()))
 }
 
 // ── HTTP helper (ureq — pure Rust, no subprocess, no secrets in process args) ──
@@ -3214,7 +3261,8 @@ fn run_title_refinement_via_agent_timeout(
     agent_cmd: &str,
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let invocation = prepare_agent_invocation(agent_cmd, prompt, &[], false)?;
+    // A title is a one-line text task: lean (no MCP, no tools) like speaker mapping.
+    let invocation = prepare_agent_invocation(agent_cmd, prompt, &[], true)?;
     let cleanup_path = invocation.cleanup_path.clone();
     let result = (|| {
         let mut command = crate::bounded_child::BoundedCommand::new(&invocation.cmd);
@@ -4311,6 +4359,56 @@ COMMITMENTS:
     }
 
     #[test]
+    fn parse_summary_response_reads_one_title_and_keeps_it_out_of_the_text() {
+        let summary = parse_summary_response(
+            "TITLE: Annual Billing Decision\n\nKEY POINTS:\n- Reviewed billing\n",
+        );
+        assert_eq!(summary.title.as_deref(), Some("Annual Billing Decision"));
+        assert_eq!(summary.key_points, vec!["Reviewed billing"]);
+
+        let bulleted = parse_summary_response("TITLE:\n- Pricing Review\n\nKEY POINTS:\n- A\n");
+        assert_eq!(bulleted.title.as_deref(), Some("Pricing Review"));
+
+        let freeform = parse_summary_response("TITLE: Pricing Review\nWe talked about pricing.");
+        assert_eq!(freeform.title.as_deref(), Some("Pricing Review"));
+        assert!(!freeform.text.contains("TITLE"));
+
+        assert!(parse_summary_response("KEY POINTS:\n- A\n").title.is_none());
+    }
+
+    #[test]
+    fn parse_summary_response_drops_titles_from_concatenated_chunks() {
+        // Engines without a synthesis call concatenate per-chunk outputs; no
+        // chunk title names the whole meeting.
+        let summary = parse_summary_response(
+            "TITLE: Opening Budget Talk\nKEY POINTS:\n- A\n\nTITLE: Hiring Plan Wrap-Up\nKEY POINTS:\n- B\n",
+        );
+        assert!(summary.title.is_none());
+        assert_eq!(summary.key_points, vec!["A", "B"]);
+
+        let repeated = parse_summary_response(
+            "TITLE: Hiring Plan\nKEY POINTS:\n- A\nTITLE: Hiring Plan\nKEY POINTS:\n- B\n",
+        );
+        assert_eq!(repeated.title.as_deref(), Some("Hiring Plan"));
+    }
+
+    #[test]
+    fn concatenated_chunk_outputs_never_supply_a_title() {
+        let text = "TITLE: Opening Budget Talk\nKEY POINTS:\n- A\n";
+        assert!(parse_concatenated_chunk_summaries(text, 2).title.is_none());
+        assert_eq!(
+            parse_concatenated_chunk_summaries(text, 1).title.as_deref(),
+            Some("Opening Budget Talk")
+        );
+    }
+
+    #[test]
+    fn summary_prompt_asks_for_a_title_section() {
+        let prompt = build_base_system_prompt("auto");
+        assert!(prompt.contains("TITLE: Specific meeting title"));
+    }
+
+    #[test]
     fn parse_summary_response_extracts_participants() {
         let response = "\
 KEY POINTS:
@@ -4331,6 +4429,7 @@ PARTICIPANTS:
     #[test]
     fn format_summary_produces_markdown() {
         let summary = Summary {
+            title: None,
             text: String::new(),
             key_points: vec!["Point one".into(), "Point two".into()],
             decisions: vec!["Decision A".into()],
@@ -4930,6 +5029,31 @@ PARTICIPANTS:
                 assert!(chunks.iter().all(|chunk| chunk.len() <= cap));
             }
         }
+    }
+
+    #[test]
+    fn agent_long_meeting_title_comes_from_the_synthesis_not_a_chunk() {
+        let transcript = format!(
+            "{}\n[59:00] closing discussion",
+            "opening discussion\n".repeat(6_000)
+        );
+        let result = summarize_agent_with_runner(
+            &transcript,
+            None,
+            &[],
+            "system",
+            "fake",
+            std::time::Duration::from_secs(5),
+            |prompt, _, _| {
+                if prompt.contains("<partial_summary>") {
+                    return Ok("TITLE: Whole Meeting Title\nKEY POINTS:\n- Everything".into());
+                }
+                Ok("TITLE: Chunk Fragment Title\nKEY POINTS:\n- Part".into())
+            },
+        )
+        .unwrap();
+        assert!(result.coverage.source_chunks > 1);
+        assert_eq!(result.summary.title.as_deref(), Some("Whole Meeting Title"));
     }
 
     #[test]

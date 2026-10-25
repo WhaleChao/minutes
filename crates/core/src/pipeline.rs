@@ -4817,7 +4817,9 @@ fn transcribe_to_artifact_with_authority(
     } else {
         None
     };
-    let calendar_event_title = matched_event.as_ref().map(|event| event.title.clone());
+    let calendar_event_title = matched_event
+        .as_ref()
+        .and_then(|event| meaningful_calendar_title(&event.title));
     let attendees = matched_event
         .as_ref()
         .map(|event| event.attendees.clone())
@@ -4977,7 +4979,9 @@ fn write_transcript_artifact_with_authority(
     } else {
         None
     };
-    let calendar_event_title = matched_event.as_ref().map(|event| event.title.clone());
+    let calendar_event_title = matched_event
+        .as_ref()
+        .and_then(|event| meaningful_calendar_title(&event.title));
     let attendees = matched_event
         .as_ref()
         .map(|event| event.attendees.clone())
@@ -5606,6 +5610,12 @@ where
         effective_speaker_labels,
         artifact.frontmatter.attendees.len(),
         attendees.len(),
+    );
+    let summary = rerender_summary_if_withheld(
+        summary,
+        collapse_warning.as_ref(),
+        raw_summary.as_ref(),
+        summary_coverage.as_ref(),
     );
 
     let entities_started = std::time::Instant::now();
@@ -6321,6 +6331,12 @@ where
         calendar_attendees.len(),
         attendees.len(),
     );
+    let summary = rerender_summary_if_withheld(
+        summary,
+        collapse_warning.as_ref(),
+        raw_summary.as_ref(),
+        summary_coverage.as_ref(),
+    );
 
     // Step 5: Write markdown (always)
     let duration = format_duration_secs(filter_stats.audio_duration_secs);
@@ -6750,6 +6766,26 @@ where
     let attempted_model = summarize::title_refinement_model(config);
     let input_chars = summarize::title_refinement_input_chars(summary_text, raw_summary, entities);
 
+    // The summary call already wrote a title with the whole transcript in
+    // view. Use it when it passes the same quality gate as a refined title;
+    // otherwise spend the separate title call as before.
+    if let Some(cleaned) = raw_summary
+        .title
+        .as_deref()
+        .map(sanitize_llm_title_candidate)
+        .filter(|cleaned| llm_title_passes_quality(cleaned))
+    {
+        return TitleGenerationDecision {
+            final_title: cleaned.clone(),
+            refined_title: Some(cleaned),
+            outcome: "llm",
+            model: attempted_model,
+            input_chars: 0,
+            detail: Some("from-summary".into()),
+            llm_duration_ms: 0,
+        };
+    }
+
     let llm_started = std::time::Instant::now();
     let refine_result = refine(summary_text, raw_summary, entities, config);
     let llm_duration_ms = llm_started.elapsed().as_millis() as u64;
@@ -6805,6 +6841,26 @@ where
 /// the single-pass `process` path and the desktop two-phase path
 /// (`write_transcript_artifact` → `enrich_transcript_artifact`) go through
 /// here so the toggle means the same thing everywhere.
+/// Calendars show a free/busy placeholder ("Busy") for an event whose details
+/// are hidden. It names no meeting: used as the title it became a project
+/// entity called "Busy" and a meaningless calendar label on the meeting.
+pub fn meaningful_calendar_title(title: &str) -> Option<String> {
+    const PLACEHOLDERS: &[&str] = &[
+        "busy",
+        "free",
+        "tentative",
+        "away",
+        "out of office",
+        "private",
+        "private event",
+        "private appointment",
+        "no title",
+        "(no title)",
+    ];
+    let title = normalize_space(title);
+    (!title.is_empty() && !PLACEHOLDERS.contains(&title.to_lowercase().as_str())).then_some(title)
+}
+
 fn calendar_meeting_title(config: &Config, calendar_event_title: Option<&str>) -> Option<String> {
     let event_title = calendar_event_title?;
     if config.calendar.use_event_title_for_meeting_title {
@@ -7980,6 +8036,36 @@ fn withhold_assignees_on_collapse(
     })
 }
 
+/// The Markdown body is rendered from the summarizer's own lines, so
+/// withholding owners in the structured data alone (#392) left "@Ryan:" in the
+/// text people actually read. When the guard fired, render the body again
+/// with the "@owner:" prefix dropped from action items and commitments.
+fn rerender_summary_if_withheld(
+    rendered: Option<String>,
+    collapse_warning: Option<&markdown::ProcessingWarning>,
+    raw_summary: Option<&summarize::Summary>,
+    coverage: Option<&summarize::SummaryCoverage>,
+) -> Option<String> {
+    match (collapse_warning, raw_summary) {
+        (Some(_), Some(raw)) => Some(format_summary_with_coverage(
+            &summary_without_owners(raw),
+            coverage,
+        )),
+        _ => rendered,
+    }
+}
+
+fn summary_without_owners(summary: &summarize::Summary) -> summarize::Summary {
+    let unowned = |line: &String| match parse_actor_prefix(line) {
+        (Some(_), what) => what,
+        (None, _) => line.clone(),
+    };
+    let mut summary = summary.clone();
+    summary.action_items = summary.action_items.iter().map(unowned).collect();
+    summary.commitments = summary.commitments.iter().map(unowned).collect();
+    summary
+}
+
 fn strip_conversational_prefixes(line: &str) -> String {
     let mut remaining = line.trim();
     let fillers = ["okay", "ok", "so", "well", "alright", "all right"];
@@ -8169,12 +8255,23 @@ pub(crate) fn extract_action_items(summary: &summarize::Summary) -> Vec<markdown
 
             markdown::ActionItem {
                 assignee,
-                task: task.trim_end_matches(')').trim().to_string(),
+                task: trim_unbalanced_close_parens(&task),
                 due,
                 status: "open".to_string(),
             }
         })
         .collect()
+}
+
+/// Drop trailing ")" left over from an unbalanced suffix such as "(due Friday)"
+/// split mid-way, but keep a closing parenthesis that closes something:
+/// "(completed in-session)" must not become "(completed in-session".
+fn trim_unbalanced_close_parens(text: &str) -> String {
+    let mut text = text.trim();
+    while text.ends_with(')') && text.matches(')').count() > text.matches('(').count() {
+        text = text[..text.len() - 1].trim_end();
+    }
+    text.to_string()
 }
 
 /// Extract structured decisions from a Summary.
@@ -8254,7 +8351,7 @@ pub(crate) fn extract_intents(summary: &summarize::Summary) -> Vec<markdown::Int
         let (who, what) = parse_actor_prefix(commitment);
         intents.push(markdown::Intent {
             kind: markdown::IntentKind::Commitment,
-            what: what.trim_end_matches(')').trim().to_string(),
+            what: trim_unbalanced_close_parens(&what),
             who,
             status: "open".into(),
             by_date: due,
@@ -8298,41 +8395,48 @@ fn extract_due_date(text: &str) -> Option<String> {
     None
 }
 
-/// Infer a topic from decision text by extracting the first noun phrase.
+/// Infer a topic from decision text by extracting the first noun phrase:
+/// the words before the first verb or preposition. Decision topics become
+/// project entities, so when the sentence has no clear leading noun phrase
+/// (an imperative like "Keep the app name...", or a single word like
+/// "Gaming remains...") there is no topic. A fragment such as
+/// `keep app name "second` is worse than none.
 fn infer_topic(text: &str) -> Option<String> {
-    // Simple heuristic: use the first 3-5 meaningful words as the topic
-    let words: Vec<&str> = text
+    const LEADING_SKIP: &[&str] = &["the", "a", "an", "we", "they", "it", "our", "their"];
+    // Verbs and prepositions that end a leading noun phrase.
+    const BOUNDARIES: &[&str] = &[
+        "is", "are", "was", "were", "be", "been", "will", "would", "should", "must", "can",
+        "could", "may", "might", "shall", "has", "have", "had", "remains", "remain", "stays",
+        "stay", "keeps", "keep", "use", "uses", "needs", "need", "goes", "becomes", "gets",
+        "makes", "moves", "wins", "replaces", "rather", "instead", "to", "for", "of", "in", "on",
+        "at", "over", "with", "by", "from", "as", "via", "into", "only", "and", "or", "but",
+        "than",
+    ];
+    let mut words = text
         .split_whitespace()
-        .filter(|w| {
-            let lower = w.to_lowercase();
-            !matches!(
-                lower.as_str(),
-                "the"
-                    | "a"
-                    | "an"
-                    | "to"
-                    | "for"
-                    | "of"
-                    | "in"
-                    | "on"
-                    | "at"
-                    | "is"
-                    | "was"
-                    | "will"
-                    | "should"
-                    | "we"
-                    | "they"
-                    | "it"
-            )
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
         })
+        .filter(|word| !word.is_empty())
+        .skip_while(|word| LEADING_SKIP.contains(&word.as_str()))
+        .peekable();
+    // An imperative opening ("Keep...", "Use...") has no subject to name.
+    if words
+        .peek()
+        .is_some_and(|word| BOUNDARIES.contains(&word.as_str()))
+    {
+        return None;
+    }
+    let phrase: Vec<String> = words
+        .take_while(|word| !BOUNDARIES.contains(&word.as_str()))
         .take(4)
         .collect();
-
-    if words.is_empty() {
+    if phrase.len() < 2 {
         return None;
     }
 
-    let candidate = words.join(" ").to_lowercase();
+    let candidate = phrase.join(" ");
     (!is_task_like_project_candidate(&candidate, Some(text))).then_some(candidate)
 }
 
@@ -8818,6 +8922,7 @@ mod tests {
             detail: "All source chunks delivered.".into(),
         };
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec!["Meeting point".into()],
             decisions: vec![],
@@ -9519,6 +9624,7 @@ mod tests {
 
     fn sample_summary() -> summarize::Summary {
         summarize::Summary {
+            title: None,
             text: "Discussed Command RX codebase walkthrough and next steps.".into(),
             key_points: vec![
                 "Walked through the Command RX codebase".into(),
@@ -9635,6 +9741,47 @@ mod tests {
         let transcript = "Okay, this is a meeting that we're gonna be doing here";
         let title = generate_title(transcript, None);
         assert_eq!(title, "Untitled Recording");
+    }
+
+    #[test]
+    fn summary_title_skips_the_separate_title_call() {
+        let mut summary = sample_summary();
+        summary.title = Some("Command RX Codebase Walkthrough".into());
+        let decision = maybe_refine_title_with_llm(
+            "Untitled Recording",
+            None,
+            Some("Command RX walkthrough with implementation planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &Config::default(),
+            |_, _, _, _| panic!("title call must not run when the summary has a title"),
+        );
+        assert_eq!(decision.final_title, "Command RX Codebase Walkthrough");
+        assert_eq!(decision.outcome, "llm");
+        assert_eq!(decision.detail.as_deref(), Some("from-summary"));
+    }
+
+    #[test]
+    fn generic_summary_title_falls_back_to_the_title_call() {
+        let mut summary = sample_summary();
+        summary.title = Some("Meeting".into());
+        let decision = maybe_refine_title_with_llm(
+            "Untitled Recording",
+            None,
+            Some("Command RX walkthrough with implementation planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &Config::default(),
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Command RX Codebase Walkthrough".into(),
+                    model: "agent:claude".into(),
+                    input_chars: 128,
+                })
+            },
+        );
+        assert_eq!(decision.final_title, "Command RX Codebase Walkthrough");
+        assert_eq!(decision.detail, None);
     }
 
     #[test]
@@ -10091,6 +10238,7 @@ mod tests {
     #[test]
     fn extract_action_items_parses_assignee_and_task() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec![],
@@ -10285,6 +10433,7 @@ mod tests {
     #[test]
     fn extract_decisions_with_topic_inference() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec![
@@ -10301,6 +10450,99 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         assert!(decisions[0].topic.is_some());
         assert!(decisions[0].text.contains("monthly billing"));
+    }
+
+    #[test]
+    fn infer_topic_takes_the_leading_noun_phrase_or_nothing() {
+        assert_eq!(
+            infer_topic("LeaderNet 835 reconciliation remains the core workflow").as_deref(),
+            Some("leadernet 835 reconciliation")
+        );
+        assert_eq!(
+            infer_topic("Price advisor platform at monthly billing/mo").as_deref(),
+            Some("price advisor platform")
+        );
+        // The Second Look meeting: imperatives and one-word subjects used to
+        // become clipped project fragments.
+        assert_eq!(
+            infer_topic("Keep the app name \"Second Look\" rather than renaming"),
+            None
+        );
+        assert_eq!(
+            infer_topic("Use the pre-prepped judge Q&A file only as a fallback"),
+            None
+        );
+        assert_eq!(
+            infer_topic("Gaming remains the initial vertical, delivered as one plugin"),
+            None
+        );
+        assert_eq!(infer_topic("Pitch must explicitly cover uniqueness"), None);
+        // Punctuation never survives into a topic.
+        assert_eq!(
+            infer_topic("\"Second Look\" branding stays as is").as_deref(),
+            Some("second look branding")
+        );
+    }
+
+    #[test]
+    fn trim_unbalanced_close_parens_keeps_closed_parentheticals() {
+        assert_eq!(
+            trim_unbalanced_close_parens("present the integrations (completed in-session)"),
+            "present the integrations (completed in-session)"
+        );
+        assert_eq!(
+            trim_unbalanced_close_parens("Send doc by Friday)"),
+            "Send doc by Friday"
+        );
+        assert_eq!(trim_unbalanced_close_parens("plain task"), "plain task");
+    }
+
+    #[test]
+    fn withheld_owners_leave_the_rendered_body_too() {
+        let summary = summarize::Summary {
+            title: None,
+            text: String::new(),
+            key_points: vec!["point".into()],
+            decisions: vec![],
+            action_items: vec!["@Ryan: present the sponsor integrations".into()],
+            open_questions: vec![],
+            commitments: vec!["@Unnamed participant: will try Minutes".into()],
+            participants: vec![],
+        };
+        let warning = markdown::ProcessingWarning {
+            step: "attribution".into(),
+            reason: "diarization_collapsed".into(),
+            timeout_secs: None,
+            message: None,
+        };
+        let original = format_summary_with_coverage(&summary, None);
+        let body = rerender_summary_if_withheld(
+            Some(original.clone()),
+            Some(&warning),
+            Some(&summary),
+            None,
+        )
+        .unwrap();
+        assert!(!body.contains("@Ryan"));
+        assert!(!body.contains("@Unnamed"));
+        assert!(body.contains("- [ ] present the sponsor integrations"));
+        assert!(body.contains("- will try Minutes"));
+        // No collapse, no change.
+        assert_eq!(
+            rerender_summary_if_withheld(Some(original.clone()), None, Some(&summary), None),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn calendar_placeholders_are_not_meeting_titles() {
+        assert_eq!(meaningful_calendar_title("Busy"), None);
+        assert_eq!(meaningful_calendar_title("  out of office "), None);
+        assert_eq!(meaningful_calendar_title(""), None);
+        assert_eq!(
+            meaningful_calendar_title("Weekly sync  with Ryan").as_deref(),
+            Some("Weekly sync with Ryan")
+        );
     }
 
     #[test]
@@ -11183,6 +11425,7 @@ mod tests {
     #[test]
     fn extract_intents_builds_typed_entries() {
         let summary = summarize::Summary {
+            title: None,
             text: String::new(),
             key_points: vec![],
             decisions: vec!["Use REST over GraphQL for the new API".into()],
