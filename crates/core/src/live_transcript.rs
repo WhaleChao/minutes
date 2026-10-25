@@ -1247,6 +1247,16 @@ fn drain_relay_backlog(
             "wrote queued live audio to the session WAV"
         );
     }
+    let remaining = audio_rx.len();
+    if remaining > 0 {
+        // Only a WAV write slower than capture gets here; say what was lost.
+        persist_sidecar_log(
+            "warn",
+            "live_audio_drain_incomplete",
+            "stopped writing queued live audio to the session WAV before the queue emptied",
+            serde_json::json!({ "written_chunks": drained, "discarded_chunks": remaining }),
+        );
+    }
     drained
 }
 
