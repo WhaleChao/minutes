@@ -9204,7 +9204,11 @@ pub fn cmd_get_meeting_detail_blocking(path: String) -> Result<MeetingDetail, St
         status,
         context: frontmatter.context,
         attendees: frontmatter.attendees,
-        calendar_event: frontmatter.calendar_event,
+        // Older files stored the free/busy placeholder ("Busy") as the event.
+        calendar_event: frontmatter
+            .calendar_event
+            .as_deref()
+            .and_then(minutes_core::pipeline::meaningful_calendar_title),
         action_items,
         decisions,
         related_people: related.related_people,
