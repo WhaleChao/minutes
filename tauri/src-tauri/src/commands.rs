@@ -7412,6 +7412,13 @@ pub fn cmd_add_note(text: String) -> Result<String, String> {
     minutes_core::notes::add_note(&text)
 }
 
+/// Lets the note window say up front whether a note has anywhere to go,
+/// instead of failing only after the person has typed it.
+#[tauri::command]
+pub fn cmd_note_target() -> Option<&'static str> {
+    minutes_core::notes::note_target()
+}
+
 /// Start a no-capture sensitive meeting from the desktop app.
 #[tauri::command]
 pub fn cmd_sensitive_start(title: Option<String>) -> Result<serde_json::Value, String> {
@@ -8218,18 +8225,31 @@ fn delete_meeting_artifacts(
     Ok(())
 }
 
+/// One file moved into the archive folder. The desktop app keeps these so an
+/// Undo can put every file back exactly where it came from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ArchivedFileMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
 fn archive_meeting_artifacts(
     md_path: &Path,
     archive_dir: &Path,
     audio_artifacts: &[PathBuf],
     with_audio: bool,
-) -> Result<(), String> {
+) -> Result<Vec<ArchivedFileMove>, String> {
+    let mut moves = Vec::new();
     let dest_md = archive_dir.join(
         md_path
             .file_name()
             .ok_or_else(|| format!("missing filename for {}", md_path.display()))?,
     );
     std::fs::rename(md_path, &dest_md).map_err(|e| e.to_string())?;
+    moves.push(ArchivedFileMove {
+        from: md_path.to_path_buf(),
+        to: dest_md,
+    });
 
     if with_audio {
         for path in audio_artifacts.iter().filter(|path| path.exists()) {
@@ -8238,10 +8258,114 @@ fn archive_meeting_artifacts(
                 .ok_or_else(|| format!("missing filename for {}", path.display()))?;
             let dest_audio = archive_dir.join(file_name);
             std::fs::rename(path, &dest_audio).map_err(|e| e.to_string())?;
+            moves.push(ArchivedFileMove {
+                from: path.clone(),
+                to: dest_audio,
+            });
         }
     }
 
+    Ok(moves)
+}
+
+/// Archive a meeting and its audio without a confirmation dialog. Archiving
+/// only moves files into `<output_dir>/archive`, so the desktop app offers
+/// Undo instead of asking first; the returned moves are what Undo reverses.
+#[tauri::command]
+pub fn cmd_archive_meeting(path: String) -> Result<Vec<ArchivedFileMove>, String> {
+    let md_path = PathBuf::from(&path);
+    if !md_path.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    let audio_artifacts = minutes_core::capture::meeting_audio_artifact_paths(&md_path);
+    let archive_dir = Config::load().output_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir).map_err(|e| e.to_string())?;
+    archive_meeting_artifacts(&md_path, &archive_dir, &audio_artifacts, true)
+}
+
+#[tauri::command]
+pub fn cmd_restore_archived_meeting(moves: Vec<ArchivedFileMove>) -> Result<(), String> {
+    let output_dir = Config::load().output_dir;
+    restore_archived_meeting(&output_dir, &moves)
+}
+
+/// Reverse an archive. Every move is checked before any file is touched: the
+/// source must still be in the archive folder, and the destination must be
+/// free and inside the meetings folder, so a stale or forged receipt can
+/// neither overwrite a file nor move one anywhere else.
+fn restore_archived_meeting(output_dir: &Path, moves: &[ArchivedFileMove]) -> Result<(), String> {
+    let output_dir = std::fs::canonicalize(output_dir).map_err(|e| e.to_string())?;
+    let archive_dir = output_dir.join("archive");
+    for item in moves {
+        let archived = std::fs::canonicalize(&item.to)
+            .map_err(|_| format!("{} is no longer in the archive", item.to.display()))?;
+        if archived.parent() != Some(archive_dir.as_path()) {
+            return Err(format!(
+                "{} is not in the archive folder",
+                item.to.display()
+            ));
+        }
+        let original_parent = item
+            .from
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or_else(|| format!("{} no longer exists", item.from.display()))?;
+        if !original_parent.starts_with(&output_dir) || original_parent.starts_with(&archive_dir) {
+            return Err(format!(
+                "{} is outside the meetings folder",
+                item.from.display()
+            ));
+        }
+        if item.from.exists() {
+            return Err(format!("{} already exists", item.from.display()));
+        }
+    }
+    for item in moves {
+        std::fs::rename(&item.to, &item.from).map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Copy a file's path. A menu action is not a user gesture to WebKit, so the
+/// web clipboard API would refuse it; the native clipboard does not.
+#[tauri::command]
+pub fn cmd_copy_path(path: String) -> Result<(), String> {
+    copy_to_clipboard(&path)
+}
+
+/// Show a file selected in Finder (or Explorer). Elsewhere, open its folder.
+#[tauri::command]
+pub fn cmd_reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(target.as_os_str());
+        std::process::Command::new("explorer")
+            .arg(select)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let folder = target.parent().unwrap_or(&target);
+        open_target(&app, &folder.to_string_lossy())
+    }
 }
 
 #[tauri::command]
@@ -18062,6 +18186,54 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn restore_archived_meeting_puts_every_file_back() {
+        let dir = TempDir::new().unwrap();
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let md = dir.path().join("2026-04-01-undo.md");
+        std::fs::write(&md, "---\ntitle: Undo\n---\n").unwrap();
+        let artifacts = minutes_core::capture::meeting_audio_artifact_paths(&md);
+        for path in &artifacts {
+            std::fs::write(path, "artifact").unwrap();
+        }
+
+        let moves = archive_meeting_artifacts(&md, &archive_dir, &artifacts, true).unwrap();
+        assert_eq!(moves.len(), 1 + artifacts.len());
+        restore_archived_meeting(dir.path(), &moves).unwrap();
+
+        assert!(md.exists());
+        for path in &artifacts {
+            assert!(path.exists(), "{} should be restored", path.display());
+        }
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn restore_archived_meeting_refuses_to_overwrite_or_escape() {
+        let dir = TempDir::new().unwrap();
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let md = dir.path().join("2026-04-01-taken.md");
+        std::fs::write(&md, "original").unwrap();
+        let moves = archive_meeting_artifacts(&md, &archive_dir, &[], false).unwrap();
+
+        // A new file now occupies the original path: Undo must not clobber it.
+        std::fs::write(&md, "newer").unwrap();
+        assert!(restore_archived_meeting(dir.path(), &moves).is_err());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "newer");
+        std::fs::remove_file(&md).unwrap();
+
+        // A receipt pointing outside the meetings folder is rejected.
+        let elsewhere = TempDir::new().unwrap();
+        let forged = vec![ArchivedFileMove {
+            from: elsewhere.path().join("escaped.md"),
+            to: moves[0].to.clone(),
+        }];
+        assert!(restore_archived_meeting(dir.path(), &forged).is_err());
+        assert!(moves[0].to.exists());
     }
 
     #[test]

@@ -251,6 +251,17 @@ pub fn create_workspace(config: &Config) -> Result<PathBuf, String> {
     Ok(workspace)
 }
 
+/// Longest meeting body copied into CURRENT_MEETING.md, in characters.
+const MEETING_BODY_CHAR_LIMIT: usize = 80_000;
+
+/// The leading whole lines of `body` that fit in `limit` characters, or None
+/// when the whole body fits.
+fn truncate_meeting_body(body: &str, limit: usize) -> Option<&str> {
+    let (cut, _) = body.char_indices().nth(limit)?;
+    let end = body[..cut].rfind('\n').map(|i| i + 1).unwrap_or(cut);
+    Some(&body[..end])
+}
+
 /// Generate CURRENT_MEETING.md for discussing a specific meeting.
 pub fn generate_meeting_context(meeting_path: &Path, config: &Config) -> Result<String, String> {
     let content =
@@ -340,18 +351,31 @@ pub fn generate_meeting_context(meeting_path: &Path, config: &Config) -> Result<
         md.push('\n');
     }
 
-    // Include the full body (summary + transcript)
+    // Include the body (summary + transcript). The agent reads this file in
+    // one call, so keep whole meetings whole: 12k characters used to cut a
+    // 20-minute meeting off at minute nine. The cap keeps the file inside a
+    // single agent file read (~20k tokens). Past it, cut on a line boundary
+    // and say exactly where the rest starts, so the follow-up is one read.
     md.push_str("## Full Content\n\n");
-    md.push_str("The complete meeting transcript follows. It is also available at:\n");
-    md.push_str(&format!("`{}`\n\n", meeting_path.display()));
-    // Truncate very long transcripts to avoid blowing out context
-    let body_chars: Vec<char> = body.chars().collect();
-    if body_chars.len() > 12000 {
-        let truncated: String = body_chars[..12000].iter().collect();
-        md.push_str(&truncated);
-        md.push_str("\n\n...[transcript truncated — read the full file for the rest]\n");
-    } else {
-        md.push_str(body);
+    let path = meeting_path.display();
+    match truncate_meeting_body(body, MEETING_BODY_CHAR_LIMIT) {
+        None => {
+            md.push_str(&format!(
+                "The complete meeting transcript follows. Source file: `{path}`\n\n"
+            ));
+            md.push_str(body);
+        }
+        Some(kept) => {
+            let body_first_line = content[..content.len() - body.len()].lines().count() + 1;
+            let resume_line = body_first_line + kept.lines().count();
+            md.push_str(&format!(
+                "This meeting is long, so only its first part follows. The rest continues at line {resume_line} of `{path}` (e.g. `tail -n +{resume_line}` on that file).\n\n"
+            ));
+            md.push_str(kept);
+            md.push_str(&format!(
+                "\n\n[Transcript continues at line {resume_line} of `{path}`.]\n"
+            ));
+        }
     }
 
     md.push_str("\n\n## Instructions\n\n");
@@ -739,6 +763,38 @@ mod tests {
             ..Config::default()
         };
         (corpus, config)
+    }
+
+    #[test]
+    fn truncate_meeting_body_keeps_short_bodies_whole_and_cuts_on_lines() {
+        assert_eq!(truncate_meeting_body("short\nbody\n", 100), None);
+        let body = "first line\nsecond line\nthird line\n";
+        assert_eq!(truncate_meeting_body(body, 15), Some("first line\n"));
+        // Character-based, so multibyte text cannot split a code point.
+        assert_eq!(truncate_meeting_body("é\nüü\n", 3), Some("é\n"));
+    }
+
+    #[test]
+    fn meeting_context_points_at_the_exact_continuation_line() {
+        let (corpus, config) = test_config();
+        let path = corpus.path().join("2026-10-24-long.md");
+        let mut body = String::from("## Transcript\n");
+        while body.len() <= MEETING_BODY_CHAR_LIMIT {
+            body.push_str("[0:01] Speaker: words words words words words words\n");
+        }
+        let header = "---\ntitle: Long\ntype: meeting\ndate: 2026-10-24T16:29:00-04:00\nduration: 90m\n---\n";
+        std::fs::write(&path, format!("{header}{body}")).unwrap();
+
+        let md = generate_meeting_context(&path, &config).unwrap();
+        let marker = "continues at line ";
+        let at = md.find(marker).expect("continuation pointer") + marker.len();
+        let line: usize = md[at..].split(' ').next().unwrap().parse().unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let kept_last = md.lines().filter(|l| l.starts_with("[0:01]")).count();
+        // The named line is the first transcript line the context left out.
+        assert_eq!(line, header.lines().count() + 1 + 1 + kept_last);
+        assert!(source.lines().nth(line - 1).unwrap().starts_with("[0:01]"));
+        assert!(!md.contains("The complete meeting transcript follows"));
     }
 
     #[test]
