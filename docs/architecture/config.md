@@ -269,7 +269,7 @@ retention, nothing is deleted automatically unless `auto_cleanup` is enabled.
 
 | key | default | meaning |
 |---|---|---|
-| `backend` | `"whisper"` | Final transcription backend. Retained `"apple-speech"` and `"parakeet"` values resolve to sealed Whisper while their secure private-audio release gates remain closed. |
+| `backend` | `"whisper"` | Final transcription backend. `"sherpa"` uses the in-process Parakeet v3 model (install with `minutes setup --sherpa`) for each utterance's final text while Whisper still streams partials; if Parakeet v3 is missing or fails, Whisper writes the text. Retained `"apple-speech"` and `"parakeet"` values resolve to sealed Whisper while their secure private-audio release gates remain closed. |
 | `destination` | `"insert"` | `"insert"` puts the final text in the active app and on the clipboard; `"clipboard"`, `"file"`, and `"command"` remain available for explicit delivery workflows |
 | `destination_file` | unset | Target file when `destination = "file"` |
 | `destination_command` | unset | Shell command when `destination = "command"` |
