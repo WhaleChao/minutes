@@ -71,6 +71,12 @@ pub fn preload_model(config: &Config) -> Result<(), MinutesError> {
     let preload_start = Instant::now();
     startup_debug("preload_start", Some(&model_name), None, None);
 
+    // Whisper below still streams partials; Parakeet v3 writes the final text.
+    #[cfg(feature = "engine-sherpa")]
+    if dictation_final_backend(config) == DictationFinalBackend::Sherpa {
+        preload_sherpa_recognizer(config);
+    }
+
     // Check if already cached with the same model
     if let Ok(cache) = MODEL_CACHE.lock() {
         if let Some(ref cached) = *cache {
@@ -238,11 +244,13 @@ enum DictationFinalBackend {
     Whisper,
     AppleSpeech,
     Parakeet,
+    /// In-process Parakeet v3 (sherpa-onnx). Whisper still streams partials.
+    Sherpa,
 }
 
 impl DictationFinalBackend {
     fn needs_utterance_samples(self) -> bool {
-        matches!(self, Self::AppleSpeech | Self::Parakeet)
+        matches!(self, Self::AppleSpeech | Self::Parakeet | Self::Sherpa)
     }
 
     fn provenance(self, config: &Config) -> (String, Option<String>) {
@@ -253,6 +261,7 @@ impl DictationFinalBackend {
             ),
             Self::AppleSpeech => ("apple-speech".into(), Some("apple-speech".into())),
             Self::Parakeet => ("parakeet".into(), Some("parakeet".into())),
+            Self::Sherpa => ("sherpa:parakeet-v3".into(), Some("parakeet-v3".into())),
         }
     }
 }
@@ -268,6 +277,10 @@ struct FinalizedDictation {
 /// device. A missing or truncated model is returned as the same event used by
 /// interactive dictation surfaces.
 pub fn preflight_model(config: &Config) -> Result<(), DictationEvent> {
+    // Parakeet v3 writes the final text on its own; Whisper only adds partials.
+    if config.dictation.backend == "sherpa" && sherpa_dictation_ready(config) {
+        return Ok(());
+    }
     if config.dictation.backend == "parakeet" {
         let model = config.transcription.parakeet_model.clone();
         if crate::parakeet::resolve_model_file(config, &model).is_some() {
@@ -482,7 +495,12 @@ where
                         );
                         (Some(context), false)
                     }
-                    Err(error) if final_backend == DictationFinalBackend::Parakeet => {
+                    Err(error)
+                        if matches!(
+                            final_backend,
+                            DictationFinalBackend::Parakeet | DictationFinalBackend::Sherpa
+                        ) =>
+                    {
                         tracing::warn!(
                             error = %error,
                             "whisper partial model could not load; continuing with configured Parakeet dictation"
@@ -494,7 +512,12 @@ where
                     }
                 }
             }
-            Err(error) if final_backend == DictationFinalBackend::Parakeet => {
+            Err(error)
+                if matches!(
+                    final_backend,
+                    DictationFinalBackend::Parakeet | DictationFinalBackend::Sherpa
+                ) =>
+            {
                 tracing::info!(
                     error = %error,
                     "whisper partials unavailable; continuing with configured Parakeet dictation"
@@ -983,6 +1006,13 @@ fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
                 DictationFinalBackend::Whisper
             }
         }
+        "sherpa" => {
+            if sherpa_dictation_ready(config) {
+                DictationFinalBackend::Sherpa
+            } else {
+                DictationFinalBackend::Whisper
+            }
+        }
         "whisper" => DictationFinalBackend::Whisper,
         other => {
             tracing::warn!(
@@ -1009,6 +1039,43 @@ fn apple_speech_dictation_ready(_config: &Config) -> bool {
         );
     }
     ready
+}
+
+/// Whether Parakeet v3 can write dictation's final text: the build carries the
+/// sherpa plugin loader and the model files are installed. Quiet, for settings.
+pub fn sherpa_dictation_available(config: &Config) -> bool {
+    #[cfg(feature = "engine-sherpa")]
+    {
+        crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config))
+    }
+    #[cfg(not(feature = "engine-sherpa"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
+/// [`sherpa_dictation_available`] for a session that asked for it, with the
+/// reason logged when it falls back to Whisper.
+fn sherpa_dictation_ready(config: &Config) -> bool {
+    #[cfg(feature = "engine-sherpa")]
+    {
+        let ready = sherpa_dictation_available(config);
+        if !ready {
+            tracing::warn!(
+                "sherpa dictation requested but the Parakeet v3 model is not installed (run `minutes setup --sherpa`); using whisper"
+            );
+        }
+        ready
+    }
+    #[cfg(not(feature = "engine-sherpa"))]
+    {
+        let _ = config;
+        tracing::warn!(
+            "sherpa dictation requested but this build has no sherpa engine; using whisper"
+        );
+        false
+    }
 }
 
 fn parakeet_dictation_ready(config: &Config) -> bool {
@@ -1067,6 +1134,25 @@ fn finalize_dictation_transcription(
                 tracing::warn!(
                     error = %error,
                     "apple-speech dictation failed; latching this session to whisper fallback"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "engine-sherpa")]
+    if _final_backend == DictationFinalBackend::Sherpa {
+        match transcribe_utterance_with_sherpa(_final_utterance_samples, _config) {
+            Ok(Some(transcript)) => {
+                return Some(FinalizedDictation {
+                    transcript,
+                    backend: DictationFinalBackend::Sherpa,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "parakeet v3 dictation failed; using whisper for this utterance"
                 );
             }
         }
@@ -1163,6 +1249,96 @@ fn transcribe_utterance_with_parakeet(
     }
 }
 
+/// Parakeet v3 recognizer kept loaded between utterances and sessions, keyed by
+/// model directory. Building one takes over a second, which dictation would
+/// otherwise pay on every utterance.
+#[cfg(feature = "engine-sherpa")]
+static SHERPA_DICTATION_RECOGNIZER: std::sync::LazyLock<
+    std::sync::Mutex<Option<(PathBuf, crate::sherpa_plugin::PluginRecognizer)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Shortest utterance worth decoding: half a second still holds a one-word
+/// command ("Done.", "Continue.").
+#[cfg(feature = "engine-sherpa")]
+const SHERPA_DICTATION_MIN_SAMPLES: usize = 8_000;
+
+#[cfg(feature = "engine-sherpa")]
+fn with_sherpa_dictation_recognizer<T>(
+    config: &Config,
+    use_recognizer: impl FnOnce(&mut crate::sherpa_plugin::PluginRecognizer) -> Result<T, String>,
+) -> Result<T, String> {
+    let dir = crate::sherpa_engine::model_dir(config);
+    let mut cache = SHERPA_DICTATION_RECOGNIZER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .as_ref()
+        .map(|(cached, _)| cached != &dir)
+        .unwrap_or(true)
+    {
+        *cache = Some((dir, crate::sherpa_engine::build_recognizer(config)?));
+    }
+    let (_, recognizer) = cache.as_mut().expect("recognizer cached above");
+    use_recognizer(recognizer)
+}
+
+/// Load the Parakeet v3 recognizer ahead of the first dictation.
+#[cfg(feature = "engine-sherpa")]
+fn preload_sherpa_recognizer(config: &Config) {
+    if let Err(error) = with_sherpa_dictation_recognizer(config, |_| Ok(())) {
+        tracing::warn!(error = %error, "parakeet v3 dictation preload failed");
+    }
+}
+
+#[cfg(feature = "engine-sherpa")]
+fn transcribe_utterance_with_sherpa(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<StreamingResult>, MinutesError> {
+    if samples.len() < SHERPA_DICTATION_MIN_SAMPLES {
+        return Ok(None);
+    }
+    let segments = with_sherpa_dictation_recognizer(config, |recognizer| {
+        crate::sherpa_engine::transcribe_segments_with_recognizer(samples, config, recognizer)
+    })
+    .map_err(|error| MinutesError::from(TranscribeError::TranscriptionFailed(error)))?;
+    let joined = segments
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Some(text) = normalize_final_dictation_text(&space_before_currency(&joined)) else {
+        return Ok(None);
+    };
+    Ok(Some(StreamingResult {
+        text,
+        is_final: true,
+        duration_secs: samples.len() as f64 / 16000.0,
+    }))
+}
+
+/// Parakeet joins a dollar amount to the word before it ("write off$300,000").
+/// Put the space back when a `$` directly follows a letter or digit and
+/// precedes a digit.
+#[cfg_attr(not(feature = "engine-sherpa"), allow(dead_code))]
+fn space_before_currency(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 4);
+    for (index, &ch) in chars.iter().enumerate() {
+        if ch == '$'
+            && index > 0
+            && chars[index - 1].is_alphanumeric()
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_digit())
+        {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn dictation_decode_hints(config: &Config) -> crate::transcribe::DecodeHints {
     if config.dictation.cleanup_engine == "none" {
         return Default::default();
@@ -1228,6 +1404,9 @@ pub fn reprocess_recovery_audio_with_mode(
     match backend {
         DictationFinalBackend::Parakeet => {
             transcription_config.transcription.engine = "parakeet".into();
+        }
+        DictationFinalBackend::Sherpa => {
+            transcription_config.transcription.engine = "sherpa".into();
         }
         DictationFinalBackend::Whisper | DictationFinalBackend::AppleSpeech => {
             // Apple Speech's private-audio transport remains gated; its
@@ -2165,6 +2344,50 @@ mod tests {
                 ),
             })
         );
+    }
+
+    #[test]
+    fn sherpa_dictation_falls_back_to_whisper_without_its_model() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.transcription.model_path = dir.path().join("models");
+        config.transcription.sherpa_model_dir = dir.path().join("no-sherpa").display().to_string();
+        config.dictation.backend = "sherpa".into();
+
+        assert!(!sherpa_dictation_available(&config));
+        assert_eq!(
+            dictation_final_backend(&config),
+            DictationFinalBackend::Whisper
+        );
+        // Without Parakeet v3 the Whisper model is required, as before.
+        assert!(matches!(
+            preflight_model(&config),
+            Err(DictationEvent::ModelMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn currency_amounts_get_their_space_back() {
+        assert_eq!(
+            space_before_currency("write off$300,000 in losses"),
+            "write off $300,000 in losses"
+        );
+        assert_eq!(space_before_currency("costs $5 today"), "costs $5 today");
+        assert_eq!(space_before_currency("price$ alone"), "price$ alone");
+        assert_eq!(space_before_currency("$40 first"), "$40 first");
+    }
+
+    #[test]
+    fn sherpa_dictation_records_parakeet_v3_provenance() {
+        let config = Config::default();
+        assert_eq!(
+            DictationFinalBackend::Sherpa.provenance(&config),
+            (
+                "sherpa:parakeet-v3".to_string(),
+                Some("parakeet-v3".to_string())
+            )
+        );
+        assert!(DictationFinalBackend::Sherpa.needs_utterance_samples());
     }
 
     #[test]

@@ -13615,6 +13615,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         },
         "dictation": {
             "backend": config.dictation.backend,
+            "sherpa_available": minutes_core::dictation::sherpa_dictation_available(&config),
             "model": config.dictation.model,
             "destination": config.dictation.destination,
             "accumulate": config.dictation.accumulate,
@@ -14055,15 +14056,29 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
 
         // Dictation
         ("dictation", "backend") => {
-            if !["whisper", "apple-speech", "parakeet"].contains(&value.as_str()) {
+            if !["whisper", "sherpa", "apple-speech", "parakeet"].contains(&value.as_str()) {
                 return Err(format!(
-                    "unknown dictation backend '{}'. Valid: whisper, apple-speech, parakeet",
+                    "unknown dictation backend '{}'. Valid: whisper, sherpa, apple-speech, parakeet",
                     value
                 ));
             }
             reject_unselectable_apple_speech(&value, "dictation backend")?;
             reject_unselectable_parakeet(&value, "dictation backend")?;
+            if value == "sherpa" && !minutes_core::dictation::sherpa_dictation_available(&config) {
+                return Err(
+                    "Parakeet v3 is not installed, so it cannot write dictation text yet. Run `minutes setup --sherpa`, or keep Whisper.".into(),
+                );
+            }
             config.dictation.backend = value.clone();
+            if value == "sherpa" {
+                // Load the recognizer now so the first dictation does not wait.
+                let preload_config = config.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = minutes_core::dictation::preload_model(&preload_config) {
+                        eprintln!("[dictation] model re-preload failed: {}", e);
+                    }
+                });
+            }
         }
         ("dictation", "model") => {
             config.dictation.model = value.clone();
@@ -18127,6 +18142,16 @@ mod tests {
             )
             .unwrap_err();
             assert!(live.contains("Use Whisper"));
+        });
+    }
+
+    #[test]
+    fn desktop_settings_reject_sherpa_dictation_without_its_model() {
+        // The temp home has no Parakeet v3 model installed.
+        with_temp_home(|_| {
+            let error =
+                cmd_set_setting("dictation".into(), "backend".into(), "sherpa".into()).unwrap_err();
+            assert!(error.contains("Parakeet v3 is not installed"));
         });
     }
 

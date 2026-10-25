@@ -6915,6 +6915,16 @@
           <summary>Advanced</summary>
           <div class="about-controls">
             <div class="about-controls-group">
+              <div class="about-controls-copy">Dictation engine</div>
+              <select id="settings-dictation-backend" class="settings-field">
+                <option value="whisper">Whisper — default</option>
+                <option value="sherpa">Parakeet v3 — most accurate final text</option>
+              </select>
+              <div class="about-controls-meta" id="settings-dictation-backend-detail">Whisper shows words as you speak and writes the final text.</div>
+            </div>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-group">
               <div class="about-controls-copy">Dictation whisper model</div>
               <select id="settings-dictation-model" class="settings-field">
                 <option value="base">base — fast, decent quality (default)</option>
@@ -13152,6 +13162,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
             destinationDetail.textContent = 'Active-app insertion is unavailable in this session. Choose clipboard delivery so your transcript remains accessible.';
           }
           document.getElementById('settings-dictation-model').value = s.dictation.model || 'base';
+          renderDictationBackend(s.dictation);
           document.getElementById('settings-dictation-writing-style').value =
             ['none', 'off'].includes(s.dictation.cleanup_engine) ? 'literal' : 'natural';
           document.getElementById('settings-dictation-history-policy').value =
@@ -14172,6 +14183,28 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
         if (window.MinutesI18n) window.MinutesI18n.setLocale(resolved);
       } catch (err) { console.error('set ui language:', err); }
     });
+    function renderDictationBackend(dictation) {
+      const select = document.getElementById('settings-dictation-backend');
+      const detail = document.getElementById('settings-dictation-backend-detail');
+      const sherpaOption = select.querySelector('option[value="sherpa"]');
+      const available = dictation.sherpa_available === true;
+      const backend = dictation.backend === 'sherpa' ? 'sherpa' : 'whisper';
+      sherpaOption.disabled = !available && backend !== 'sherpa';
+      sherpaOption.textContent = available
+        ? 'Parakeet v3 — most accurate final text'
+        : 'Parakeet v3 — not installed';
+      select.value = backend;
+      if (backend === 'sherpa' && available) {
+        detail.textContent = 'Whisper still shows words as you speak; Parakeet v3 writes the final text. If Parakeet cannot, Whisper does.';
+      } else if (backend === 'sherpa') {
+        detail.textContent = 'Parakeet v3 is not installed, so Whisper writes the final text. Run `minutes setup --sherpa` to install it.';
+      } else if (available) {
+        detail.textContent = 'Whisper shows words as you speak and writes the final text. Parakeet v3 is installed and writes more accurate final text.';
+      } else {
+        detail.textContent = 'Whisper shows words as you speak and writes the final text.';
+      }
+    }
+
     async function saveDictationSetting(key, value, control) {
       control.disabled = true;
       const previous = latestSettings?.dictation?.[key];
@@ -14179,6 +14212,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       try {
         const writers = {
           model: () => invoke('cmd_set_setting', { section: 'dictation', key: 'model', value: String(value) }),
+          backend: () => invoke('cmd_set_setting', { section: 'dictation', key: 'backend', value: String(value) }),
           history_policy: () => invoke('cmd_set_setting', { section: 'dictation', key: 'history_policy', value: String(value) }),
           silence_timeout_ms: () => invoke('cmd_set_setting', { section: 'dictation', key: 'silence_timeout_ms', value: String(value) }),
           voice_commands_enabled: () => invoke('cmd_set_setting', { section: 'dictation', key: 'voice_commands_enabled', value: String(value) }),
@@ -14196,6 +14230,11 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
       } finally { control.disabled = false; }
     }
     document.getElementById('settings-dictation-model').addEventListener('change', (e) => saveDictationSetting('model', e.target.value, e.target));
+    document.getElementById('settings-dictation-backend').addEventListener('change', async (e) => {
+      if (await saveDictationSetting('backend', e.target.value, e.target) && latestSettings?.dictation) {
+        renderDictationBackend(latestSettings.dictation);
+      }
+    });
     document.getElementById('settings-dictation-history-policy').addEventListener('change', async (e) => {
       if (await saveDictationSetting('history_policy', e.target.value, e.target)) {
         document.getElementById('settings-dictation-recents-status').textContent = e.target.value === 'off' ? 'Routine history is off. Recoverable captures will still appear here.' : '';
