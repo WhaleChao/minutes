@@ -78,8 +78,7 @@ pub(crate) fn live_fts_match_snippet(title: &str, body: &str, query: &str) -> Op
         "CREATE VIRTUAL TABLE live_doc USING fts5(
             title,
             body,
-            tokenize='porter unicode61 remove_diacritics 2',
-            prefix='2 3 4'
+            tokenize='porter unicode61 remove_diacritics 2'
         );",
     )
     .ok()?;
@@ -2067,6 +2066,30 @@ mod tests {
         idx.delete_file(&p).unwrap();
         let r2 = idx.search("find", &SearchFilters::default(), None).unwrap();
         assert!(r2.is_empty());
+    }
+
+    #[test]
+    fn partial_final_word_matches_without_a_prefix_index() {
+        // The FTS table has no prefix index (rebuilt per search, where the
+        // index cost far more than it saved); `term*` must still match.
+        let (dir, config) = temp_config();
+        write_meeting(
+            &config.output_dir,
+            "a",
+            "Alpha",
+            "we settled the pricing roadmap",
+        );
+        write_meeting(&config.output_dir, "b", "Beta", "nothing relevant here");
+        let idx = make_index(&dir, &config);
+        idx.sync(&config, SyncMode::Auto).unwrap();
+        for query in ["pr", "pric", "roadmap pri"] {
+            let results = idx.search(query, &SearchFilters::default(), None).unwrap();
+            assert_eq!(results.len(), 1, "query {query:?}");
+            assert!(results[0].snippet.contains("pricing"), "query {query:?}");
+        }
+        assert!(
+            live_fts_match_snippet("Alpha", "we settled the pricing roadmap", "pric").is_some()
+        );
     }
 
     #[test]
