@@ -66,6 +66,7 @@ the compatibility boundary with saved voice profiles.
 | `mistral_model` | `"mistral-large-latest"` | Mistral API model |
 | `chunk_max_tokens` | `4000` | Max tokens per chunk when splitting long transcripts |
 | `speaker_mapping_timeout_secs` | `30` | Tight timeout for the Level-1 speaker-naming LLM call. On the agent path it also runs with no MCP servers and no tools so it can't hang on init. Clamped to [5, 120]. |
+| `agent_fast_model` | `""` | Model for the short agent calls after the summary (title refinement, speaker naming). Empty keeps the agent CLI's default. Sent as `--model` to `claude` and `-m` to `codex`; other agent CLIs ignore it. Example: `"haiku"`. |
 
 For Pi coding-agent support, use `engine = "agent"` with `agent_command = "pi"`.
 Minutes invokes Pi in non-interactive, no-tools mode. This is distinct from

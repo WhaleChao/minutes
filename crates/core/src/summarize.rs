@@ -1783,6 +1783,26 @@ fn prepare_agent_invocation(
     })
 }
 
+/// Route a short agent call to `model` when the agent CLI takes a model flag.
+/// `claude` gets `--model`, `codex exec` gets `-m`; every other CLI keeps its
+/// own default because its flag spelling is not part of a stable contract here.
+/// An empty `model` leaves the invocation unchanged.
+fn apply_agent_model(invocation: &mut AgentInvocation, agent_cmd: &str, model: &str) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
+    }
+    if matches_agent_binary(agent_cmd, "claude") {
+        invocation
+            .args
+            .splice(1..1, ["--model".to_string(), model.to_string()]);
+    } else if matches_agent_binary(agent_cmd, "codex") {
+        invocation
+            .args
+            .splice(1..1, ["-m".to_string(), model.to_string()]);
+    }
+}
+
 /// Summarize using a specific agent command (used by the "auto" engine).
 fn summarize_with_agent_cmd(
     transcript: &str,
@@ -2122,7 +2142,11 @@ fn run_summary_agent_call(
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::Write;
-    let invocation = prepare_agent_invocation(agent_cmd, prompt, selected_screens, false)?;
+    // Text-only summaries run lean (no MCP servers, no tools): the prompt
+    // carries the whole transcript, and starting the user's MCP servers only
+    // adds startup time. Screenshots need the Read tool, so they stay full.
+    let lean = existing_screen_files(selected_screens).is_empty();
+    let invocation = prepare_agent_invocation(agent_cmd, prompt, selected_screens, lean)?;
     let cleanup_path = invocation.cleanup_path.clone();
 
     // AIDEV-NOTE: Use Stdio::null() when no stdin payload is needed (e.g. pi, opencode
@@ -3095,7 +3119,11 @@ fn run_title_refinement_prompt(
             if crate::apple_fm::is_available() {
                 crate::apple_fm::generate("You generate concise meeting titles.", prompt)
             } else if let Some(agent) = detect_agent_cli() {
-                run_title_refinement_via_agent(prompt, &agent)
+                run_title_refinement_via_agent(
+                    prompt,
+                    &agent,
+                    &config.summarization.agent_fast_model,
+                )
             } else {
                 Err("no AI CLI found (claude, codex, gemini, opencode)".into())
             }
@@ -3109,7 +3137,11 @@ fn run_title_refinement_prompt(
             } else {
                 config.summarization.agent_command.clone()
             };
-            run_title_refinement_via_agent(prompt, &resolve_agent_path(&agent_cmd))
+            run_title_refinement_via_agent(
+                prompt,
+                &resolve_agent_path(&agent_cmd),
+                &config.summarization.agent_fast_model,
+            )
         }
         "claude" => {
             let api_key =
@@ -3205,16 +3237,25 @@ fn run_title_refinement_prompt(
 fn run_title_refinement_via_agent(
     prompt: &str,
     agent_cmd: &str,
+    model: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    run_title_refinement_via_agent_timeout(prompt, agent_cmd, std::time::Duration::from_secs(120))
+    run_title_refinement_via_agent_timeout(
+        prompt,
+        agent_cmd,
+        model,
+        std::time::Duration::from_secs(120),
+    )
 }
 
 fn run_title_refinement_via_agent_timeout(
     prompt: &str,
     agent_cmd: &str,
+    model: &str,
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let invocation = prepare_agent_invocation(agent_cmd, prompt, &[], false)?;
+    // A title is a one-line text task: lean (no MCP, no tools) like speaker mapping.
+    let mut invocation = prepare_agent_invocation(agent_cmd, prompt, &[], true)?;
+    apply_agent_model(&mut invocation, agent_cmd, model);
     let cleanup_path = invocation.cleanup_path.clone();
     let result = (|| {
         let mut command = crate::bounded_child::BoundedCommand::new(&invocation.cmd);
@@ -3532,7 +3573,12 @@ fn run_speaker_mapping_via_agent(
     let agent_cmd = resolve_agent_path(&agent_cmd);
     // Speaker mapping runs the agent in `lean` mode (no MCP, no tools): #382.
     // Lean is text-only — no screen_files by design (see prepare_agent_invocation).
-    let invocation = prepare_agent_invocation(&agent_cmd, prompt, &[], true)?;
+    let mut invocation = prepare_agent_invocation(&agent_cmd, prompt, &[], true)?;
+    apply_agent_model(
+        &mut invocation,
+        &agent_cmd,
+        &config.summarization.agent_fast_model,
+    );
     let cleanup_path = invocation.cleanup_path.clone();
     // Same fix as summarize_with_agent_impl_timeout (#288): file-arg agents
     // (pi, opencode) have no stdin payload, and an unclosed piped stdin makes
@@ -4466,6 +4512,40 @@ PARTICIPANTS:
         let plain = prepare_agent_invocation("claude", "p", &[], false).unwrap();
         assert_eq!(plain.args, vec!["-p", "-"]);
         assert!(!plain.args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn apply_agent_model_uses_each_cli_flag_and_leaves_others_alone() {
+        let mut claude = prepare_agent_invocation("claude", "p", &[], true).unwrap();
+        apply_agent_model(&mut claude, "claude", " haiku ");
+        assert_eq!(&claude.args[..3], ["-p", "--model", "haiku"]);
+        assert_eq!(claude.args.last().map(String::as_str), Some("-"));
+
+        let mut codex = prepare_agent_invocation("codex", "p", &[], true).unwrap();
+        apply_agent_model(&mut codex, "codex", "gpt-5-mini");
+        assert_eq!(&codex.args[..4], ["exec", "-m", "gpt-5-mini", "-"]);
+
+        for agent in ["gemini", "opencode", "pi", "agent"] {
+            let before = prepare_agent_invocation(agent, "p", &[], true).unwrap();
+            let mut after = prepare_agent_invocation(agent, "p", &[], true).unwrap();
+            apply_agent_model(&mut after, agent, "haiku");
+            assert_eq!(
+                after.args.len(),
+                before.args.len(),
+                "{agent} got a model flag"
+            );
+            for path in [before.cleanup_path, after.cleanup_path]
+                .into_iter()
+                .flatten()
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        let mut unset = prepare_agent_invocation("claude", "p", &[], true).unwrap();
+        let expected = unset.args.clone();
+        apply_agent_model(&mut unset, "claude", "");
+        assert_eq!(unset.args, expected);
     }
 
     #[test]
@@ -5726,9 +5806,12 @@ EOF
         let script_path = write_stdin_draining_pi(dir.path(), "refined title");
 
         let start = std::time::Instant::now();
-        let result =
-            run_title_refinement_via_agent("refine this title", &script_path.display().to_string())
-                .expect("file-arg agent should not block on an unclosed stdin pipe");
+        let result = run_title_refinement_via_agent(
+            "refine this title",
+            &script_path.display().to_string(),
+            "",
+        )
+        .expect("file-arg agent should not block on an unclosed stdin pipe");
 
         assert_eq!(result, "refined title");
         assert!(
@@ -5747,6 +5830,7 @@ EOF
         let error = run_title_refinement_via_agent_timeout(
             "synthetic title",
             &script.display().to_string(),
+            "",
             std::time::Duration::from_secs(2),
         )
         .unwrap_err();
