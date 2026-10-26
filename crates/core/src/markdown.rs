@@ -1269,6 +1269,10 @@ pub struct Frontmatter {
     pub speaker_map: Vec<crate::diarize::SpeakerAttribution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub name_corrections: Vec<crate::name_correction::NameCorrection>,
+    /// Listed vocabulary misspellings rewritten to their canonical spelling in
+    /// the transcript (acronyms and terms, e.g. "Sok 2" to "SOC 2").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spelling_corrections: Vec<crate::vocabulary::SpellingCorrection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_health: Option<RecordingHealth>,
     /// Health of the Level-1 speaker-naming step. Lets a meeting be greppable for
@@ -3121,6 +3125,7 @@ mod tests {
             visibility: None,
             speaker_map: vec![],
             name_corrections: Vec::new(),
+            spelling_corrections: Vec::new(),
             recording_health: None,
             speaker_mapping: None,
             summarization: None,

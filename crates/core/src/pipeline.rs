@@ -4091,6 +4091,7 @@ mod authorized_process_input_tests {
             TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
                 input.processing_path().to_path_buf(),
             )),
+            Vec::new(),
         )
         .unwrap();
         assert!(artifact.is_descriptor_authorized());
@@ -4187,6 +4188,7 @@ mod authorized_process_input_tests {
             TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
                 input.processing_path().to_path_buf(),
             )),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(no_speech.frontmatter.status, Some(OutputStatus::NoSpeech));
@@ -4824,13 +4826,14 @@ fn transcribe_to_artifact_with_authority(
         .as_ref()
         .map(|event| event.attendees.clone())
         .unwrap_or_default();
+    let vocabulary = load_vocabulary_for_decode_hints();
     let mut decode_hints = build_decode_hints(
         title,
         calendar_event_title.as_deref(),
         context.pre_context.as_deref(),
         &attendees,
         Some(&config.identity),
-        load_vocabulary_for_decode_hints().as_ref(),
+        vocabulary.as_ref(),
     );
     if let Some(format) = authorized_format {
         decode_hints = decode_hints.with_audio_format_extension(format);
@@ -4861,6 +4864,7 @@ fn transcribe_to_artifact_with_authority(
     )?;
     crate::process_trace::stage("transcribe.done");
     drop(prepared_input);
+    let (result, spelling_corrections) = apply_vocabulary_spellings(result, vocabulary.as_ref());
     let transcript = if content_type == ContentType::Meeting {
         normalize_transcript_for_self_name_participant(&result.text, &attendees, &config.identity)
     } else {
@@ -4890,6 +4894,7 @@ fn transcribe_to_artifact_with_authority(
         } else {
             TranscriptAuthority::AmbientPath
         },
+        spelling_corrections,
     );
     let artifact = artifact.map(|mut artifact| {
         artifact.diarization_audio_path = diarization_audio_path;
@@ -4934,6 +4939,7 @@ pub fn write_transcript_artifact(
         filter_stats,
         transcribe_ms,
         TranscriptAuthority::AmbientPath,
+        Vec::new(),
     )
 }
 
@@ -4949,6 +4955,7 @@ fn write_transcript_artifact_with_authority(
     filter_stats: crate::transcribe::FilterStats,
     transcribe_ms: u64,
     authority: TranscriptAuthority,
+    spelling_corrections: Vec<crate::vocabulary::SpellingCorrection>,
 ) -> Result<TranscriptArtifact, MinutesError> {
     match &authority {
         TranscriptAuthority::AmbientPath if is_reserved_private_audio_path(audio_path) => {
@@ -5110,6 +5117,7 @@ fn write_transcript_artifact_with_authority(
         visibility: None,
         speaker_map: vec![],
         name_corrections: Vec::new(),
+        spelling_corrections,
         recording_health: context.recording_health.clone(),
         speaker_mapping: None,
         summarization: None,
@@ -5935,13 +5943,14 @@ where
         .as_ref()
         .map(|e| e.attendees.clone())
         .unwrap_or_default();
+    let vocabulary = load_vocabulary_for_decode_hints();
     let mut decode_hints = build_decode_hints(
         title,
         calendar_event_title.as_deref(),
         pre_context.as_deref(),
         &calendar_attendees,
         Some(&config.identity),
-        load_vocabulary_for_decode_hints().as_ref(),
+        vocabulary.as_ref(),
     );
     if let Some(format_extension) = authorized_format {
         decode_hints = decode_hints.with_audio_format_extension(format_extension);
@@ -5975,6 +5984,7 @@ where
     )?;
     crate::process_trace::stage("transcribe.done");
     drop(prepared_input);
+    let (result, spelling_corrections) = apply_vocabulary_spellings(result, vocabulary.as_ref());
     let transcribe_ms = step_start.elapsed().as_millis() as u64;
     let transcript = if content_type == ContentType::Meeting {
         normalize_transcript_for_self_name_participant(
@@ -6488,6 +6498,7 @@ where
         visibility: None,
         speaker_map,
         name_corrections,
+        spelling_corrections,
         recording_health,
         speaker_mapping: None,
         summarization: None,
@@ -7473,6 +7484,35 @@ pub(crate) fn build_decode_hints(
     }
 
     crate::transcribe::DecodeHints::from_candidates(&priority, &contextual)
+}
+
+/// Rewrite listed vocabulary misspellings ("Sok 2" for "SOC 2") in a fresh
+/// transcript, before speaker attribution, summary and title read it. The
+/// engines cannot all take hints (Parakeet v3 decodes greedily), so this is
+/// the one place a known wrong rendering is fixed. Exact, word-bounded and
+/// recorded in frontmatter; see [`crate::vocabulary::correct_spellings`].
+fn apply_vocabulary_spellings(
+    mut result: crate::transcribe::TranscribeResult,
+    vocabulary: Option<&crate::vocabulary::VocabularyStore>,
+) -> (
+    crate::transcribe::TranscribeResult,
+    Vec<crate::vocabulary::SpellingCorrection>,
+) {
+    let pairs = vocabulary
+        .map(crate::vocabulary::VocabularyStore::spelling_corrections)
+        .unwrap_or_default();
+    if pairs.is_empty() {
+        return (result, Vec::new());
+    }
+    let (text, applied) = crate::vocabulary::correct_spellings(&result.text, &pairs);
+    if applied.is_empty() {
+        return (result, applied);
+    }
+    result.text = text;
+    for segment in &mut result.segments {
+        segment.text = crate::vocabulary::correct_spellings(&segment.text, &pairs).0;
+    }
+    (result, applied)
 }
 
 fn load_vocabulary_for_decode_hints() -> Option<crate::vocabulary::VocabularyStore> {
@@ -9673,6 +9713,7 @@ mod tests {
             visibility: None,
             speaker_map: vec![],
             name_corrections: Vec::new(),
+            spelling_corrections: Vec::new(),
             recording_health: None,
             speaker_mapping: None,
             summarization: None,
@@ -11973,6 +12014,49 @@ mod tests {
     }
 
     #[test]
+    fn listed_vocabulary_misspellings_are_fixed_before_anything_reads_the_transcript() {
+        let vocabulary = crate::vocabulary::VocabularyStore {
+            entries: vec![crate::vocabulary::VocabularyEntry {
+                kind: crate::vocabulary::VocabularyKind::Acronym,
+                canonical: "SOC 2".into(),
+                misspellings: vec!["Sok 2".into()],
+                ..crate::vocabulary::VocabularyEntry::default()
+            }],
+        }
+        .normalized()
+        .expect("normalize");
+        let result = crate::transcribe::TranscribeResult {
+            text: "[0:00] Our sok 2 audit.\n[0:04] Nothing else.\n".into(),
+            stats: Default::default(),
+            segments: vec![crate::transcribe::TranscriptSegment {
+                start: 0.0,
+                end: 4.0,
+                text: "Our sok 2 audit.".into(),
+            }],
+            detected_language: None,
+        };
+
+        let (fixed, applied) = apply_vocabulary_spellings(result.clone(), Some(&vocabulary));
+        assert_eq!(
+            fixed.text,
+            "[0:00] Our SOC 2 audit.\n[0:04] Nothing else.\n"
+        );
+        assert_eq!(fixed.segments[0].text, "Our SOC 2 audit.");
+        assert_eq!(
+            applied,
+            vec![crate::vocabulary::SpellingCorrection {
+                raw: "Sok 2".into(),
+                corrected: "SOC 2".into(),
+                count: 1,
+            }]
+        );
+
+        let (untouched, none) = apply_vocabulary_spellings(result.clone(), None);
+        assert_eq!(untouched.text, result.text);
+        assert!(none.is_empty());
+    }
+
+    #[test]
     fn build_decode_hints_uses_identity_aliases_attendees_and_context() {
         let identity = IdentityConfig {
             name: Some("Mat".into()),
@@ -12384,6 +12468,7 @@ mod tests {
                 source: diarize::AttributionSource::Llm,
             }],
             name_corrections: Vec::new(),
+            spelling_corrections: Vec::new(),
             recording_health: None,
             speaker_mapping: None,
             summarization: None,

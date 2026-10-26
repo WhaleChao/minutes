@@ -1431,8 +1431,11 @@ enum VocabularyAction {
         aliases: Vec<String>,
 
         /// Known wrong rendering to recognize after the fact (e.g. "patient
-        /// tricity"). Used for search and matching only, never offered to the
-        /// transcriber. Repeat for multiple.
+        /// tricity"). Used for search and matching, never offered to the
+        /// transcriber. On term and acronym entries it is also rewritten to the
+        /// canonical spelling in new transcripts (recorded in the meeting's
+        /// `spelling_corrections`) and in dictation when its vocabulary cleanup
+        /// is on. Repeat for multiple.
         #[arg(long = "misspelling")]
         misspellings: Vec<String>,
 

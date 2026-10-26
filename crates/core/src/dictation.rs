@@ -2231,6 +2231,7 @@ fn write_dictation_file(text: &str, duration_secs: f64, config: &Config) -> Opti
         visibility: None,
         speaker_map: vec![],
         name_corrections: Vec::new(),
+        spelling_corrections: Vec::new(),
         recording_health: None,
         speaker_mapping: None,
         summarization: None,

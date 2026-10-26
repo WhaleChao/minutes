@@ -666,7 +666,7 @@ pub fn splice_ai_sections(
 ///
 /// | Fields | Treatment |
 /// |---|---|
-/// | `title`, `type`, `date`, `duration`, `source`, `tags`, `attendees`, `attendees_raw`, `calendar_event`, `device`, `captured_at`, `context`, `recorded_by`, `capture`, `sensitivity`, `debrief`, `consent`, `consent_notice`, `visibility`, `speaker_map`, `name_corrections`, `recording_health`, `speaker_mapping` | **preserved** untouched |
+/// | `title`, `type`, `date`, `duration`, `source`, `tags`, `attendees`, `attendees_raw`, `calendar_event`, `device`, `captured_at`, `context`, `recorded_by`, `capture`, `sensitivity`, `debrief`, `consent`, `consent_notice`, `visibility`, `speaker_map`, `name_corrections`, `spelling_corrections`, `recording_health`, `speaker_mapping` | **preserved** untouched |
 /// | `entities`, `people`, `intents` | **recomputed** from the merged state |
 /// | `action_items`, `decisions` | **merge-derived** (exact-identity carry-forward, see [`merge_action_items`] / [`merge_decisions`]) |
 /// | `template`, `summarization`, `status`, `processing_warnings` | **recorded**: template slug used, run health block, summarize-scoped warnings removed and status re-derived |
