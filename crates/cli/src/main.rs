@@ -9238,7 +9238,7 @@ fn cmd_qmd(action: &str, collection: &str) -> Result<()> {
 fn cmd_service(action: &str) -> Result<()> {
     let minutes_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
     let home = dirs::home_dir().unwrap_or_default();
-    let log_dir = Config::minutes_dir().join("logs");
+    let log_dir = minutes_core::logging::log_dir();
     let agents_dir = home.join("Library/LaunchAgents");
     let bin_str = minutes_bin.display().to_string();
     let home_str = home.display().to_string();
@@ -9666,7 +9666,7 @@ fn cmd_logs(errors: bool, lines: usize) -> Result<()> {
     if !assistant_policy_allows_restricted_content() {
         anyhow::bail!("local logs are unavailable under the active assistant policy");
     }
-    let log_path = Config::minutes_dir().join("logs").join("minutes.log");
+    let log_path = minutes_core::logging::log_path();
     if !log_path.exists() {
         eprintln!("No log file found at {}", log_path.display());
         return Ok(());
