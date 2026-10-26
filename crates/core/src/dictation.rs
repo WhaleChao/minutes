@@ -1055,6 +1055,18 @@ fn sherpa_dictation_ready(config: &Config) -> bool {
     {
         let ready = sherpa_dictation_available(config);
         if !ready {
+            crate::logging::append_log(&serde_json::json!({
+                "ts": chrono::Local::now().to_rfc3339(),
+                "level": "warn",
+                "step": "dictation_final_engine",
+                "file": "dictation",
+                "extra": {
+                    "requested": "sherpa",
+                    "result": "unavailable-using-whisper",
+                    "detail": "the Parakeet v3 model or plugin is not installed",
+                }
+            }))
+            .ok();
             tracing::warn!(
                 "sherpa dictation requested but the Parakeet v3 model or plugin is not installed (run `minutes setup --sherpa`); using whisper"
             );
@@ -1134,7 +1146,10 @@ fn finalize_dictation_transcription(
 
     #[cfg(feature = "engine-sherpa")]
     if _final_backend == DictationFinalBackend::Sherpa {
-        match transcribe_utterance_with_sherpa(_final_utterance_samples, _config) {
+        let started = Instant::now();
+        let outcome = transcribe_utterance_with_sherpa(_final_utterance_samples, _config);
+        log_sherpa_dictation_outcome(&outcome, _final_utterance_samples.len(), started);
+        match outcome {
             Ok(Some(transcript)) => {
                 return Some(FinalizedDictation {
                     transcript,
@@ -1319,6 +1334,36 @@ fn with_sherpa_dictation_recognizer<T>(
     }
     let (_, recognizer) = cache.as_mut().expect("recognizer cached above");
     use_recognizer(recognizer)
+}
+
+/// Durable record of what Parakeet v3 did with one utterance. The desktop app
+/// installs no tracing subscriber, so without this a silent fall back to
+/// Whisper leaves no trace of why.
+#[cfg(feature = "engine-sherpa")]
+fn log_sherpa_dictation_outcome(
+    outcome: &Result<Option<StreamingResult>, MinutesError>,
+    samples: usize,
+    started: Instant,
+) {
+    let (level, result, detail) = match outcome {
+        Ok(Some(_)) => ("info", "parakeet-v3", String::new()),
+        Ok(None) => ("info", "empty-using-whisper", String::new()),
+        Err(error) => ("warn", "failed-using-whisper", error.to_string()),
+    };
+    crate::logging::append_log(&serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "level": level,
+        "step": "dictation_final_engine",
+        "file": "dictation",
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "extra": {
+            "requested": "sherpa",
+            "result": result,
+            "audio_ms": samples as u64 * 1000 / 16_000,
+            "detail": detail,
+        }
+    }))
+    .ok();
 }
 
 /// Read a recovery WAV (Minutes writes them as 16 kHz mono PCM) as f32 samples.
