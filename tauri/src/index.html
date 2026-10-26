@@ -15409,7 +15409,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     }
 
     function markRecallPtyAlive() {
-      markRecallPtyAlive();
+      recallPtyAlive = true;
       invoke('cmd_terminal_info', { sessionId: SESSION_ID })
         .then((info) => { recallTerminalSessionDark = info?.theme_dark ?? null; })
         .catch(() => { recallTerminalSessionDark = null; })
@@ -15417,7 +15417,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     }
 
     function markRecallPtyEnded() {
-      markRecallPtyEnded();
+      recallPtyAlive = false;
       recallTerminalSessionDark = null;
       applyRecallTerminalTheme();
     }
