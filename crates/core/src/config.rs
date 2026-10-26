@@ -972,7 +972,13 @@ impl IdentityConfig {
 #[serde(default)]
 pub struct DictationConfig {
     pub experience: crate::dictation_experience::DictationExperience,
+    /// Final-text engine: "auto" (Parakeet v3 where installed and the
+    /// language fits, otherwise Whisper), "whisper", "sherpa" (Parakeet v3),
+    /// or the retained "apple-speech" / "parakeet" values.
     pub backend: String,
+    /// Set once the one-time move from the old "whisper" default to "auto"
+    /// has run, so a later deliberate choice of Whisper is left alone.
+    pub auto_engine_migrated: bool,
     pub destination: String,
     pub accumulate: bool,
     pub daily_note_log: bool,
@@ -1021,7 +1027,8 @@ impl Default for DictationConfig {
     fn default() -> Self {
         Self {
             experience: Default::default(),
-            backend: "whisper".into(),
+            backend: "auto".into(),
+            auto_engine_migrated: false,
             destination: "insert".into(),
             accumulate: true,
             daily_note_log: true,
@@ -2092,6 +2099,29 @@ impl Config {
             }
         }
 
+        // Dictation engine default: "whisper" was the compiled default and the
+        // only value the desktop app could write until it gained a dictation
+        // engine control, so a saved "whisper" almost never records a choice.
+        // Move it to "auto" once (Parakeet v3 where it is installed and the
+        // language fits, Whisper otherwise) and persist a marker, so a later
+        // deliberate choice of Whisper is never flipped back. A text edit on
+        // top of any earlier migration keeps comments and unknown keys.
+        if file_existed && !config.dictation.auto_engine_migrated {
+            if let Some(base) = migrated_toml.clone().or_else(|| raw_toml.clone()) {
+                if let Some((edited, moved)) = migrate_dictation_auto_engine(&base) {
+                    if moved {
+                        config.dictation.backend = "auto".into();
+                        tracing::info!(
+                            "dictation engine migration: moved the old whisper default to auto at {}",
+                            path.display()
+                        );
+                    }
+                    config.dictation.auto_engine_migrated = true;
+                    migrated_toml = Some(edited);
+                }
+            }
+        }
+
         if let Some(migrated_toml) = migrated_toml {
             if let Err(e) = std::fs::write(path, migrated_toml) {
                 tracing::warn!(
@@ -2416,6 +2446,59 @@ fn append_palette_section(raw: &str, palette: &PaletteConfig) -> String {
     output
 }
 
+/// Text edit behind the one-time dictation engine migration. Within
+/// `[dictation]`, turns `backend = "whisper"` into `backend = "auto"` and sets
+/// `auto_engine_migrated = true`; appends a minimal `[dictation]` section when
+/// there is none. Returns the edited text and whether the backend moved, or
+/// `None` when the marker is already set.
+fn migrate_dictation_auto_engine(raw: &str) -> Option<(String, bool)> {
+    let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    let is_header = |line: &str| line.trim_start().starts_with('[');
+    let Some(start) = lines.iter().position(|line| line.trim() == "[dictation]") else {
+        let mut edited = raw.to_string();
+        if !edited.is_empty() && !edited.ends_with('\n') {
+            edited.push('\n');
+        }
+        edited.push_str("\n[dictation]\nauto_engine_migrated = true\n");
+        return Some((edited, false));
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| is_header(line))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let key_of = |line: &str| line.split('=').next().map(|key| key.trim().to_string());
+    let value_of = |line: &str| {
+        line.split_once('=')
+            .map(|(_, value)| value.split('#').next().unwrap_or("").trim().to_string())
+    };
+    let mut flag_line = None;
+    let mut moved = false;
+    for (index, line) in lines.iter_mut().enumerate().take(end).skip(start + 1) {
+        match key_of(line).as_deref() {
+            Some("auto_engine_migrated") => {
+                if value_of(line).as_deref() == Some("true") {
+                    return None;
+                }
+                flag_line = Some(index);
+            }
+            Some("backend") if value_of(line).as_deref() == Some("\"whisper\"") => {
+                *line = "backend = \"auto\"".to_string();
+                moved = true;
+            }
+            _ => {}
+        }
+    }
+    match flag_line {
+        Some(index) => lines[index] = "auto_engine_migrated = true".to_string(),
+        None => lines.insert(start + 1, "auto_engine_migrated = true".to_string()),
+    }
+    let mut edited = lines.join("\n");
+    if raw.ends_with('\n') {
+        edited.push('\n');
+    }
+    Some((edited, moved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2487,7 +2570,7 @@ mod tests {
         assert_eq!(config.copilot.grounding_refresh_secs, 15);
         assert_eq!(config.search.engine, "builtin");
         assert!(!config.daily_notes.enabled);
-        assert_eq!(config.dictation.backend, "whisper");
+        assert_eq!(config.dictation.backend, "auto");
         assert!(config.dictation.accumulate);
         assert!(config.call_detection.enabled);
         assert_eq!(config.watch.settle_delay_ms, 2000);
@@ -2712,6 +2795,68 @@ mod tests {
         assert!(error.contains("malformed"));
         assert!(!error.contains("PRIVATE-CONFIG-CANARY"));
         assert!(!Config::load_from(&path).knowledge.enabled);
+    }
+
+    #[test]
+    fn old_whisper_dictation_default_moves_to_auto_once() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[dictation]\nbackend = \"whisper\"\n").unwrap();
+
+        let migrated = Config::load_with_migrations_from(&path);
+        assert_eq!(migrated.dictation.backend, "auto");
+        assert!(migrated.dictation.auto_engine_migrated);
+        // Persisted, so the move does not depend on running again.
+        let on_disk = Config::load_strict_from(&path).unwrap();
+        assert_eq!(on_disk.dictation.backend, "auto");
+        assert!(on_disk.dictation.auto_engine_migrated);
+
+        // A deliberate choice of Whisper after the move is left alone.
+        let mut chosen = on_disk;
+        chosen.dictation.backend = "whisper".into();
+        chosen.save_to(&path).unwrap();
+        assert_eq!(
+            Config::load_with_migrations_from(&path).dictation.backend,
+            "whisper"
+        );
+    }
+
+    #[test]
+    fn dictation_migration_keeps_comments_and_appends_when_missing() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\nmystery = \"keep-me\"\n\n[dictation]\n# engine\nbackend = \"whisper\" # old\nmodel = \"small\"\n",
+        )
+        .unwrap();
+        Config::load_with_migrations_from(&path);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("# mine")
+                && raw.contains("mystery = \"keep-me\"")
+                && raw.contains("# engine")
+        );
+        assert!(raw.contains("backend = \"auto\"") && raw.contains("auto_engine_migrated = true"));
+        assert!(raw.contains("model = \"small\""));
+
+        std::fs::write(&path, "[transcription]\nmodel = \"small\"\n").unwrap();
+        let config = Config::load_with_migrations_from(&path);
+        assert_eq!(config.dictation.backend, "auto");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[transcription]\nmodel = \"small\""));
+        assert!(raw.contains("[dictation]\nauto_engine_migrated = true"));
+    }
+
+    #[test]
+    fn dictation_migration_keeps_non_default_engines() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[dictation]\nbackend = \"sherpa\"\n").unwrap();
+        let migrated = Config::load_with_migrations_from(&path);
+        assert_eq!(migrated.dictation.backend, "sherpa");
+        assert!(migrated.dictation.auto_engine_migrated);
+        assert_eq!(Config::default().dictation.backend, "auto");
     }
 
     #[test]
