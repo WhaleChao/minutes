@@ -145,6 +145,7 @@ export interface Frontmatter {
   entities?: { people?: Array<{ slug?: string; label: string; aliases?: string[] }> };
   /** Applied post-pass name corrections (raw token preserved), if any. */
   name_corrections?: { raw: string; corrected: string }[];
+  spelling_corrections?: { raw: string; corrected: string; count: number }[];
   recording_health?: RecordingHealth;
 }
 

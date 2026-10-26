@@ -87,6 +87,7 @@ transcript was lost.
 | `entities` | object | Structured entity links. See [Entities](#entities) below. |
 | `speaker_map` | list&lt;SpeakerAttribution&gt; | Diarizer speaker label → real person mapping. See [Speaker attribution](#speaker-attribution) below. |
 | `name_corrections` | list&lt;NameCorrection&gt; | Applied post-pass name corrections as `{raw, corrected}` records. Omitted when no corrections were made. |
+| `spelling_corrections` | list&lt;SpellingCorrection&gt; | Vocabulary misspellings rewritten to the canonical spelling right after transcription, as `{raw, corrected, count}` records. Only misspellings you listed on acronym or term entries (`minutes vocabulary add ... --misspelling`), matched as whole words ignoring case. Omitted when nothing was rewritten. |
 
 ### Structured extraction
 
