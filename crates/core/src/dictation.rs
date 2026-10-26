@@ -538,6 +538,52 @@ where
         for warning in permission_preflight.warnings {
             tracing::warn!(warning = %warning, "dictation microphone permission preflight warning");
         }
+        // Undecided permission: ask explicitly before opening the device, so a
+        // hidden or missing prompt ends in a clear error instead of a capture
+        // that waits forever and ignores Escape.
+        if crate::macos_permissions::microphone_status()
+            == crate::macos_permissions::MacPermissionStatus::NotDetermined
+        {
+            use crate::macos_permissions::MicrophoneRequestOutcome;
+            startup_debug(
+                "microphone_permission_request",
+                Some(&model_name),
+                None,
+                None,
+            );
+            let outcome = crate::macos_permissions::request_microphone_access(
+                &|| {
+                    stop_flag.load(Ordering::Relaxed)
+                        || cancellation::requested(options.cancel_flag.as_deref())
+                },
+                MICROPHONE_PERMISSION_WAIT,
+            );
+            startup_debug(
+                "microphone_permission_answer",
+                Some(&model_name),
+                None,
+                Some(&format!("{outcome:?}")),
+            );
+            match outcome {
+                MicrophoneRequestOutcome::Granted => {}
+                MicrophoneRequestOutcome::Cancelled => {
+                    on_event(DictationEvent::Cancelled);
+                    return Ok(());
+                }
+                MicrophoneRequestOutcome::Denied => {
+                    return Err(DictationError::PermissionBlocked(
+                        "Microphone access is off for Minutes. Turn it on in System Settings > Privacy & Security > Microphone.".into(),
+                    )
+                    .into());
+                }
+                MicrophoneRequestOutcome::TimedOut => {
+                    return Err(DictationError::PermissionBlocked(
+                        "macOS did not answer the microphone permission request. Check System Settings > Privacy & Security > Microphone, then try again.".into(),
+                    )
+                    .into());
+                }
+            }
+        }
 
         let audio_start = Instant::now();
         startup_debug(
@@ -1335,6 +1381,10 @@ fn with_sherpa_dictation_recognizer<T>(
     let (_, recognizer) = cache.as_mut().expect("recognizer cached above");
     use_recognizer(recognizer)
 }
+
+/// Longest dictation waits for macOS to answer a microphone permission request.
+#[cfg(feature = "whisper")]
+const MICROPHONE_PERMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Durable record of what Parakeet v3 did with one utterance. The desktop app
 /// installs no tracing subscriber, so without this a silent fall back to
