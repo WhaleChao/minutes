@@ -15,7 +15,7 @@ minutes-archive-semantic = { path = "../../crates/archive-semantic" }
 minutes-archive-worker-control = { path = "../../crates/archive-worker-control" }
 flate2 = "1"
 base64 = "0.23"
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 serde = { workspace = true }
 sha2 = "0.10"
 serde_json = { workspace = true }
