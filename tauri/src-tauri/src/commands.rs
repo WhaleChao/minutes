@@ -2634,6 +2634,13 @@ pub struct ProactiveContextBundleView {
     pub losing_touch_count: usize,
 }
 
+/// "Sat Oct 24" instead of an RFC 3339 timestamp; unparseable dates pass through.
+fn weekly_date_label(date: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(date)
+        .map(|date| date.format("%a %b %-d").to_string())
+        .unwrap_or_else(|_| date.to_string())
+}
+
 fn build_weekly_summary_markdown(
     meetings_count: usize,
     recent_titles: &str,
@@ -2642,7 +2649,8 @@ fn build_weekly_summary_markdown(
     open_actions_block: &str,
 ) -> String {
     format!(
-        "# Weekly Summary\n\n## Volume\n\n- {meetings_count} meeting or memo artifact(s) in the last 7 days.\n\n## Recent Meetings\n\n{recent_titles}\n\n## Decision Arcs\n\n{decision_conflicts}\n\n## Stale Commitments\n\n{stale_commitments}\n\n## Open Actions\n\n{open_actions_block}\n\n## Monday Brief\n\n- Confirm the highest-risk open commitment.\n- Review the most important decision conflict before the next meeting.\n- Turn the most important meeting into a durable artifact if it is still only in transcript form.\n"
+        "# Weekly Summary\n\n## Volume\n\n- {meetings_count} {} in the last 7 days.\n\n## Recent Meetings\n\n{recent_titles}\n\n## Decision Arcs\n\n{decision_conflicts}\n\n## Stale Commitments\n\n{stale_commitments}\n\n## Open Actions\n\n{open_actions_block}\n\n## Monday Brief\n\n- Confirm the highest-risk open commitment.\n- Review the most important decision conflict before the next meeting.\n- Turn the most important meeting into a durable artifact if it is still only in transcript form.\n",
+        if meetings_count == 1 { "meeting or memo" } else { "meetings and memos" }
     )
 }
 
@@ -7996,7 +8004,7 @@ fn cmd_weekly_summary_blocking() -> Result<WeeklySummaryView, String> {
         meetings
             .iter()
             .take(6)
-            .map(|meeting| format!("- {} ({})", meeting.title, meeting.date))
+            .map(|meeting| format!("- {} · {}", meeting.title, weekly_date_label(&meeting.date)))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -8223,12 +8231,19 @@ fn list_meetings_value(limit: usize) -> Result<serde_json::Value, String> {
     let search_duration = search_started.elapsed();
     let limited: Vec<_> = results.into_iter().take(limit).collect();
     let badges_started = Instant::now();
+    // Badges re-read each file, so only the rows a person sees first get them;
+    // the rest of the full inventory stays metadata-only.
     let enriched: Result<Vec<serde_json::Value>, String> = limited
         .iter()
-        .map(|result| {
+        .enumerate()
+        .map(|(index, result)| {
             let mut value = serde_json::to_value(result)
                 .map_err(|error| format!("Meeting inventory could not be encoded: {error}"))?;
-            let badges = compute_lifecycle_badges(&result.path, &prep_slugs);
+            let badges = if index < LIFECYCLE_BADGE_ROWS {
+                compute_lifecycle_badges(&result.path, &prep_slugs)
+            } else {
+                Vec::new()
+            };
             value["badges"] = serde_json::json!(badges);
             Ok(value)
         })
@@ -8244,9 +8259,11 @@ fn list_meetings_value(limit: usize) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!(enriched?))
 }
 
+const LIFECYCLE_BADGE_ROWS: usize = 100;
+
 #[tauri::command]
 pub async fn cmd_list_meetings(limit: Option<usize>) -> Result<serde_json::Value, String> {
-    let requested_limit = limit.unwrap_or(20).clamp(1, 100);
+    let requested_limit = limit.unwrap_or(20).clamp(1, 5000);
     run_json_inventory(&MEETING_INVENTORY, "Meeting inventory", move || {
         list_meetings_value(requested_limit)
     })
@@ -8436,6 +8453,20 @@ fn archive_meeting_artifacts(
     }
 
     Ok(moves)
+}
+
+/// Check off (or reopen) one action item from the meeting detail view. Only
+/// Markdown files inside the meetings folder can be edited this way.
+#[tauri::command]
+pub fn cmd_set_action_item_status(path: String, index: usize, done: bool) -> Result<(), String> {
+    let output_dir = std::fs::canonicalize(Config::load().output_dir).map_err(|e| e.to_string())?;
+    let md_path = std::fs::canonicalize(&path).map_err(|_| format!("File not found: {path}"))?;
+    if !md_path.starts_with(&output_dir)
+        || md_path.extension().and_then(|ext| ext.to_str()) != Some("md")
+    {
+        return Err("Only meetings in your meetings folder can be edited".into());
+    }
+    minutes_core::markdown::set_action_item_status(&md_path, index, done).map_err(|e| e.to_string())
 }
 
 /// Archive a meeting and its audio without a confirmation dialog. Archiving
@@ -19481,6 +19512,12 @@ mod tests {
             .related_topics
             .iter()
             .any(|topic| topic == "pricing strategy"));
+    }
+
+    #[test]
+    fn weekly_dates_read_as_days() {
+        assert_eq!(weekly_date_label("2026-10-24T22:33:34-04:00"), "Sat Oct 24");
+        assert_eq!(weekly_date_label("not a date"), "not a date");
     }
 
     #[test]

@@ -1227,13 +1227,8 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     };
 
     let file_menu = {
-        let open_item = MenuItem::with_id(
-            app,
-            "app-open-main",
-            tr("Open Minutes"),
-            true,
-            Some("Cmd+O"),
-        )?;
+        let open_item =
+            MenuItem::with_id(app, "app-open-main", tr("Open Minutes"), true, None::<&str>)?;
         let note_item = MenuItem::with_id(
             app,
             "app-add-note",
@@ -3250,6 +3245,7 @@ fn main() {
             commands::cmd_remember_dictation_hud_position,
             commands::cmd_delete_meeting,
             commands::cmd_archive_meeting,
+            commands::cmd_set_action_item_status,
             commands::cmd_restore_archived_meeting,
             commands::cmd_reveal_path,
             commands::cmd_copy_path,
