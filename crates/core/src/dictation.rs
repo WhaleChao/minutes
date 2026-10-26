@@ -1379,9 +1379,22 @@ struct SherpaReleaseOnEnd(bool);
 #[cfg(feature = "engine-sherpa")]
 impl Drop for SherpaReleaseOnEnd {
     fn drop(&mut self) {
-        if self.0 && Config::load().dictation.backend != "sherpa" {
+        if self.0 && !dictation_setting_wants_sherpa(&Config::load()) {
             release_sherpa_dictation_recognizer();
         }
+    }
+}
+
+/// Whether the saved dictation setting still asks for Parakeet v3: "sherpa",
+/// or "auto" where the language fits. Decides whether the cached recognizer is
+/// kept between sessions, so it must match how "auto" resolves; installation
+/// is not rechecked, since a missing model leaves nothing cached anyway.
+#[cfg(feature = "engine-sherpa")]
+fn dictation_setting_wants_sherpa(config: &Config) -> bool {
+    match config.dictation.backend.as_str() {
+        "sherpa" => true,
+        "auto" => auto_dictation_uses_parakeet(config),
+        _ => false,
     }
 }
 
@@ -1495,7 +1508,7 @@ fn preload_sherpa_recognizer(config: &Config) {
         tracing::warn!(error = %error, "parakeet v3 dictation preload failed");
     }
     // Switched back to Whisper while this was loading: do not keep it.
-    if Config::load().dictation.backend != "sherpa" {
+    if !dictation_setting_wants_sherpa(&Config::load()) {
         release_sherpa_dictation_recognizer();
     }
 }
@@ -2653,6 +2666,56 @@ mod tests {
             dictation_final_backend(&config),
             DictationFinalBackend::Whisper
         );
+    }
+
+    #[cfg(feature = "engine-sherpa")]
+    #[test]
+    fn auto_keeps_the_recognizer_exactly_when_it_resolves_to_parakeet() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        for (backend, wants) in [
+            ("sherpa", true),
+            ("whisper", false),
+            ("apple-speech", false),
+        ] {
+            config.dictation.backend = backend.into();
+            assert_eq!(dictation_setting_wants_sherpa(&config), wants, "{backend}");
+        }
+        // An installed Parakeet: the plugin under the install root, and model
+        // files sized past the floor (sparse, so nothing is really written).
+        config.transcription.model_path = dir.path().join("models");
+        let plugin = crate::sherpa_plugin::candidate_paths(&config)
+            .pop()
+            .unwrap();
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, b"").unwrap();
+        let model = dir.path().join("parakeet-v3");
+        std::fs::create_dir_all(&model).unwrap();
+        for (name, min) in crate::sherpa_engine::MODEL_FILES {
+            std::fs::File::create(model.join(name))
+                .unwrap()
+                .set_len(min)
+                .unwrap();
+        }
+        config.transcription.sherpa_model_dir = model.display().to_string();
+        config.transcription.language = Some("en".into());
+
+        // "auto" must follow its own resolution, or a session that decoded
+        // with Parakeet drops the recognizer and the next one reloads it.
+        config.dictation.backend = "auto".into();
+        let resolves_to_parakeet = auto_dictation_uses_parakeet(&config);
+        assert_eq!(
+            resolves_to_parakeet,
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
+        assert_eq!(
+            dictation_setting_wants_sherpa(&config),
+            resolves_to_parakeet
+        );
+
+        // A language Parakeet v3 does not cover keeps Whisper, and lets go.
+        config.transcription.language = Some("ja".into());
+        assert!(!dictation_setting_wants_sherpa(&config));
     }
 
     #[test]
