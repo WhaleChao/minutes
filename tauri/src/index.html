@@ -7030,7 +7030,8 @@
             <div class="about-controls-group">
               <div class="about-controls-copy">Dictation engine</div>
               <select id="settings-dictation-backend" class="settings-field">
-                <option value="whisper">Whisper — default</option>
+                <option value="auto">Auto</option>
+                <option value="whisper">Whisper — every language</option>
                 <option value="sherpa">Parakeet v3 — most accurate final text</option>
               </select>
               <div class="about-controls-meta" id="settings-dictation-backend-detail">Whisper shows words as you speak and writes the final text.</div>
@@ -14653,22 +14654,27 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
     function renderDictationBackend(dictation) {
       const select = document.getElementById('settings-dictation-backend');
       const detail = document.getElementById('settings-dictation-backend-detail');
+      const autoOption = select.querySelector('option[value="auto"]');
       const sherpaOption = select.querySelector('option[value="sherpa"]');
       const available = dictation.sherpa_available === true;
-      const backend = dictation.backend === 'sherpa' ? 'sherpa' : 'whisper';
+      const autoParakeet = dictation.auto_uses_parakeet === true;
+      const backend = ['auto', 'whisper', 'sherpa'].includes(dictation.backend) ? dictation.backend : 'whisper';
+      autoOption.textContent = autoParakeet ? 'Auto (Parakeet v3)' : 'Auto (Whisper)';
       sherpaOption.disabled = !available && backend !== 'sherpa';
       sherpaOption.textContent = available
         ? 'Parakeet v3 — most accurate final text'
         : 'Parakeet v3 — not installed';
       select.value = backend;
-      if (backend === 'sherpa' && available) {
+      if (backend === 'auto') {
+        detail.textContent = autoParakeet
+          ? 'Parakeet v3 writes the final text and Whisper shows words as you speak. Auto uses Whisper instead for languages Parakeet v3 does not cover.'
+          : 'Whisper shows words as you speak and writes the final text. Auto switches to Parakeet v3 when it is installed and covers your language.';
+      } else if (backend === 'sherpa' && available) {
         detail.textContent = 'Whisper still shows words as you speak; Parakeet v3 writes the final text. If Parakeet cannot, Whisper does.';
       } else if (backend === 'sherpa') {
         detail.textContent = 'Parakeet v3 is not installed, so Whisper writes the final text. Run `minutes setup --sherpa` to install it.';
-      } else if (available) {
-        detail.textContent = 'Whisper shows words as you speak and writes the final text. Parakeet v3 is installed and writes more accurate final text.';
       } else {
-        detail.textContent = 'Whisper shows words as you speak and writes the final text.';
+        detail.textContent = 'Whisper shows words as you speak and writes the final text, in every language Whisper supports.';
       }
     }
 

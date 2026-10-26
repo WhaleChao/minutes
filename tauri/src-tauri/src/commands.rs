@@ -13653,6 +13653,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         "dictation": {
             "backend": config.dictation.backend,
             "sherpa_available": minutes_core::dictation::sherpa_dictation_available(&config),
+            "auto_uses_parakeet": minutes_core::dictation::auto_dictation_uses_parakeet(&config),
             "model": config.dictation.model,
             "destination": config.dictation.destination,
             "accumulate": config.dictation.accumulate,
@@ -14123,9 +14124,10 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
 
         // Dictation
         ("dictation", "backend") => {
-            if !["whisper", "sherpa", "apple-speech", "parakeet"].contains(&value.as_str()) {
+            if !["auto", "whisper", "sherpa", "apple-speech", "parakeet"].contains(&value.as_str())
+            {
                 return Err(format!(
-                    "unknown dictation backend '{}'. Valid: whisper, sherpa, apple-speech, parakeet",
+                    "unknown dictation backend '{}'. Valid: auto, whisper, sherpa, apple-speech, parakeet",
                     value
                 ));
             }
@@ -14137,7 +14139,13 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
                 );
             }
             config.dictation.backend = value.clone();
-            if value == "sherpa" {
+            // A choice made here is deliberate; the one-time move from the old
+            // whisper default must never overrule it.
+            config.dictation.auto_engine_migrated = true;
+            if value == "sherpa"
+                || (value == "auto"
+                    && minutes_core::dictation::auto_dictation_uses_parakeet(&config))
+            {
                 // Load the recognizer now so the first dictation does not wait.
                 let preload_config = config.clone();
                 std::thread::spawn(move || {

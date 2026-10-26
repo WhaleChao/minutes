@@ -1051,6 +1051,13 @@ fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
                 DictationFinalBackend::Whisper
             }
         }
+        "auto" => {
+            if auto_dictation_uses_parakeet(config) && sherpa_dictation_ready(config) {
+                DictationFinalBackend::Sherpa
+            } else {
+                DictationFinalBackend::Whisper
+            }
+        }
         "whisper" => DictationFinalBackend::Whisper,
         other => {
             tracing::warn!(
@@ -1077,6 +1084,41 @@ fn apple_speech_dictation_ready(_config: &Config) -> bool {
         );
     }
     ready
+}
+
+/// ISO 639-1 codes Parakeet v3 (parakeet-tdt-0.6b-v3) transcribes. Whisper
+/// covers many more, including Chinese, Japanese, Hindi, Urdu and Arabic.
+const PARAKEET_V3_LANGUAGES: &[&str] = &[
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv", "mt",
+    "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk",
+];
+
+/// Whether Parakeet v3 handles the language this user dictates in. An explicit
+/// transcription language decides; on auto-detect, a Chinese interface keeps
+/// Whisper, since Parakeet v3 has no Chinese.
+fn parakeet_v3_fits_language(language: Option<&str>, ui_language: &str) -> bool {
+    match language
+        .map(|code| code.trim().to_ascii_lowercase())
+        .filter(|code| !code.is_empty() && code != "auto")
+    {
+        Some(code) => {
+            let base = code.split(['-', '_']).next().unwrap_or("");
+            PARAKEET_V3_LANGUAGES.contains(&base)
+        }
+        None => crate::i18n::resolve_locale(ui_language) != crate::i18n::Locale::ZhCn,
+    }
+}
+
+/// What `dictation.backend = "auto"` resolves to here: Parakeet v3 when the
+/// batch auto rule would pick it (Apple Silicon, plugin and model installed)
+/// and the language fits, Whisper otherwise.
+pub fn auto_dictation_uses_parakeet(config: &Config) -> bool {
+    crate::transcribe::auto_transcription_engine_resolution(config).engine == "sherpa"
+        && parakeet_v3_fits_language(
+            config.transcription.language.as_deref(),
+            &config.ui.language,
+        )
+        && sherpa_dictation_available(config)
 }
 
 /// Whether Parakeet v3 can write dictation's final text: the build carries the
@@ -2581,6 +2623,36 @@ mod tests {
         assert_eq!(space_before_currency("costs $5 today"), "costs $5 today");
         assert_eq!(space_before_currency("price$ alone"), "price$ alone");
         assert_eq!(space_before_currency("$40 first"), "$40 first");
+    }
+
+    #[test]
+    fn parakeet_v3_language_fit() {
+        // Explicit language decides, regional suffixes included.
+        assert!(parakeet_v3_fits_language(Some("en"), "zh-CN"));
+        assert!(parakeet_v3_fits_language(Some("pt-BR"), "auto"));
+        assert!(parakeet_v3_fits_language(Some("UK"), "en"));
+        assert!(!parakeet_v3_fits_language(Some("zh"), "en"));
+        assert!(!parakeet_v3_fits_language(Some("ja"), "en"));
+        assert!(!parakeet_v3_fits_language(Some("ur"), "en"));
+        // Auto-detect: a Chinese interface keeps Whisper.
+        assert!(!parakeet_v3_fits_language(None, "zh-CN"));
+        assert!(!parakeet_v3_fits_language(Some("auto"), "zh-CN"));
+        assert!(parakeet_v3_fits_language(None, "pt-BR"));
+        assert!(parakeet_v3_fits_language(None, "en"));
+    }
+
+    #[test]
+    fn auto_dictation_uses_whisper_without_parakeet_installed() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.transcription.model_path = dir.path().join("models");
+        config.transcription.sherpa_model_dir = dir.path().join("no-sherpa").display().to_string();
+        config.dictation.backend = "auto".into();
+        assert!(!auto_dictation_uses_parakeet(&config));
+        assert_eq!(
+            dictation_final_backend(&config),
+            DictationFinalBackend::Whisper
+        );
     }
 
     #[test]
