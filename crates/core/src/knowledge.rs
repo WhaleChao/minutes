@@ -7123,7 +7123,7 @@ where
     Err("PARA completed transaction retention slots are exhausted".into())
 }
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn remove_owner_private_para_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let parent = path.parent().ok_or("private PARA file has no parent")?;
     let name = path.file_name().ok_or("private PARA file has no name")?;
@@ -18889,34 +18889,5 @@ mod tests {
         assert!(log.contains("Q2 Pricing Call"));
         assert!(log.contains("Facts written: 3, skipped: 1"));
         assert_eq!(log.matches("Q2 Pricing Call").count(), 2); // two appends
-    }
-
-    /// Stands in for a machine where `qmd` was never installed.
-    struct AbsentQmdRunner;
-
-    impl QmdRunner for AbsentQmdRunner {
-        fn run_until(
-            &self,
-            _args: &[&str],
-            _deadline: Instant,
-        ) -> Result<QmdCommandResult, QmdRunError> {
-            Err(QmdRunError::Io {
-                kind: std::io::ErrorKind::NotFound,
-                message: "no such file or directory".into(),
-            })
-        }
-    }
-
-    /// Installed, but cannot be inspected.
-    struct BrokenQmdRunner;
-
-    impl QmdRunner for BrokenQmdRunner {
-        fn run_until(
-            &self,
-            _args: &[&str],
-            _deadline: Instant,
-        ) -> Result<QmdCommandResult, QmdRunError> {
-            Err(QmdRunError::Other("qmd exploded".into()))
-        }
     }
 }
