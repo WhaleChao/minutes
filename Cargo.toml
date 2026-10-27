@@ -78,7 +78,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 ctrlc = "3"
 
 # HTTP client (for LLM API calls — no secrets in process args)
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3", features = ["json", "platform-verifier"] }
 
 # File locking (atomic PID file operations)
 fs2 = "0.4"

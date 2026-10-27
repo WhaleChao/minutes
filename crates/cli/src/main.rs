@@ -8745,6 +8745,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         ureq::config::Config::builder()
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
+            .tls_config(minutes_core::tls_roots::platform_tls_config())
             .build(),
     );
     let response = agent

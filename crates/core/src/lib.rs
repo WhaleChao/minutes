@@ -226,6 +226,7 @@ pub mod template;
 /// Test scaffolding shared by unit and integration tests. Not public API.
 #[doc(hidden)]
 pub mod test_support;
+pub mod tls_roots;
 pub mod transcribe;
 pub mod transcription_coordinator;
 pub mod vault;

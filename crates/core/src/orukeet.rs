@@ -136,6 +136,7 @@ pub fn install(model_root: &Path) -> Result<PathBuf, String> {
 fn download(url: &str, timeout: Duration) -> Result<Box<dyn Read>, String> {
     let response = ureq::get(url)
         .config()
+        .tls_config(crate::tls_roots::platform_tls_config())
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_global(Some(timeout))

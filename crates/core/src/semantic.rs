@@ -74,6 +74,7 @@ pub fn install_model(model_root: &Path) -> Result<PathBuf, String> {
         || {
             let response = ureq::get(MODEL_URL)
                 .config()
+                .tls_config(crate::tls_roots::platform_tls_config())
                 .timeout_connect(Some(Duration::from_secs(15)))
                 .timeout_recv_response(Some(Duration::from_secs(30)))
                 .timeout_global(Some(Duration::from_secs(30 * 60)))
