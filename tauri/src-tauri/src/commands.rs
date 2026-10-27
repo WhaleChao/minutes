@@ -25061,6 +25061,9 @@ fn fetch_github_release_notes(version: &str) -> Option<String> {
     match ureq::get(&url)
         .header("Accept", "application/vnd.github.v3+json")
         .header("User-Agent", "minutes-desktop")
+        .config()
+        .tls_config(minutes_core::tls_roots::platform_tls_config())
+        .build()
         .call()
     {
         Ok(response) => response
@@ -25076,6 +25079,9 @@ fn fetch_updater_manifest_notes(version: &str) -> Option<String> {
     match ureq::get(UPDATER_LATEST_JSON_URL)
         .header("Accept", "application/json")
         .header("User-Agent", "minutes-desktop")
+        .config()
+        .tls_config(minutes_core::tls_roots::platform_tls_config())
+        .build()
         .call()
     {
         Ok(response) => response

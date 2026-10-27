@@ -139,6 +139,7 @@ pub fn install_pinned_model(
     install_pinned_with(&dir, &PINNED_MODEL_FILES, progress, |file| {
         let response = ureq::get(&format!("{PINNED_MODEL_BASE}/{file}"))
             .config()
+            .tls_config(crate::tls_roots::platform_tls_config())
             .timeout_connect(Some(std::time::Duration::from_secs(15)))
             .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
             .timeout_global(Some(std::time::Duration::from_secs(60 * 60)))
