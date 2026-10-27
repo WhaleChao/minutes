@@ -16,6 +16,10 @@ const expected = [
   "GGML_AVX512_VBMI=OFF",
   "GGML_AVX512_VNNI=OFF",
   "GGML_AVX512_BF16=OFF",
+  // Without these, the cmake crate strips /O2 from whisper.cpp's MSVC Release
+  // flags and Windows transcription runs about 10x slower (#1256).
+  "CMAKE_C_FLAGS_RELEASE=/MD /O2 /Ob2 /DNDEBUG",
+  "CMAKE_CXX_FLAGS_RELEASE=/MD /O2 /Ob2 /DNDEBUG",
 ];
 
 test("the shared exporter writes the portable Windows CPU contract", () => {

@@ -16,6 +16,14 @@ set -euo pipefail
   echo "GGML_AVX512_VBMI=OFF"
   echo "GGML_AVX512_VNNI=OFF"
   echo "GGML_AVX512_BF16=OFF"
+  # The cmake crate, when it targets MSVC with the default Visual Studio
+  # generator, overwrites CMAKE_<LANG>_FLAGS_RELEASE with cc's flags and drops
+  # every /O flag from them, so whisper.cpp was compiled without optimization
+  # and transcribed about 10x slower than an official whisper.cpp build (#1256).
+  # whisper-rs-sys forwards CMAKE_* variables as defines, and the cmake crate
+  # leaves a defined variable alone, so restore CMake's MSVC Release flags.
+  echo "CMAKE_C_FLAGS_RELEASE=/MD /O2 /Ob2 /DNDEBUG"
+  echo "CMAKE_CXX_FLAGS_RELEASE=/MD /O2 /Ob2 /DNDEBUG"
 } >> "$GITHUB_ENV"
 
-echo "Windows native CPU baseline: AVX2 maximum; AVX-512 disabled"
+echo "Windows native CPU baseline: AVX2 maximum; AVX-512 disabled; MSVC Release optimization restored"
