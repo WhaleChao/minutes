@@ -126,6 +126,13 @@ pub struct ProcessingJob {
     /// forever (issue #229). Reset to 0 by `requeue_job` on a manual retry.
     #[serde(default)]
     pub retry_count: u32,
+    /// Set by crash recovery when the dead worker had this job in
+    /// `Transcribing`. A native abort inside the in-process sherpa engine (an
+    /// onnxruntime C++ exception cannot be caught by Rust) kills the worker
+    /// before the in-process whisper fallback can run, so every retry would
+    /// abort the same way. The next attempt transcribes with whisper instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crashed_while_transcribing: bool,
 }
 
 fn next_job_id() -> String {
@@ -231,6 +238,7 @@ pub fn queue_live_capture_with_recording_health(
         error: None,
         owner_pid: None,
         retry_count: 0,
+        crashed_while_transcribing: false,
     };
     if let Err(error) = write_job(&job) {
         if audio_path.exists() {
@@ -660,6 +668,7 @@ fn enqueue_capture_job_with_id(
         error: None,
         owner_pid: None,
         retry_count: 0,
+        crashed_while_transcribing: false,
     };
     write_job(&job)?;
     maybe_mark_context_session_processing(&job, Path::new(&job.audio_path));
@@ -1055,6 +1064,9 @@ pub fn list_jobs() -> Vec<ProcessingJob> {
                 return;
             }
             current.retry_count = current.retry_count.saturating_add(1);
+            if current.state == JobState::Transcribing {
+                current.crashed_while_transcribing = true;
+            }
             current.owner_pid = None;
             current.started_at = None;
             if current.retry_count > MAX_AUTO_RETRIES {
@@ -1523,6 +1535,41 @@ where
     process_pending_jobs_with_transcriber(config, &mut on_job_update, &mut transcribe)
 }
 
+/// The config a queued job transcribes with. Once a worker has died while the
+/// job was transcribing on the in-process sherpa engine, retry with whisper:
+/// sherpa runs in the worker's own address space, so a native abort there
+/// repeats on every attempt and never reaches the in-process fallback.
+fn transcription_config_for_job<'a>(
+    job: &ProcessingJob,
+    config: &'a Config,
+) -> std::borrow::Cow<'a, Config> {
+    if !retries_with_whisper(job, crate::transcribe::effective_batch_engine(config)) {
+        return std::borrow::Cow::Borrowed(config);
+    }
+    // The desktop app installs no tracing subscriber; persist the decision so
+    // a whisper transcript after a sherpa engine choice is explainable.
+    crate::logging::append_log(&json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "job_transcription_engine_fallback",
+        "file": "",
+        "message": "previous worker died while transcribing with sherpa; retrying with whisper",
+        "extra": {
+            "job_id": job.id,
+            "retry_count": job.retry_count,
+            "requested_engine": config.transcription.engine,
+        },
+    }))
+    .ok();
+    let mut fallback = config.clone();
+    fallback.transcription.engine = "whisper".into();
+    std::borrow::Cow::Owned(fallback)
+}
+
+fn retries_with_whisper(job: &ProcessingJob, effective_engine: &str) -> bool {
+    job.crashed_while_transcribing && effective_engine == "sherpa"
+}
+
 type JobTranscriber<'a> = dyn FnMut(
         &Path,
         ContentType,
@@ -1557,6 +1604,7 @@ fn process_pending_jobs_with_transcriber(
 
         let audio_path = PathBuf::from(&job.audio_path);
         let context = job_context(&job);
+        let transcription_config = transcription_config_for_job(&job, config);
 
         // Run transcription inside `catch_unwind` so a Rust panic in any of
         // the heavy native paths (whisper.cpp FFI, parakeet helper, audio
@@ -1570,7 +1618,7 @@ fn process_pending_jobs_with_transcriber(
                 &audio_path,
                 job.content_type,
                 job.title.as_deref(),
-                config,
+                &transcription_config,
                 &context,
                 job.output_path.as_deref().map(Path::new),
             )
@@ -2397,6 +2445,7 @@ mod tests {
                 error: None,
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2456,6 +2505,7 @@ mod tests {
                 error: None,
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2520,6 +2570,7 @@ mod tests {
                     error: None,
                     owner_pid: None,
                     retry_count: 0,
+                    crashed_while_transcribing: false,
                 };
                 write_job(&job).unwrap();
 
@@ -2626,6 +2677,7 @@ mod tests {
                 error: None,
                 owner_pid: Some(99_999_999),
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2634,7 +2686,77 @@ mod tests {
             assert_eq!(jobs[0].state, JobState::Queued);
             assert_eq!(jobs[0].owner_pid, None);
             assert_eq!(jobs[0].retry_count, 1);
+            assert!(jobs[0].crashed_while_transcribing);
         });
+    }
+
+    fn crash_test_job(id: &str, state: JobState) -> ProcessingJob {
+        ProcessingJob {
+            id: id.into(),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            title: None,
+            audio_path: "/tmp/fake.wav".into(),
+            output_path: None,
+            state,
+            stage: state.default_stage(),
+            created_at: Local::now(),
+            started_at: None,
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            consent: None,
+            consent_notice: None,
+            calendar_event: None,
+            template_slug: None,
+            recording_health: None,
+            word_count: None,
+            error: None,
+            owner_pid: None,
+            retry_count: 0,
+            crashed_while_transcribing: false,
+        }
+    }
+
+    #[test]
+    fn stale_claim_after_transcription_does_not_mark_a_transcription_crash() {
+        with_temp_home(|_| {
+            let mut job = crash_test_job("job-stale-summary", JobState::Summarizing);
+            job.owner_pid = Some(99_999_999);
+            write_job(&job).unwrap();
+
+            let jobs = list_jobs();
+            assert_eq!(jobs[0].state, JobState::Queued);
+            assert!(!jobs[0].crashed_while_transcribing);
+        });
+    }
+
+    #[test]
+    fn only_a_sherpa_transcription_crash_retries_with_whisper() {
+        let mut job = crash_test_job("job-crash", JobState::Queued);
+        assert!(!retries_with_whisper(&job, "sherpa"));
+
+        job.crashed_while_transcribing = true;
+        assert!(retries_with_whisper(&job, "sherpa"));
+        // Whisper and the out-of-process parakeet helper cannot take the
+        // worker down with them, so their crashes keep the chosen engine.
+        assert!(!retries_with_whisper(&job, "whisper"));
+        assert!(!retries_with_whisper(&job, "parakeet"));
+    }
+
+    #[test]
+    fn transcription_crash_flag_is_omitted_until_set() {
+        let job = crash_test_job("job-crash", JobState::Queued);
+        let json = serde_json::to_value(&job).unwrap();
+        assert!(json.get("crashed_while_transcribing").is_none());
+
+        // Records written before the field existed still load.
+        let restored: ProcessingJob = serde_json::from_value(json).unwrap();
+        assert!(!restored.crashed_while_transcribing);
     }
 
     #[test]
@@ -2671,6 +2793,7 @@ mod tests {
                 error: None,
                 owner_pid: Some(99_999_999),
                 retry_count: MAX_AUTO_RETRIES,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2727,6 +2850,7 @@ mod tests {
                 error: Some("crashed three times".into()),
                 owner_pid: None,
                 retry_count: MAX_AUTO_RETRIES + 1,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
             fs::write(&audio_path, b"fake-wav").unwrap();
@@ -2769,6 +2893,7 @@ mod tests {
                 error: Some("boom".into()),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
             fs::write(&audio_path, b"fake-wav").unwrap();
@@ -2815,6 +2940,7 @@ mod tests {
                 error: Some("boom".into()),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2861,6 +2987,7 @@ mod tests {
                 error: None,
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             write_job(&job).unwrap();
 
@@ -2904,6 +3031,7 @@ mod tests {
                 error: None,
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
             let queued = ProcessingJob {
                 id: "job-queued".into(),
@@ -2932,6 +3060,7 @@ mod tests {
                 error: None,
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
             };
 
             write_job(&active).unwrap();
@@ -2975,6 +3104,7 @@ mod tests {
             error: None,
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
         }
     }
 
