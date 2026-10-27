@@ -1,21 +1,73 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "whisper.cpp vs parakeet.cpp for local transcription — minutes",
+  title: "Whisper vs Parakeet v3 for local transcription | minutes",
   description:
-    "A candid comparison of two local transcription engines: accuracy, Apple Silicon speed, language coverage, build friction, and why Minutes picks Whisper.",
+    "How NVIDIA's Parakeet v3 compares with Whisper for local transcription: published benchmarks, our own measurements on a Mac, where Whisper still wins, and what Minutes picks by default.",
   alternates: {
     canonical: "/writing/whisper-cpp-vs-parakeet-cpp",
   },
 };
 
-const benchmarks = [
-  { engine: "Whisper", model: "small (our default)", params: "244M", wer: "3.4%", speed: "~200ms" },
-  { engine: "Whisper", model: "medium", params: "769M", wer: "2.9%", speed: "~600ms" },
-  { engine: "Whisper", model: "large-v3", params: "1.55B", wer: "2.4%", speed: "~1.5s" },
-  { engine: "Parakeet", model: "tdt-ctc-110m", params: "110M", wer: "2.4%", speed: "~27ms" },
-  { engine: "Parakeet", model: "tdt-600m", params: "600M", wer: "1.7%", speed: "~520ms" },
-] as const;
+const linkClass =
+  "text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]";
+
+const headingClass =
+  "pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]";
+
+const leaderboard = {
+  headers: ["Model", "Average", "AMI meetings", "LibriSpeech other", "Speed (RTFx)"],
+  rows: [
+    ["Whisper large-v3", "7.44%", "15.95%", "3.91%", "146"],
+    ["Parakeet v3", "6.32%", "11.39%", "3.59%", "3,333"],
+  ],
+};
+
+const ourRun = {
+  headers: ["Engine", "Word error rate", "Median time per clip"],
+  rows: [
+    ["Parakeet v3 (int8)", "3.46%", "151 ms"],
+    ["Whisper medium", "4.45%", "759 ms"],
+    ["Whisper small (Minutes default)", "5.81%", "290 ms"],
+  ],
+};
+
+function Table({ headers, rows }: { headers: string[]; rows: string[][] }) {
+  return (
+    <div className="overflow-x-auto rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)]">
+      <table className="min-w-full border-collapse text-left">
+        <thead>
+          <tr className="border-b border-[color:var(--border)]">
+            {headers.map((h) => (
+              <th
+                key={h}
+                className="px-4 py-3 font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--text-secondary)]"
+              >
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row[0]} className="border-b border-[color:var(--border)] last:border-b-0">
+              {row.map((cell, i) => (
+                <td
+                  key={`${row[0]}-${headers[i]}`}
+                  className={`px-4 py-3 font-mono text-[13px] ${
+                    i === 0 ? "text-[var(--text)]" : "text-[var(--text-secondary)]"
+                  }`}
+                >
+                  {cell}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 export default function Post() {
   return (
@@ -39,149 +91,157 @@ export default function Post() {
 
       <article className="pt-14">
         <p className="mb-4 font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--text-secondary)]">
-          2026-07-11 · Mat Silverstein
+          2026-07-11 · updated 2026-10-27 · Mat Silverstein
         </p>
         <h1 className="font-serif text-[36px] leading-[1.05] tracking-[-0.04em] text-[var(--text)] sm:text-[42px]">
-          whisper.cpp vs parakeet.cpp for local transcription
+          Whisper vs Parakeet v3 for local transcription
         </h1>
 
         <div className="mt-8 space-y-5 text-[16px] leading-[1.75] text-[var(--text-secondary)]">
           <p>
-            Minutes retains integrations for both engines, but currently selects only its sealed,
-            in-process whisper.cpp path. The available parakeet.cpp helpers accept audio by
-            pathname, which cannot safely receive Minutes&apos; sealed private-audio capability.
-            Parakeet therefore fails closed on every platform until it has a safe byte transport.
-            The upstream performance comparison is still useful, so here are the numbers and the
-            friction we found while building the integration.
+            When I first wrote this in July, the answer was simple: Minutes used Whisper, and
+            Parakeet stayed switched off. That has changed. Since version 0.31.0, Minutes runs
+            NVIDIA&apos;s Parakeet v3 inside its own process on Apple Silicon Macs, and installing
+            it takes one click. Whisper is still there, and for some people it is still the right
+            engine. Here is how the two compare on published benchmarks and on our own audio, and
+            where each one falls short.
           </p>
 
-          <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
-            The numbers
-          </h2>
+          <h2 className={headingClass}>What changed</h2>
           <p>
-            Parakeet is NVIDIA&apos;s FastConformer architecture;{" "}
-            <a
-              href="https://github.com/Frikallo/parakeet.cpp"
-              className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
-            >
+            The July version of this post was about{" "}
+            <a href="https://github.com/Frikallo/parakeet.cpp" className={linkClass}>
               parakeet.cpp
+            </a>
+            , a local port of Parakeet that only accepts audio as a file path. Minutes never
+            writes private audio to a named file that another process on your Mac could open, so
+            we left that integration off. It is still off.
+          </p>
+          <p>
+            Parakeet v3 now runs through{" "}
+            <a href="https://k2-fsa.github.io/sherpa/onnx/index.html" className={linkClass}>
+              sherpa-onnx
             </a>{" "}
-            is its ggml-style local port with Metal acceleration on Apple Silicon. LibriSpeech
-            clean word-error rates, with speed measured on 10 seconds of audio on an M-series GPU:
+            instead, loaded as a plugin inside the Minutes process. It receives audio the same way
+            Whisper does, as samples in memory, so no new copy of your audio touches disk. The
+            model is parakeet-tdt-0.6b-v3 in int8 form, a 639&nbsp;MB download from a pinned
+            Hugging Face revision. Minutes checks every file against its SHA-256 before using it.
           </p>
 
-          <div className="overflow-x-auto rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)]">
-            <table className="min-w-full border-collapse text-left">
-              <thead>
-                <tr className="border-b border-[color:var(--border)]">
-                  {["Engine", "Model", "Params", "WER", "Speed"].map((h) => (
-                    <th
-                      key={h}
-                      className="px-4 py-3 font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--text-secondary)]"
-                    >
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {benchmarks.map((row) => (
-                  <tr
-                    key={`${row.engine}-${row.model}`}
-                    className="border-b border-[color:var(--border)] last:border-b-0"
-                  >
-                    <td className="px-4 py-3 font-mono text-[13px] text-[var(--text)]">{row.engine}</td>
-                    <td className="px-4 py-3 font-mono text-[13px] text-[var(--text-secondary)]">{row.model}</td>
-                    <td className="px-4 py-3 font-mono text-[13px] text-[var(--text-secondary)]">{row.params}</td>
-                    <td className="px-4 py-3 font-mono text-[13px] text-[var(--text-secondary)]">{row.wer}</td>
-                    <td className="px-4 py-3 font-mono text-[13px] text-[var(--text-secondary)]">{row.speed}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <h2 className={headingClass}>The published numbers</h2>
+          <p>
+            NVIDIA released{" "}
+            <a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3" className={linkClass}>
+              Parakeet v3
+            </a>{" "}
+            in August 2025. It has 600 million parameters, covers 25 European languages with
+            automatic language detection, writes punctuation and capitals, and is licensed CC BY
+            4.0. NVIDIA&apos;s{" "}
+            <a href="https://arxiv.org/abs/2509.14128" className={linkClass}>
+              paper
+            </a>{" "}
+            reports these word error rates on the Hugging Face Open ASR Leaderboard (lower is
+            better):
+          </p>
+
+          <Table headers={leaderboard.headers} rows={leaderboard.rows} />
 
           <p>
-            Read that table twice. Parakeet&apos;s 110M-parameter model matches Whisper
-            large-v3&apos;s accuracy with 14× fewer parameters, and transcribes 10 seconds of
-            audio in 27 milliseconds where large-v3 takes a second and a half. The 600M model
-            beats everything in its class at 1.7% WER. On raw accuracy-per-parameter and speed,
-            it isn&apos;t close.
+            RTFx is how many seconds of audio a model gets through per second of compute on
+            NVIDIA&apos;s test GPU. The AMI column is the one I care about most, because it is
+            recorded meetings. There Parakeet v3 makes about 29% fewer errors than Whisper
+            large-v3, and it does it with well under half the parameters.
           </p>
 
-          <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
-            So why is Whisper still our default?
-          </h2>
+          <h2 className={headingClass}>Our numbers, on a Mac</h2>
+          <p>
+            Minutes defaults to Whisper small, not large-v3, so we also measured the models
+            Minutes users actually run. This was on an M4 Max with the models already loaded,
+            using 39 clips from LibriSpeech test-other:
+          </p>
+
+          <Table headers={ourRun.headers} rows={ourRun.rows} />
+
+          <p>
+            LibriSpeech is people reading books aloud, with few names or acronyms, so I also ran
+            39 of my own saved dictation clips. There is no hand-checked transcript for those, so
+            Whisper medium served as the reference. Parakeet v3 differed from it on 2.1% of words
+            and Whisper small on 6.9%. Parakeet decoded a typical clip in 51&nbsp;ms, Whisper small
+            in 168&nbsp;ms.
+          </p>
+
+          <h2 className={headingClass}>Where Whisper still wins</h2>
           <p>
             <span className="font-medium text-[var(--text)]">Languages.</span> Whisper covers 99
-            languages. Parakeet&apos;s tdt-600m covers 25 European ones, and the 110M model is
-            English-only. If your meetings might contain Japanese, Hindi, Arabic, or Mandarin,
-            the comparison is over before it starts.
+            languages and Parakeet v3 covers 25, all European. If you set a language Parakeet
+            does not cover, such as Chinese, Japanese, Hindi or Arabic, Minutes keeps Whisper and
+            never offers the install.
           </p>
           <p>
-            <span className="font-medium text-[var(--text)]">Zero-friction install.</span>{" "}
-            whisper.cpp has mature prebuilt distribution everywhere. parakeet.cpp has no binary
-            releases as of this writing: you build it yourself with CMake — and on macOS you need
-            full Xcode for the Metal shader compiler, plus CMake 3.31.x specifically, because a
-            bundled dependency trips on CMake 4. Then you download a 2.4&nbsp;GB .nemo file from
-            HuggingFace and convert it to safetensors with a small Python venv. We documented the
-            whole path and it&apos;s reliable — but it&apos;s an afternoon, not a{" "}
-            <span className="font-mono text-[14px]">brew install</span>.
+            <span className="font-medium text-[var(--text)]">Platforms.</span> The desktop app
+            uses Parakeet only on Apple Silicon Macs. On Linux, the command-line sherpa archive
+            runs it if you set the engine to sherpa yourself. Windows and Intel Macs use Whisper
+            for now; Windows support is tracked in{" "}
+            <a href="https://github.com/silverstein/minutes/issues/645" className={linkClass}>
+              #645
+            </a>
+            .
           </p>
           <p>
-            <span className="font-medium text-[var(--text)]">Streaming partials.</span> Our
-            dictation overlay depends on fast mid-utterance partial results, and Whisper&apos;s
-            streaming behavior is what makes that feel live. The retained Parakeet integration
-            does not currently receive production audio because its pathname-only handoff would
-            require restoring plaintext staging.
+            <span className="font-medium text-[var(--text)]">Unusual names.</span> Parakeet v3
+            can misspell rare names. In my dictation clips it wrote &quot;Garek&quot; for
+            &quot;Garrett&quot;, a name Whisper small got right. Minutes can steer Whisper toward
+            the names in your vocabulary list, and Parakeet has no equivalent. What works for
+            both engines is listing the misspellings you see: Minutes corrects them in every new
+            transcript.
           </p>
           <p>
-            <span className="font-medium text-[var(--text)]">Private-audio transport.</span>{" "}
-            A transcription engine must consume audio without creating a named plaintext file
-            that another same-user process can open. Whisper runs in-process against Minutes&apos;
-            sealed reader. The current Parakeet subprocess and warm-server protocols accept a
-            pathname, so Minutes rejects Parakeet selection and uses Whisper instead.
-          </p>
-
-          <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
-            Where Parakeet&apos;s upstream results stand out
-          </h2>
-          <p>
-            English or major-European-language audio on Apple Silicon, especially live
-            transcription. The latency difference is not subtle: for real-time meeting
-            transcription, a warm Parakeet sidecar turns per-utterance transcription from
-            &quot;noticeable lag&quot; into &quot;effectively instant,&quot; and on long batch
-            jobs the throughput gap compounds. One contributor runs Parakeet through
-            NVIDIA&apos;s NeMo on an RTX 3090: a 68-minute French meeting transcribes in about
-            3.5 minutes, with quality that beats Whisper large-v3 on mixed-language audio.
+            <span className="font-medium text-[var(--text)]">Live text.</span> While you dictate,
+            the words appearing on screen still come from Whisper; Parakeet writes the final
+            text when you stop. Standalone live transcript runs on Whisper, or on Apple Speech if
+            you opt in on macOS 26.
           </p>
 
-          <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
-            The recommendation
-          </h2>
+          <h2 className={headingClass}>What Minutes picks by default</h2>
           <p>
-            Use Whisper in Minutes today. Even if a Parakeet preference or binary is present,
-            Minutes resolves to sealed Whisper rather than stage private audio on a pathname.
-            Parakeet selection can return when its subprocess accepts a safe byte stream, or when
-            an explicitly acknowledged descriptor-isolation protocol closes the same-user open
-            race. Until then, the benchmark advantage is promising research, not a setup path we
-            recommend to Minutes users.
+            The transcription engine defaults to Auto. Auto uses Parakeet v3 when it is installed,
+            you are on Apple Silicon, and your language is one Parakeet covers. Otherwise it uses
+            Whisper. If Parakeet fails on a recording, Whisper transcribes it instead, and since
+            0.31.0 that includes the rare recording that crashes the Parakeet engine outright.
           </p>
           <p>
-            The retained integration notes, including the safety gate and build pitfalls, are in{" "}
+            You can install Parakeet v3 from the banner Minutes shows when it is available, from Settings ›
+            Transcription, or during first-run setup. From the command line it is{" "}
+            <span className="font-mono text-[14px]">minutes setup --sherpa</span>.
+          </p>
+
+          <h2 className={headingClass}>The recommendation</h2>
+          <p>
+            If you are on an Apple Silicon Mac and your meetings are mostly in one of
+            Parakeet&apos;s 25 languages, install it. On our tests it was more accurate than
+            Whisper small, the default, and about twice as fast. If your meetings are
+            full of unusual names, add them to your vocabulary along with the misspellings you
+            see. Everyone else should stay on Whisper, and with the engine on Auto, Minutes makes
+            that call for you.
+          </p>
+          <p>
+            Setup details are in{" "}
+            <a
+              href="https://github.com/silverstein/minutes/blob/main/docs/architecture/sherpa-engine.md"
+              className={linkClass}
+            >
+              docs/architecture/sherpa-engine.md
+            </a>
+            , and the parked parakeet.cpp integration is documented in{" "}
             <a
               href="https://github.com/silverstein/minutes/blob/main/docs/architecture/parakeet.md"
-              className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
+              className={linkClass}
             >
               docs/architecture/parakeet.md
             </a>
-            . Benchmarks are the upstream projects&apos; published LibriSpeech numbers; speed
-            figures are from parakeet.cpp&apos;s measurements on M-series GPUs. Minutes is MIT
-            licensed —{" "}
-            <a
-              href="https://github.com/silverstein/minutes"
-              className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
-            >
+            . The leaderboard figures come from Table 5 of NVIDIA&apos;s paper; the Mac
+            measurements are ours. Minutes is MIT licensed, and{" "}
+            <a href="https://github.com/silverstein/minutes" className={linkClass}>
               the pipeline code is on GitHub
             </a>
             .

@@ -12,10 +12,10 @@ export const metadata: Metadata = {
 const posts = [
   {
     slug: "whisper-cpp-vs-parakeet-cpp",
-    date: "2026-07-11",
-    title: "whisper.cpp vs parakeet.cpp for local transcription",
+    date: "2026-10-27",
+    title: "Whisper vs Parakeet v3 for local transcription",
     summary:
-      "Real numbers on accuracy and Apple Silicon speed, plus why Minutes currently selects sealed Whisper and safety-gates Parakeet's pathname-only transport. Read this if you are choosing a local transcription engine, or wondering why the faster one is not the default.",
+      "Parakeet v3 now runs inside Minutes on Apple Silicon. Published benchmarks and our own Mac measurements against Whisper, where Whisper still wins, and what Minutes picks by default. Read this if you are choosing a local transcription engine.",
   },
   {
     slug: "governance-built-in-not-retrofitted",

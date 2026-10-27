@@ -66,7 +66,7 @@ const sources = [
   { label: "Vibe on GitHub", href: "https://github.com/thewh1teagle/vibe" },
   { label: "whisper.cpp on GitHub", href: "https://github.com/ggml-org/whisper.cpp" },
   {
-    label: "whisper.cpp vs parakeet.cpp — our engine comparison",
+    label: "Whisper vs Parakeet v3: our engine comparison",
     href: "/writing/whisper-cpp-vs-parakeet-cpp",
   },
 ] as const;

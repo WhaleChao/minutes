@@ -73,7 +73,7 @@ const sources = [
   { label: "Minutes MCP reference", href: "https://useminutes.app/docs/mcp/tools" },
   { label: "Minutes on GitHub", href: "https://github.com/silverstein/minutes" },
   {
-    label: "whisper.cpp vs parakeet.cpp — our engine comparison",
+    label: "Whisper vs Parakeet v3: our engine comparison",
     href: "/writing/whisper-cpp-vs-parakeet-cpp",
   },
 ] as const;
