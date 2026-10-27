@@ -940,6 +940,7 @@ mod tests {
             error: None,
             owner_pid: Some(4242),
             retry_count: 0,
+            crashed_while_transcribing: false,
         };
         let jobs = vec![job];
         let status = status_with_active_jobs(&jobs);
@@ -994,6 +995,7 @@ mod tests {
             error: None,
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
         };
         let active = mk("job-a", crate::jobs::JobState::Transcribing, "Active job");
         let queued = mk("job-q", crate::jobs::JobState::Queued, "Queued job");

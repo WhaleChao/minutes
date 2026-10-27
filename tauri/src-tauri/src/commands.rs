@@ -5111,29 +5111,74 @@ pub fn spawn_processing_worker(
         // Keep batch ASR/diarization work out of the GUI process. Long or
         // mostly-silent captures can stress native backends; the CLI already
         // uses this process boundary for queued jobs.
-        let child_result = std::env::current_exe().and_then(|exe| {
-            std::process::Command::new(exe)
-                .arg("--process-queue-worker")
-                .env(
-                    "RUST_LOG",
-                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-                )
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-        });
+        //
+        // A worker that dies (for example a native abort in the sherpa
+        // engine) leaves its job claimed; the next `list_jobs` requeues it or
+        // fails it once the retry budget is spent. Nothing else would start a
+        // new worker until the app relaunched, so the requeued job would sit
+        // in "Queued" indefinitely. Respawn while the crash left work behind,
+        // bounded by the same budget the job records enforce.
+        let mut crash_respawns = 0;
+        loop {
+            let child_result = std::env::current_exe().and_then(|exe| {
+                std::process::Command::new(exe)
+                    .arg("--process-queue-worker")
+                    .env(
+                        "RUST_LOG",
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                    )
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            });
 
-        match child_result {
-            Ok(mut child) => {
-                let status = child.wait();
-                if let Err(error) = status {
-                    eprintln!("[minutes] processing worker wait failed: {}", error);
+            let crashed = match child_result {
+                Ok(mut child) => {
+                    // Drain on a thread so a full pipe never blocks the worker.
+                    let stderr_tail = child
+                        .stderr
+                        .take()
+                        .map(|stderr| std::thread::spawn(move || read_stderr_tail(stderr)));
+                    let status = child.wait();
+                    let tail = stderr_tail
+                        .and_then(|reader| reader.join().ok())
+                        .unwrap_or_default();
+                    match status {
+                        Ok(status) if status.success() => false,
+                        Ok(status) => {
+                            persist_worker_crash_tail(&status.to_string(), &tail);
+                            true
+                        }
+                        Err(error) => {
+                            eprintln!("[minutes] processing worker wait failed: {}", error);
+                            false
+                        }
+                    }
                 }
+                Err(error) => {
+                    eprintln!("[minutes] failed to spawn processing worker: {}", error);
+                    false
+                }
+            };
+
+            if !crashed
+                || crash_respawns >= minutes_core::jobs::MAX_AUTO_RETRIES
+                || minutes_core::jobs::active_job_count() == 0
+                || minutes_core::jobs::worker_active()
+            {
+                break;
             }
-            Err(error) => {
-                eprintln!("[minutes] failed to spawn processing worker: {}", error);
-            }
+            crash_respawns += 1;
+            minutes_core::logging::append_log(&serde_json::json!({
+                "ts": chrono::Local::now().to_rfc3339(),
+                "level": "warn",
+                "step": "processing_worker_respawn",
+                "file": "",
+                "message": "processing worker exited abnormally with jobs still pending; respawning",
+                "extra": { "respawn": crash_respawns },
+            }))
+            .ok();
         }
 
         sync_processing_indicator(&processing, &processing_stage);
@@ -5164,6 +5209,77 @@ pub fn spawn_processing_worker(
             }
         }
     });
+}
+
+/// Bytes of worker stderr kept in memory; only the tail matters for a crash.
+const PROCESSING_WORKER_STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// Size at which the worker crash log is rotated to a single `.1` backup.
+const PROCESSING_WORKER_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Keep the last `PROCESSING_WORKER_STDERR_TAIL_BYTES` the worker writes to
+/// stderr. Native engines report their last words there before an abort
+/// (onnxruntime prints the failing node), and the crash report does not.
+fn read_stderr_tail(mut stderr: impl std::io::Read) -> Vec<u8> {
+    let mut tail = std::collections::VecDeque::with_capacity(PROCESSING_WORKER_STDERR_TAIL_BYTES);
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                tail.extend(&chunk[..read]);
+                let excess = tail
+                    .len()
+                    .saturating_sub(PROCESSING_WORKER_STDERR_TAIL_BYTES);
+                tail.drain(..excess);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail.into()
+}
+
+/// Persist the stderr tail of a worker that exited abnormally to an
+/// owner-only file under the log directory. A clean exit keeps nothing, and
+/// the tail never reaches UI text or notifications.
+fn persist_worker_crash_tail(status: &str, tail: &[u8]) {
+    let dir = minutes_core::logging::log_dir();
+    let path = dir.join("processing-worker-crash.log");
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        if std::fs::metadata(&path)
+            .map(|meta| meta.len() > PROCESSING_WORKER_LOG_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            std::fs::rename(&path, dir.join("processing-worker-crash.log.1"))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        use std::io::Write;
+        writeln!(
+            file,
+            "--- processing worker exited abnormally ({}) at {}",
+            status,
+            chrono::Local::now().to_rfc3339()
+        )?;
+        file.write_all(tail)?;
+        if !tail.ends_with(b"\n") {
+            writeln!(file)?;
+        }
+        Ok(())
+    };
+    if let Err(error) = write() {
+        eprintln!(
+            "[minutes] could not persist processing worker crash tail: {}",
+            error
+        );
+    }
 }
 
 fn display_path(path: &str) -> String {
@@ -14376,6 +14492,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn worker_stderr_tail_keeps_only_the_last_bytes() {
+        let mut output = vec![b'a'; PROCESSING_WORKER_STDERR_TAIL_BYTES * 3];
+        output.extend_from_slice(b"fatal runtime error: Rust cannot catch foreign exceptions\n");
+
+        let tail = read_stderr_tail(output.as_slice());
+
+        assert_eq!(tail.len(), PROCESSING_WORKER_STDERR_TAIL_BYTES);
+        assert!(tail.ends_with(b"Rust cannot catch foreign exceptions\n"));
+        assert!(read_stderr_tail(&b""[..]).is_empty());
+    }
+
+    #[test]
     fn live_captures_both_sides_when_native_call_capture_is_usable() {
         use minutes_core::macos_permissions::MacPermissionStatus;
         let available = call_capture::CallCaptureAvailability::Available {
@@ -18740,6 +18868,7 @@ mod tests {
             word_count: None,
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
             consent: None,
             consent_notice: None,
             recording_health: None,
@@ -19777,6 +19906,7 @@ mod tests {
             word_count: Some(0),
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
             consent: None,
             consent_notice: None,
             recording_health: None,
@@ -19817,6 +19947,7 @@ mod tests {
             word_count: Some(8_329),
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
             consent: None,
             consent_notice: None,
             recording_health: None,
@@ -19859,6 +19990,7 @@ mod tests {
             word_count: Some(0),
             owner_pid: None,
             retry_count: 0,
+            crashed_while_transcribing: false,
             consent: None,
             consent_notice: None,
             recording_health: None,
@@ -19906,6 +20038,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -19949,6 +20082,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -19977,6 +20111,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -20020,6 +20155,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -20061,6 +20197,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -20104,6 +20241,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
@@ -20163,6 +20301,7 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                crashed_while_transcribing: false,
                 consent: None,
                 consent_notice: None,
                 recording_health: None,
