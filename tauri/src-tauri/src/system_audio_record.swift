@@ -434,6 +434,13 @@ private final class FixedFormatStemWriter {
         }
     }
 
+    /// Flushes and discards the resampler without touching the timeline.
+    func restartConverter() {
+        flushConverter()
+        converter = nil
+        converterInputFormat = nil
+    }
+
     /// Seconds of audio already in the file, or nil before the first write.
     var writtenSeconds: Double? {
         guard let file else { return nil }
@@ -1464,6 +1471,9 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
                 "channels": channels,
             ])
             self.tapRateWindowStart = nil
+            // Liveness is measured from the start, so a tap that never
+            // delivers its first buffer is rebuilt too.
+            self.lastTapSampleHost = hostSeconds()
             self.systemAudioArbiter.tapStarted(rebuild: reason != "start")
             self.decideSystemSource()
         }
@@ -1558,12 +1568,6 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         if pts.isFinite, abs(pts - now) < 5 { return pts }
         return now - seconds
-    }
-
-    /// Seconds since the stems' shared origin, falling back to the capture
-    /// clock before the first stem buffer. sampleQueue.
-    private var stemElapsedSeconds: Double {
-        stemOriginHost.map { max(0, hostSeconds() - $0) } ?? elapsedSeconds
     }
 
     /// sampleQueue. Places a voice buffer on the shared stem timeline: the
@@ -1756,9 +1760,10 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             // While the tap owns the system stem, a ScreenCaptureKit reconnect
             // must not pad it: the tap kept writing through the interruption.
             let ownsStem = outputType == .microphone || systemStemSource == .screenCaptureKit
-            // The stems' own timeline, not the .mov segment clock, so both
-            // stems resume from the same origin.
-            if attempt > 0, ownsStem { writer?.resume(atElapsedSeconds: stemElapsedSeconds) }
+            // The reconnect gap is filled by host-time placement when the
+            // next buffer is written; only the resampler starts over, since
+            // the new stream may deliver another format.
+            if attempt > 0, ownsStem { writer?.restartConverter() }
         }
         let framesBefore = writer?.framesWritten ?? 0
         let silenceBefore = writer?.framesSilenced ?? 0

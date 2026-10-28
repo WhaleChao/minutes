@@ -89,6 +89,9 @@ struct SystemAudioSourceArbiter {
     /// Since the current tap started. A refused tap never sets it.
     private(set) var tapHeardSignal = false
     private var lastTapBufferAt: Double?
+    /// Until the current tap's first buffer, its level is unknown, not zero,
+    /// so witness audio is not evidence against it.
+    private var awaitingFirstTapBuffer = false
     private var tapLevel = RecentLevel()
     private var witnessLevel = RecentLevel()
     private var witnessLouderSeconds = 0.0
@@ -107,11 +110,15 @@ struct SystemAudioSourceArbiter {
     /// A start or a rebuild. Keeps an earlier demotion: a rebuilt tap that is
     /// still refused would otherwise flap. Clears the comparison windows so a
     /// rebuild's warm-up cannot be read as a refusal. A rebuild keeps the old
-    /// tap's liveness, so a quick rebuild does not announce a fallback.
+    /// tap's liveness, so a quick rebuild does not announce a fallback, and
+    /// what the old tap heard: a rebuilt tap is not a newly refused one.
     mutating func tapStarted(rebuild: Bool = false) {
         tapRunning = true
-        if !rebuild { lastTapBufferAt = nil }
-        tapHeardSignal = false
+        awaitingFirstTapBuffer = true
+        if !rebuild {
+            lastTapBufferAt = nil
+            tapHeardSignal = false
+        }
         tapLevel = RecentLevel()
         witnessLouderSeconds = 0
         tapLouderSeconds = 0
@@ -127,6 +134,7 @@ struct SystemAudioSourceArbiter {
     mutating func observeTap(seconds: Double, allZero: Bool, level: UInt32, now: Double) {
         guard tapRunning else { return }
         lastTapBufferAt = now
+        awaitingFirstTapBuffer = false
         if !allZero { tapHeardSignal = true }
         tapLevel.observe(level, now: now)
         let witness = witnessLevel.value(now: now)
@@ -155,7 +163,7 @@ struct SystemAudioSourceArbiter {
         witnessLevel.observe(level, now: now)
         // Only a live tap can be judged. Startup latency and stalls are the
         // live window's job, never evidence of a refusal.
-        guard tapRunning, !demoted, let last = lastTapBufferAt,
+        guard tapRunning, !demoted, !awaitingFirstTapBuffer, let last = lastTapBufferAt,
               now - last < Self.tapLiveWindow, level >= systemAudioSignalLevel else { return }
         let tap = tapLevel.value(now: now)
         guard Double(level) > Self.dominanceRatio * tap else {
@@ -206,8 +214,10 @@ struct StemPlacement: Equatable {
     /// Beyond this the stem is not drifting but has a gap (a stall, a
     /// reconnect) or a fresh start, and is moved in one step.
     static let jumpThreshold = 0.25
-    /// Drift is corrected at most this much per buffer, so a correction is
-    /// a couple of milliseconds, never a word.
+    /// A stem that runs ahead is trimmed at most this much per buffer, so a
+    /// correction cuts a couple of milliseconds, never a word. A stem that
+    /// falls behind is padded in one step: that audio is missing anyway, and
+    /// one short silence beats many tiny ones.
     static let driftStep = 0.002
 
     /// Seconds of silence to insert before the buffer.
@@ -227,10 +237,9 @@ struct StemPlacement: Equatable {
     ) -> StemPlacement {
         let delta = bufferStart - written
         guard abs(delta) > tolerance else { return StemPlacement() }
-        let whole = align || abs(delta) > jumpThreshold
-        let step = whole ? abs(delta) : min(abs(delta), driftStep)
-        if delta > 0 { return StemPlacement(padSeconds: step) }
-        return StemPlacement(dropSeconds: min(step, bufferSeconds))
+        if delta > 0 { return StemPlacement(padSeconds: delta) }
+        let whole = align || -delta > jumpThreshold
+        return StemPlacement(dropSeconds: min(whole ? -delta : driftStep, bufferSeconds))
     }
 }
 
@@ -372,8 +381,8 @@ func runSystemAudioArbiterSelfTest() -> Bool {
     // and a drop never exceeds the buffer.
     checks.append(StemPlacement.place(bufferStart: 1.4, bufferSeconds: 0.01, written: 0, tolerance: 0.02)
         == StemPlacement(padSeconds: 1.4))
-    checks.append(StemPlacement.place(bufferStart: 10.06, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
-        == StemPlacement(padSeconds: StemPlacement.driftStep))
+    checks.append(abs(StemPlacement.place(bufferStart: 10.15, bufferSeconds: 0.01, written: 10,
+        tolerance: 0.02).padSeconds - 0.15) < 1e-9)
     checks.append(StemPlacement.place(bufferStart: 9.94, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
         == StemPlacement(dropSeconds: StemPlacement.driftStep))
     checks.append(StemPlacement.place(bufferStart: 9.94, bufferSeconds: 0.01, written: 10, tolerance: 0.02,
@@ -383,13 +392,21 @@ func runSystemAudioArbiterSelfTest() -> Bool {
     checks.append(StemPlacement.place(bufferStart: 9.5, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
         == StemPlacement(dropSeconds: 0.01))
 
-    // A rebuild keeps the old tap's liveness: no fallback is announced.
+    // A rebuild keeps the old tap's liveness: no fallback is announced. And
+    // speech the witness hears before the new tap's first buffer is not
+    // evidence of a refusal.
     var rebuilt = SystemAudioSourceArbiter()
     rebuilt.tapStarted()
     rebuilt.observeTap(seconds: tick, allZero: false, level: 10, now: 0)
     _ = rebuilt.takeTransition(now: 0.01)
     rebuilt.tapStarted(rebuild: true)
     checks.append(rebuilt.takeTransition(now: 0.2) == nil)
+    for step in 0..<4 { rebuilt.observeScreenCaptureKit(seconds: tick, level: 30, now: 0.1 + Double(step) * tick) }
+    checks.append(!rebuilt.demoted)
+    rebuilt.observeTap(seconds: tick, allZero: true, level: 0, now: 0.45)
+    for step in 0..<6 { rebuilt.observeScreenCaptureKit(seconds: tick, level: 30, now: 0.46 + Double(step) * 0.05) }
+    // The old tap heard audio, so the 2 s rule applies, not the 0.3 s one.
+    checks.append(!rebuilt.demoted)
 
     let passed = checks.allSatisfy { $0 }
     let failed = checks.enumerated().filter { !$0.element }.map { $0.offset }
