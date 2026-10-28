@@ -77,6 +77,12 @@ export type AttributionSource =
 export type DiagnosticConfidence = "high" | "inferred";
 export type CaptureSource = "voice" | "system" | "both" | "backend";
 export type DiarizationPath = "stem-energy" | "ml" | "ml-bleed-degraded" | "none";
+/**
+ * Positive evidence that the remote side of a call did not fully reach the
+ * recording (#1266). Absent means no evidence of loss, not verified coverage.
+ * Do not attribute transcript lines to remote participants when `missing`.
+ */
+export type RemoteAudioStatus = "missing" | "partial";
 export type FailureKind =
   | "silent"
   | "sparse"
@@ -103,6 +109,9 @@ export interface RecordingHealth {
   system_dominant_ratio?: number;
   capture_warnings: CaptureWarning[];
   diarization_path?: DiarizationPath;
+  remote_audio?: RemoteAudioStatus;
+  /** Capture backend recorded at capture time, e.g. `native-call`. */
+  capture_backend?: string;
 }
 
 /**
@@ -249,6 +258,12 @@ function parseDiarizationPath(raw: unknown): DiarizationPath {
   throw new Error(`unknown diarization path: ${String(raw)}`);
 }
 
+function parseRemoteAudioStatus(raw: unknown): RemoteAudioStatus | undefined {
+  // Lenient: a newer writer may add states; an unknown value is dropped
+  // rather than failing the whole meeting parse.
+  return raw === "missing" || raw === "partial" ? raw : undefined;
+}
+
 function parseFailureKind(raw: unknown): FailureKind {
   if (
     raw === "silent" ||
@@ -300,6 +315,11 @@ function parseRecordingHealth(raw: any): RecordingHealth | undefined {
     diarization_path: raw.diarization_path
       ? parseDiarizationPath(raw.diarization_path)
       : undefined,
+    remote_audio: parseRemoteAudioStatus(raw.remote_audio),
+    capture_backend:
+      typeof raw.capture_backend === "string" && raw.capture_backend.trim()
+        ? raw.capture_backend
+        : undefined,
   };
 }
 

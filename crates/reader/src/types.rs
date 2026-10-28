@@ -133,6 +133,22 @@ pub struct RecordingHealth {
     pub capture_warnings: Vec<CaptureWarning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diarization_path: Option<DiarizationPath>,
+    /// `missing` or `partial` when there is positive evidence the remote side
+    /// of a call did not fully reach the recording (#1266). Absent means no
+    /// evidence of loss. Do not attribute lines to remote participants when
+    /// this is `missing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_audio: Option<RemoteAudioStatus>,
+    /// Capture backend recorded at capture time, e.g. `native-call`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_backend: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteAudioStatus {
+    Missing,
+    Partial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

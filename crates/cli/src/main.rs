@@ -19375,6 +19375,12 @@ fn cmd_transcript(
             if let (Some(diagnostic), None) = (s.diagnostic.as_ref(), s.disabled) {
                 eprintln!("  Diagnostic: {}", diagnostic);
             }
+            if let Some(remote_audio) = s.remote_audio {
+                eprintln!(
+                    "  Remote audio: {} (Minutes isn't hearing the other side of this call; live lines are local only)",
+                    remote_audio.as_str()
+                );
+            }
             if let Some(ref p) = s.jsonl_path {
                 eprintln!("  File: {}", p);
             }

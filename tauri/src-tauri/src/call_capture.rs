@@ -25,6 +25,34 @@ pub struct CallSourceHealth {
     pub mic_frames_silenced: u64,
     pub system_frames_silenced: u64,
     pub last_update: String,
+    /// Set by the recording loop while the live remote-silence alert is
+    /// outstanding (#1266): the system source may be "live" (delivering
+    /// buffers) yet carry no remote audio, which `call_audio_live` alone
+    /// cannot show.
+    pub remote_audio_silent: bool,
+}
+
+/// Map one helper health snapshot to a remote-silence detector sample.
+///
+/// `None` when the microphone is not delivering (including stale telemetry,
+/// which `source_health` reports as not live): without the local side the
+/// detector cannot tell "the remote is silent" from "nobody is talking". A
+/// system source that is attached but not delivering buffers reads as level 0,
+/// because that is still "not hearing the other side".
+pub(crate) fn remote_silence_sample(
+    health: &CallSourceHealth,
+) -> Option<minutes_core::remote_silence::LevelSample> {
+    if !health.mic_live {
+        return None;
+    }
+    Some(minutes_core::remote_silence::LevelSample {
+        mic_level: health.mic_level,
+        system_level: if health.call_audio_live {
+            health.call_audio_level
+        } else {
+            0
+        },
+    })
 }
 
 const HELPER_STDERR_INITIAL_LOG_LIMIT: usize = 5;
@@ -558,6 +586,7 @@ impl NativeCallCaptureSession {
                 mic_frames_silenced: 0,
                 system_frames_silenced: 0,
                 last_update: chrono::Local::now().to_rfc3339(),
+                remote_audio_silent: false,
             })
     }
 
@@ -752,6 +781,7 @@ pub fn start_native_call_capture(
         mic_frames_silenced: 0,
         system_frames_silenced: 0,
         last_update: chrono::Local::now().to_rfc3339(),
+        remote_audio_silent: false,
     }));
     let mut command = Command::new(&helper);
     command.args(native_call_helper_args(&output_path, &microphone_selection));
@@ -1139,8 +1169,8 @@ fn find_native_call_helper_binary() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_call_exit_is_unexpected, CaptureInterruption, CaptureProgressAction,
-        CaptureProgressMonitor,
+        native_call_exit_is_unexpected, remote_silence_sample, CallSourceHealth,
+        CaptureInterruption, CaptureProgressAction, CaptureProgressMonitor,
     };
 
     #[test]
@@ -1426,6 +1456,56 @@ mod tests {
             unknown_files.check(start + Duration::from_secs(300)),
             CaptureProgressAction::Stop(_)
         ));
+    }
+
+    fn health(mic_live: bool, call_live: bool, mic: u32, call: u32) -> CallSourceHealth {
+        CallSourceHealth {
+            backend: "screencapturekit-helper".into(),
+            mic_live,
+            call_audio_live: call_live,
+            mic_level: mic,
+            call_audio_level: call,
+            mic_frames_silenced: 0,
+            system_frames_silenced: 0,
+            last_update: chrono::Local::now().to_rfc3339(),
+            remote_audio_silent: false,
+        }
+    }
+
+    #[test]
+    fn remote_silence_sample_maps_live_sources() {
+        use minutes_core::remote_silence::LevelSample;
+        assert_eq!(
+            remote_silence_sample(&health(true, true, 40, 30)),
+            Some(LevelSample {
+                mic_level: 40,
+                system_level: 30
+            })
+        );
+        // System attached but not delivering buffers: still silent remote.
+        assert_eq!(
+            remote_silence_sample(&health(true, false, 40, 30)),
+            Some(LevelSample {
+                mic_level: 40,
+                system_level: 0
+            })
+        );
+        // Mic not delivering (or telemetry stale): no evidence either way.
+        assert_eq!(remote_silence_sample(&health(false, true, 0, 30)), None);
+    }
+
+    #[test]
+    fn remote_audio_silent_flag_reaches_the_status_payload() {
+        let mut snapshot = health(true, true, 40, 0);
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["remote_audio_silent"],
+            false
+        );
+        snapshot.remote_audio_silent = true;
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["remote_audio_silent"],
+            true
+        );
     }
 
     #[test]

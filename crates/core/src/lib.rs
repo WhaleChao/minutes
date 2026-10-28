@@ -196,6 +196,7 @@ pub mod pipeline;
 mod pocketstation_capture;
 pub mod policy_fs;
 pub mod process_trace;
+pub mod remote_silence;
 pub mod resummarize;
 pub mod retention;
 pub mod retrieval;

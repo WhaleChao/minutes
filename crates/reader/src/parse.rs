@@ -112,6 +112,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_meeting_preserves_remote_audio_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("remote-missing.md");
+        std::fs::write(
+            &path,
+            "---\ntitle: FaceTime Call\ntype: meeting\ndate: 2026-10-28T09:44:00-04:00\nduration: 31m\nrecording_health:\n  system_stem_active_ratio: 0.0037\n  capture_warnings:\n    - kind: sparse\n      source: system\n      message: Call audio stayed silent.\n      diagnostic_confidence: inferred\n  remote_audio: missing\n  capture_backend: native-call\n---\n\n## Transcript\n\nHello.\n",
+        )
+        .unwrap();
+
+        let meeting = parse_meeting(&path).unwrap();
+        let health = meeting.frontmatter.recording_health.unwrap();
+        assert_eq!(
+            health.remote_audio,
+            Some(crate::types::RemoteAudioStatus::Missing)
+        );
+        assert_eq!(health.capture_backend.as_deref(), Some("native-call"));
+    }
+
+    #[test]
     fn parse_meeting_preserves_sensitive_fields() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sensitive.md");
