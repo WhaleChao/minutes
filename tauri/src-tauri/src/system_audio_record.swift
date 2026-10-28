@@ -4,6 +4,7 @@ import CoreMedia
 import Dispatch
 import Foundation
 import ScreenCaptureKit
+import os
 
 private func availableMicrophones() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(
@@ -237,6 +238,16 @@ private func monoFloatBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCM
     return buffer
 }
 
+/// A copy of a mono float buffer without its first `count` frames.
+private func droppingLeadingFrames(_ buffer: AVAudioPCMBuffer, count: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+    guard count < buffer.frameLength, let source = buffer.floatChannelData?[0] else { return nil }
+    let remaining = Int(buffer.frameLength - count)
+    return monoFloatBuffer(
+        samples: Array(UnsafeBufferPointer(start: source + Int(count), count: remaining)),
+        sampleRate: buffer.format.sampleRate
+    )
+}
+
 private func convertMonoBuffer(
     _ sourceBuffer: AVAudioPCMBuffer,
     to targetFormat: AVAudioFormat,
@@ -260,7 +271,11 @@ private func convertMonoBuffer(
     var conversionError: NSError?
     let status = converter.convert(to: converted, error: &conversionError) { _, outStatus in
         if providedInput {
-            outStatus.pointee = .endOfStream
+            // noDataNow, not endOfStream: the converter is reused for every
+            // buffer of a stream, and after endOfStream it returns nothing
+            // until reset, so every buffer after the first was dropped once
+            // a source changed rate (a headset entering HFP mid-call).
+            outStatus.pointee = .noDataNow
             return nil
         }
         providedInput = true
@@ -386,6 +401,27 @@ private final class FixedFormatStemWriter {
         resumeOffsetSeconds = max(0, seconds)
         converter = nil
         converterInputFormat = nil
+    }
+
+    /// Pads silence up to `seconds` on the stem timeline. Unlike `resume`, it
+    /// keeps the resampler: a timeline gap is not a format change.
+    func pad(toSeconds seconds: Double) throws {
+        guard let file else {
+            resumeOffsetSeconds = max(resumeOffsetSeconds ?? 0, max(0, seconds))
+            return
+        }
+        let rate = file.processingFormat.sampleRate
+        let target = UInt64((max(0, seconds) * rate).rounded())
+        while framesWritten < target {
+            let count = AVAudioFrameCount(min(target - framesWritten, 4096))
+            try writeSilence(sourceFrameCount: count, sourceSampleRate: rate)
+        }
+    }
+
+    /// Seconds of audio already in the file, or nil before the first write.
+    var writtenSeconds: Double? {
+        guard let file else { return nil }
+        return Double(framesWritten) / file.processingFormat.sampleRate
     }
 }
 
@@ -568,6 +604,64 @@ private func runPCMDecoderSelfTest() -> Bool {
     } else {
         fputs("PCM decoder self-test failed\n", stderr)
     }
+    return passed
+}
+
+/// The system stem's tap path resamples every buffer once a headset drops
+/// to 16 kHz, pads stalls on the shared timeline and trims drift (#1266).
+private func runStemTimelineSelfTest() -> Bool {
+    var checks: [Bool] = []
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("minutes-stem-timeline-\(UUID().uuidString)")
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // 0.1 s at 48 kHz fixes the file rate; then 100 HFP buffers at 16 kHz.
+        let url = directory.appendingPathComponent("hfp.wav")
+        let writer = FixedFormatStemWriter(url: url)
+        try writer.write(monoFloatBuffer(samples: [Float](repeating: 0.2, count: 4_800), sampleRate: 48_000)!)
+        for index in 0..<100 {
+            let samples = (0..<160).map { Float(0.5 * sin(Double(index * 160 + $0) * 0.2)) }
+            try writer.write(monoFloatBuffer(samples: samples, sampleRate: 16_000)!)
+        }
+        // A one-second stall, padded on the timeline, then more HFP audio.
+        try writer.pad(toSeconds: 2.1)
+        for index in 0..<50 {
+            let samples = (0..<160).map { Float(0.5 * sin(Double(index * 160 + $0) * 0.2)) }
+            try writer.write(monoFloatBuffer(samples: samples, sampleRate: 16_000)!)
+        }
+        writer.close()
+        // Read in a loop: a single AVAudioFile read can come back short.
+        let file = try AVAudioFile(forReading: url)
+        var samples: [Float] = []
+        let chunk = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 8_192)!
+        while file.framePosition < file.length {
+            try file.read(into: chunk)
+            guard chunk.frameLength > 0 else { break }
+            samples += UnsafeBufferPointer(start: chunk.floatChannelData![0], count: Int(chunk.frameLength))
+        }
+        // 0.1 s, then 1.0 s, padded to 2.1 s, then 0.5 s: 2.6 s at 48 kHz.
+        // The resampler holds back a millisecond of filter latency, which
+        // the timeline pad absorbs.
+        checks.append(file.length == 124_800 && samples.count == 124_800)
+        // Converted audio continues to the end of each run, not just the
+        // first buffer after the rate change (the endOfStream bug).
+        checks.append((52_000..<52_700).contains { abs(samples[$0]) > 0.1 })
+        checks.append((53_000..<100_700).allSatisfy { samples[$0] == 0 })
+        checks.append((124_000..<124_700).contains { abs(samples[$0]) > 0.1 })
+
+        let trimmed = droppingLeadingFrames(monoFloatBuffer(samples: [0, 1, 2, 3], sampleRate: 16_000)!, count: 3)
+        checks.append(trimmed?.frameLength == 1 && trimmed?.floatChannelData?[0][0] == 3)
+        checks.append(droppingLeadingFrames(monoFloatBuffer(samples: [0, 1], sampleRate: 16_000)!, count: 2) == nil)
+    } catch {
+        fputs("stem timeline self-test failed: \(error)\n", stderr)
+        checks.append(false)
+    }
+    let passed = checks.allSatisfy { $0 }
+    emitJSON(["event": "stem_timeline_self_test", "status": passed ? "ok" : "failed", "checks": checks.count,
+        "failed_checks": checks.enumerated().filter { !$0.element }.map { $0.offset }])
     return passed
 }
 
@@ -905,6 +999,26 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     // Accessed on sampleQueue, never reset when a stream is replaced.
     private var sourceAttempts: [String: Int] = [:]
 
+    // Core Audio tap for call audio (#1266). Tap objects and listeners live
+    // on tapControlQueue; the arbiter and every stem write stay on sampleQueue.
+    private let tapControlQueue = DispatchQueue(label: "minutes.system-audio.tap-control")
+    private var systemTap: SystemAudioTap?
+    private let tapShutDown = OSAllocatedUnfairLock(initialState: false)
+    private var tapRebuildTimes: [Double] = []
+    private var tapRebuildPending = false
+    private var systemAudioArbiter = SystemAudioSourceArbiter()
+    private var systemSourceDecided = false
+    private var systemStemNeedsAlignment = false
+    // Host-time bookkeeping, all on sampleQueue.
+    private var stemOriginHost: Double?
+    private var lastTapSampleHost: Double?
+    private var lastScreenCaptureKitSignalHost: Double?
+    private var tapHeardSignalThisSession = false
+    private var tapSecondsWritten = 0.0
+    private var screenCaptureKitSecondsWritten = 0.0
+    private var tapRateWindowStart: Double?
+    private var tapRateWindowFrames = 0.0
+
     // Per-source stem writers
     private var voiceStemWriter: FixedFormatStemWriter?
     private var systemStemWriter: FixedFormatStemWriter?
@@ -1137,6 +1251,10 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         // Flush and close stem files on the sample queue to serialize
         // with any in-flight writeStemSamples calls. Without this,
         // nil'ing on the main thread races with writes on sampleQueue.
+        // The tap goes first. Its stop() drains the IO queue, so every tap
+        // buffer is either already queued on sampleQueue (and written before
+        // the close below) or never delivered.
+        shutDownSystemTap()
         sampleQueue.sync {
             stemsClosed = true
             voiceStemWriter?.close()
@@ -1267,12 +1385,262 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         try await consolidateCaptureMedia(parts, outputURL: outputURL)
     }
 
+    // MARK: Core Audio tap (#1266)
+
+    /// The source currently allowed to write the system stem. sampleQueue.
+    private var systemStemSource: SystemAudioSource {
+        systemAudioArbiter.activeSource(now: hostSeconds())
+    }
+
+    private var isTapShutDown: Bool { tapShutDown.withLock { $0 } }
+
+    /// tapControlQueue. Builds a fresh tap; on failure ScreenCaptureKit keeps
+    /// the system stem and the failure stage is reported.
+    private func buildSystemTap(reason: String) {
+        tapRebuildPending = false
+        guard !isTapShutDown, !captureLifecycle.isStopping else { return }
+        tearDownSystemTap()
+        let tap = SystemAudioTap { [weak self] samples, sampleRate, startHost in
+            self?.sampleQueue.async {
+                self?.handleTapSamples(samples, sampleRate: sampleRate, startHost: startHost)
+            }
+        }
+        do {
+            try tap.start()
+        } catch {
+            let failure = error as? SystemAudioTapFailure
+            sampleQueue.async {
+                self.queueSourceEvent([
+                    "event": "system_audio_tap_failed",
+                    "stage": failure?.stage ?? "unknown",
+                    "status": Int(failure?.status ?? -1),
+                    "trigger": reason,
+                ])
+                self.systemAudioArbiter.tapStopped()
+                self.decideSystemSource()
+            }
+            return
+        }
+        // Stop may have run while AudioDeviceStart was waiting (for example
+        // on the first-run permission prompt). Nothing may outlive it.
+        guard !isTapShutDown else {
+            tap.stop()
+            return
+        }
+        systemTap = tap
+        let rate = tap.currentSampleRate
+        let channels = tap.format.mChannelsPerFrame
+        sampleQueue.async {
+            self.queueSourceEvent([
+                "event": reason == "start" ? "system_audio_tap_started" : "system_audio_tap_rebuilt",
+                "trigger": reason,
+                "sample_rate": rate,
+                "channels": channels,
+            ])
+            self.tapRateWindowStart = nil
+            self.systemAudioArbiter.tapStarted()
+            self.decideSystemSource()
+        }
+    }
+
+    /// tapControlQueue. Debounced and bounded to three rebuilds a minute;
+    /// past that the tap rests for 30 s while ScreenCaptureKit keeps the
+    /// stem, then is tried again.
+    private func scheduleTapRebuild(reason: String) {
+        guard !isTapShutDown, !tapRebuildPending, systemTap != nil else { return }
+        let now = hostSeconds()
+        tapRebuildTimes.removeAll { now - $0 >= 60 }
+        tapRebuildPending = true
+        guard tapRebuildTimes.count < 3 else {
+            tearDownSystemTap()
+            sampleQueue.async {
+                self.queueSourceEvent(["event": "system_audio_tap_failed", "stage": "rebuild_limit",
+                    "status": 0, "trigger": reason])
+                self.systemAudioArbiter.tapStopped()
+                self.reportSystemAudioSourceTransition(now: hostSeconds())
+            }
+            tapControlQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
+                self?.buildSystemTap(reason: "cooldown_retry")
+            }
+            return
+        }
+        tapRebuildTimes.append(now)
+        // Let a route change (a headset entering HFP) settle first.
+        tapControlQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.buildSystemTap(reason: reason)
+        }
+    }
+
+    /// tapControlQueue.
+    private func tearDownSystemTap() {
+        systemTap?.stop()
+        systemTap = nil
+    }
+
+    /// Final: no tap starts or rebuilds after this. Waits a bounded time for
+    /// the control queue, which can be inside AudioDeviceStart while a first
+    /// run permission prompt is up; the closed stems guard any late buffer.
+    private func shutDownSystemTap() {
+        tapShutDown.withLock { $0 = true }
+        let done = DispatchSemaphore(value: 0)
+        tapControlQueue.async {
+            self.tearDownSystemTap()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 3) == .timedOut {
+            emitJSON(["event": "system_audio_tap_stop_timeout"])
+        }
+    }
+
+    /// sampleQueue. Source reporting starts once the first tap attempt
+    /// finished, so a normal start does not announce a transient fallback.
+    private func decideSystemSource() {
+        systemSourceDecided = true
+        reportSystemAudioSourceTransition(now: hostSeconds())
+    }
+
+    /// sampleQueue.
+    private func reportSystemAudioSourceTransition(now: Double) {
+        guard systemSourceDecided, !stemsClosed,
+              let transition = systemAudioArbiter.takeTransition(now: now) else { return }
+        systemStemNeedsAlignment = true
+        queueSourceEvent([
+            "event": "system_audio_source",
+            "source": transition.source.rawValue,
+            "reason": transition.reason,
+        ])
+    }
+
+    /// sampleQueue. A tap that stopped calling back while ScreenCaptureKit
+    /// still hears audio is rebuilt. Silence alone never triggers this.
+    private func checkTapLiveness() {
+        guard systemAudioArbiter.tapRunning, let lastTap = lastTapSampleHost,
+              let lastSignal = lastScreenCaptureKitSignalHost else { return }
+        let now = hostSeconds()
+        guard now - lastTap > 3, now - lastSignal < 1 else { return }
+        lastTapSampleHost = now
+        tapControlQueue.async { [weak self] in self?.scheduleTapRebuild(reason: "tap_stalled") }
+    }
+
+    /// Start of a ScreenCaptureKit buffer in host time. Its presentation
+    /// timestamps are host-clock based; anything implausible falls back to
+    /// arrival time.
+    private func bufferStartHost(_ sampleBuffer: CMSampleBuffer, seconds: Double) -> Double {
+        let now = hostSeconds()
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        if pts.isFinite, abs(pts - now) < 5 { return pts }
+        return now - seconds
+    }
+
+    /// sampleQueue. Pads the voice stem's first buffer onto the shared origin
+    /// if the system stem started first. Later voice buffers are unchanged.
+    private func placeFirstVoiceBuffer(_ writer: FixedFormatStemWriter, startHost: Double) {
+        guard writer.writtenSeconds == nil else { return }
+        guard let origin = stemOriginHost else {
+            stemOriginHost = startHost
+            return
+        }
+        do { try writer.pad(toSeconds: startHost - origin) }
+        catch { reportStemWriteFailureOnce(sourceName: "microphone", error: error) }
+    }
+
+    /// sampleQueue. Writes one system-stem buffer at its host-time position
+    /// on the shared stem timeline: a newly active source starts where the
+    /// timeline is, audio lost to a stall becomes silence instead of pulling
+    /// later audio earlier, and clock drift is corrected in small steps.
+    private func writeSystemStem(
+        _ buffer: AVAudioPCMBuffer,
+        startHost: Double,
+        source: SystemAudioSource
+    ) {
+        guard !stemsClosed, let writer = systemStemWriter, buffer.frameLength > 0 else { return }
+        let origin = stemOriginHost ?? startHost
+        stemOriginHost = origin
+        let seconds = Double(buffer.frameLength) / buffer.format.sampleRate
+        let tolerance = systemStemNeedsAlignment ? 0.02 : (source == .coreAudioTap ? 0.05 : 0.1)
+        systemStemNeedsAlignment = false
+        let placement = StemPlacement.place(
+            bufferStart: startHost - origin,
+            bufferSeconds: seconds,
+            written: writer.writtenSeconds ?? 0,
+            tolerance: tolerance
+        )
+        do {
+            if placement.padSeconds > 0 { try writer.pad(toSeconds: startHost - origin) }
+            var output = buffer
+            if placement.dropSeconds > 0 {
+                let drop = AVAudioFrameCount((placement.dropSeconds * buffer.format.sampleRate).rounded())
+                guard drop < buffer.frameLength,
+                      let trimmed = droppingLeadingFrames(buffer, count: drop) else { return }
+                output = trimmed
+            }
+            try writer.write(output)
+            let written = Double(output.frameLength) / output.format.sampleRate
+            switch source {
+            case .coreAudioTap: tapSecondsWritten += written
+            case .screenCaptureKit: screenCaptureKitSecondsWritten += written
+            }
+        } catch {
+            reportStemWriteFailureOnce(sourceName: "system", error: error)
+        }
+    }
+
+    /// sampleQueue.
+    private func handleTapSamples(_ samples: [Float], sampleRate: Double, startHost: Double) {
+        guard !stemsClosed, sampleRate > 0, !samples.isEmpty else { return }
+        let now = hostSeconds()
+        var sumSquares: Float = 0
+        var allZero = true
+        for sample in samples {
+            sumSquares += sample * sample
+            if sample != 0 { allZero = false }
+        }
+        let level = systemAudioLevel(rms: sqrt(sumSquares / Float(samples.count)))
+        let seconds = Double(samples.count) / sampleRate
+        if let last = lastTapSampleHost, now - last > 0.5 { tapRateWindowStart = nil }
+        lastTapSampleHost = now
+        if !allZero { tapHeardSignalThisSession = true }
+        checkTapRate(frames: samples.count, sampleRate: sampleRate, startHost: startHost)
+        systemAudioArbiter.observeTap(seconds: seconds, allZero: allZero, level: level, now: now)
+        reportSystemAudioSourceTransition(now: now)
+        guard systemStemSource == .coreAudioTap,
+              let buffer = monoFloatBuffer(samples: samples, sampleRate: sampleRate) else { return }
+        lastSystemAudioSampleAt = Date()
+        latestSystemLevel = level
+        writeSystemStem(buffer, startHost: startHost, source: .coreAudioTap)
+    }
+
+    /// sampleQueue. The rate the tap reports must match the rate it actually
+    /// delivers at; a stale rate is the #1165 failure (system stem 3x fast).
+    /// Measured over ten seconds of continuous delivery.
+    private func checkTapRate(frames: Int, sampleRate: Double, startHost: Double) {
+        guard let windowStart = tapRateWindowStart else {
+            tapRateWindowStart = startHost
+            tapRateWindowFrames = Double(frames)
+            return
+        }
+        let span = startHost - windowStart
+        guard span >= 10 else {
+            tapRateWindowFrames += Double(frames)
+            return
+        }
+        let measured = tapRateWindowFrames / span
+        tapRateWindowStart = startHost
+        tapRateWindowFrames = Double(frames)
+        guard abs(measured / sampleRate - 1) > 0.15 else { return }
+        queueSourceEvent(["event": "system_audio_tap_rate_mismatch",
+            "reported_rate": sampleRate, "measured_rate": measured.rounded()])
+        tapControlQueue.async { [weak self] in self?.scheduleTapRebuild(reason: "tap_rate_mismatch") }
+    }
+
     private func startMonitoring() {
         let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(150))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             let now = Date()
+            self.reportSystemAudioSourceTransition(now: ProcessInfo.processInfo.systemUptime)
+            self.checkTapLiveness()
             let systemLive = self.lastSystemAudioSampleAt.map { now.timeIntervalSince($0) < 1.5 } ?? false
             let micLive = self.lastMicSampleAt.map { now.timeIntervalSince($0) < 1.5 } ?? false
             if !systemLive {
@@ -1290,6 +1658,10 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             let payload: [String: Any] = [
                 "event": "health",
                 "call_audio_live": systemLive,
+                "call_audio_source": self.systemStemSource.rawValue,
+                "call_audio_tap_heard": self.tapHeardSignalThisSession,
+                "call_audio_tap_seconds": Int(self.tapSecondsWritten),
+                "call_audio_screencapturekit_seconds": Int(self.screenCaptureKitSecondsWritten),
                 "mic_live": micLive,
                 "call_audio_level": self.latestSystemLevel,
                 "mic_level": self.latestMicLevel,
@@ -1320,14 +1692,16 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         let writer = outputType == .microphone ? voiceStemWriter : systemStemWriter
         if sourceAttempts[sourceKey] != attempt {
             sourceAttempts[sourceKey] = attempt
-            if attempt > 0 { writer?.resume(atElapsedSeconds: elapsedSeconds) }
+            // While the tap owns the system stem, a ScreenCaptureKit reconnect
+            // must not pad it: the tap kept writing through the interruption.
+            let ownsStem = outputType == .microphone || systemStemSource == .screenCaptureKit
+            if attempt > 0, ownsStem { writer?.resume(atElapsedSeconds: elapsedSeconds) }
         }
         let framesBefore = writer?.framesWritten ?? 0
         let silenceBefore = writer?.framesSilenced ?? 0
         let now = Date()
         switch outputType {
         case .audio:
-            lastSystemAudioSampleAt = now
             writeStemSamples(sampleBuffer, source: .audio)
         case .microphone:
             lastMicSampleAt = now
@@ -1506,12 +1880,25 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             sumSquares += sample * sample
         }
         let rms = sqrt(sumSquares / max(Float(frameCount), 1))
-        let level = UInt32(min(100.0, max(0.0, Double(rms) * 2000.0)))
+        let level = systemAudioLevel(rms: rms)
+        let bufferSeconds = Double(frameCount) / max(sampleRate, 1)
+        let startHost = bufferStartHost(sampleBuffer, seconds: bufferSeconds)
         switch source {
         case .microphone:
             latestMicLevel = level
+            placeFirstVoiceBuffer(stemWriter, startHost: startHost)
         case .audio:
+            // ScreenCaptureKit is the tap's witness, and writes the system
+            // stem only while the tap cannot.
+            let now = hostSeconds()
+            if level >= systemAudioSignalLevel { lastScreenCaptureKitSignalHost = now }
+            systemAudioArbiter.observeScreenCaptureKit(seconds: bufferSeconds, level: level, now: now)
+            reportSystemAudioSourceTransition(now: now)
+            guard systemStemSource == .screenCaptureKit else { return }
+            lastSystemAudioSampleAt = Date()
             latestSystemLevel = level
+            writeSystemStem(pcmBuffer, startHost: startHost, source: .screenCaptureKit)
+            return
         default:
             break
         }
@@ -1536,6 +1923,7 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         case .microphone:
             writer = voiceStemWriter
         case .audio:
+            guard systemStemSource == .screenCaptureKit else { return }
             writer = systemStemWriter
         default:
             return
@@ -1679,6 +2067,9 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             self.pendingSourceEvents.forEach(emitJSON)
             self.pendingSourceEvents.removeAll()
         }
+        // Microphone first, then the tap: the stream is already running here,
+        // and the stem origin was just set, so the tap aligns to it.
+        tapControlQueue.async { [weak self] in self?.buildSystemTap(reason: "start") }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -1782,6 +2173,14 @@ struct NativeCallRecordMain {
         if CommandLine.arguments.count == 2,
            CommandLine.arguments[1] == "--self-test-pcm-decoder" {
             exit(runPCMDecoderSelfTest() ? 0 : 1)
+        }
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--self-test-system-audio-arbiter" {
+            exit(runSystemAudioArbiterSelfTest() ? 0 : 1)
+        }
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--self-test-stem-timeline" {
+            exit(runStemTimelineSelfTest() ? 0 : 1)
         }
 
         guard #available(macOS 15.0, *) else {

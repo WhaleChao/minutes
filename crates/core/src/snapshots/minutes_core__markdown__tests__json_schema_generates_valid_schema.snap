@@ -633,6 +633,13 @@ expression: schema
     "RecordingHealth": {
       "type": "object",
       "properties": {
+        "call_audio_source": {
+          "description": "Which source recorded the other side of a native call (#1266):\n`core-audio-tap` (hears FaceTime and phone calls answered on the Mac),\n`screencapturekit` (cannot), or `mixed` when capture switched between\nthem. Absent for other capture paths.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "capture_backend": {
           "description": "Capture backend that produced the audio, when it is known at capture\ntime (for example `native-call` for ScreenCaptureKit call capture).",
           "type": [

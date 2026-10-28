@@ -112,6 +112,11 @@ export interface RecordingHealth {
   remote_audio?: RemoteAudioStatus;
   /** Capture backend recorded at capture time, e.g. `native-call`. */
   capture_backend?: string;
+  /**
+   * Source of a native call's remote audio: `core-audio-tap` (hears FaceTime
+   * and phone calls answered on the Mac), `screencapturekit`, or `mixed`.
+   */
+  call_audio_source?: string;
 }
 
 /**
@@ -319,6 +324,10 @@ function parseRecordingHealth(raw: any): RecordingHealth | undefined {
     capture_backend:
       typeof raw.capture_backend === "string" && raw.capture_backend.trim()
         ? raw.capture_backend
+        : undefined,
+    call_audio_source:
+      typeof raw.call_audio_source === "string" && raw.call_audio_source.trim()
+        ? raw.call_audio_source
         : undefined,
   };
 }

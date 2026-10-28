@@ -236,6 +236,11 @@ pub const LIVE_REMOTE_SILENCE_CODE: &str = "live-remote-audio-silent";
 /// label the pipeline already logs from `infer_capture_backend`.
 pub const NATIVE_CALL_CAPTURE_BACKEND: &str = "native-call";
 
+/// `recording_health.call_audio_source` values (#1266).
+pub const CALL_AUDIO_SOURCE_TAP: &str = "core-audio-tap";
+pub const CALL_AUDIO_SOURCE_SCREENCAPTUREKIT: &str = "screencapturekit";
+pub const CALL_AUDIO_SOURCE_MIXED: &str = "mixed";
+
 /// Record the live remote-silence outcome on a recording's health.
 ///
 /// Sets [`RecordingHealth::remote_audio`] (never downgrading an existing

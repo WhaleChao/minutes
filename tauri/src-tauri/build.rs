@@ -384,19 +384,26 @@ fn compile_system_audio_helper() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"),
     );
-    let source = manifest_dir.join("src/system_audio_record.swift");
+    // The call helper is two sources: the ScreenCaptureKit recorder and the
+    // Core Audio tap it prefers for call audio (#1266).
+    let sources = [
+        manifest_dir.join("src/system_audio_record.swift"),
+        manifest_dir.join("src/system_audio_tap.swift"),
+    ];
     let bin_dir = manifest_dir.join("bin");
     let binary = bin_dir.join("system_audio_record");
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".into());
     let target_binary = bin_dir.join(format!("system_audio_record-{}", target));
 
-    println!("cargo:rerun-if-changed={}", source.display());
+    for source in &sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
     std::fs::create_dir_all(&bin_dir).expect("failed to create helper bin dir");
 
     let output = Command::new("swiftc")
         .args(["-parse-as-library"])
         .args(["-target", &swift_deployment_target("14.0")])
-        .arg(&source)
+        .args(&sources)
         .arg("-o")
         .arg(&binary)
         .output()
@@ -404,7 +411,7 @@ fn compile_system_audio_helper() {
 
     if !output.status.success() {
         panic!(
-            "failed to compile system_audio_record.swift: {}",
+            "failed to compile the system_audio_record helper: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

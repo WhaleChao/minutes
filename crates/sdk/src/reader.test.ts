@@ -942,12 +942,14 @@ speaker_map:`
       diagnostic_confidence: inferred
   remote_audio: missing
   capture_backend: native-call
+  call_audio_source: core-audio-tap
 speaker_map:`
     );
     const health = parseFrontmatter(content, "/t/m.md")?.frontmatter.recording_health;
 
     expect(health?.remote_audio).toBe("missing");
     expect(health?.capture_backend).toBe("native-call");
+    expect(health?.call_audio_source).toBe("core-audio-tap");
   });
 
   it("drops an unknown remote_audio value instead of failing the parse", () => {

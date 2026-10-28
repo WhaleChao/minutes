@@ -142,6 +142,10 @@ pub struct RecordingHealth {
     /// Capture backend recorded at capture time, e.g. `native-call`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_backend: Option<String>,
+    /// Source of a native call's remote audio: `core-audio-tap`,
+    /// `screencapturekit` or `mixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_audio_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
