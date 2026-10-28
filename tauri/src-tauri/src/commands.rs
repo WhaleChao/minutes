@@ -16354,8 +16354,8 @@ mod tests {
             remote_audio_silent: false,
             call_audio_source: None,
             call_audio_tap_heard: false,
-            call_audio_tap_seconds: 0,
-            call_audio_screencapturekit_seconds: 0,
+            call_audio_tap_seconds: 0.0,
+            call_audio_screencapturekit_seconds: 0.0,
         }
     }
 

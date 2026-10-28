@@ -36,8 +36,8 @@ pub struct CallSourceHealth {
     /// Whether the Core Audio tap has delivered any non-zero audio this
     /// session. A tap refused System Audio Recording access never does.
     pub call_audio_tap_heard: bool,
-    pub call_audio_tap_seconds: u64,
-    pub call_audio_screencapturekit_seconds: u64,
+    pub call_audio_tap_seconds: f64,
+    pub call_audio_screencapturekit_seconds: f64,
 }
 
 impl CallSourceHealth {
@@ -57,8 +57,8 @@ impl CallSourceHealth {
     /// stem over the whole capture.
     pub fn call_audio_source_summary(&self) -> Option<&'static str> {
         match (
-            self.call_audio_tap_seconds > 0,
-            self.call_audio_screencapturekit_seconds > 0,
+            self.call_audio_tap_seconds > 0.0,
+            self.call_audio_screencapturekit_seconds > 0.0,
         ) {
             (true, false) => Some(minutes_core::health::CALL_AUDIO_SOURCE_TAP),
             (false, true) => Some(minutes_core::health::CALL_AUDIO_SOURCE_SCREENCAPTUREKIT),
@@ -72,6 +72,9 @@ pub(crate) const SYSTEM_AUDIO_SOURCE_TAP: &str = "core_audio_tap";
 
 /// Shown once when the tap returned only silence while ScreenCaptureKit heard
 /// call audio: the signature of System Audio Recording being refused.
+/// Saved once when the tap failed to start or was lost mid-call; the helper
+/// retries, but some call audio may have been recorded without it.
+pub(crate) const TAP_LOST_WARNING: &str = "Minutes's Core Audio tap failed to start or stopped during this call, so some call audio may have been recorded through ScreenCaptureKit, which cannot hear FaceTime or phone calls answered on this Mac.";
 pub(crate) const TAP_PERMISSION_TITLE: &str = "Allow System Audio Recording for Minutes";
 pub(crate) const TAP_PERMISSION_DETAIL: &str = "Minutes is recording this call with its older capture path, which can't hear FaceTime or phone calls answered on this Mac. To capture those, allow Minutes under System Settings > Privacy & Security > Screen & System Audio Recording.";
 
@@ -652,8 +655,8 @@ impl NativeCallCaptureSession {
                 remote_audio_silent: false,
                 call_audio_source: None,
                 call_audio_tap_heard: false,
-                call_audio_tap_seconds: 0,
-                call_audio_screencapturekit_seconds: 0,
+                call_audio_tap_seconds: 0.0,
+                call_audio_screencapturekit_seconds: 0.0,
             })
     }
 
@@ -859,8 +862,8 @@ pub fn start_native_call_capture(
         remote_audio_silent: false,
         call_audio_source: None,
         call_audio_tap_heard: false,
-        call_audio_tap_seconds: 0,
-        call_audio_screencapturekit_seconds: 0,
+        call_audio_tap_seconds: 0.0,
+        call_audio_screencapturekit_seconds: 0.0,
     }));
     let mut command = Command::new(&helper);
     command.args(native_call_helper_args(&output_path, &microphone_selection));
@@ -898,6 +901,9 @@ pub fn start_native_call_capture(
     let warnings_for_thread = Arc::clone(&capture_warnings);
     let call_audio_notice: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let notice_for_thread = Arc::clone(&call_audio_notice);
+    // Armed at most once per capture, even if the helper demotes again after
+    // a rebuild and the first notice was already taken.
+    let mut call_audio_notice_armed = false;
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -1085,13 +1091,13 @@ pub fn start_native_call_capture(
                                 current.call_audio_tap_heard = heard;
                             }
                             if let Some(seconds) =
-                                value.get("call_audio_tap_seconds").and_then(|v| v.as_u64())
+                                value.get("call_audio_tap_seconds").and_then(|v| v.as_f64())
                             {
                                 current.call_audio_tap_seconds = seconds;
                             }
                             if let Some(seconds) = value
                                 .get("call_audio_screencapturekit_seconds")
-                                .and_then(|v| v.as_u64())
+                                .and_then(|v| v.as_f64())
                             {
                                 current.call_audio_screencapturekit_seconds = seconds;
                             }
@@ -1114,11 +1120,15 @@ pub fn start_native_call_capture(
                                 }
                             }
                         }
-                        if reason == "tap_silent_while_screencapturekit_active" {
+                        if reason == "tap_silent_while_screencapturekit_active"
+                            && !call_audio_notice_armed
+                        {
+                            call_audio_notice_armed = true;
                             if let Ok(mut notice) = notice_for_thread.lock() {
-                                notice.get_or_insert_with(|| {
-                                    (TAP_PERMISSION_TITLE.into(), TAP_PERMISSION_DETAIL.into())
-                                });
+                                *notice = Some((
+                                    TAP_PERMISSION_TITLE.into(),
+                                    TAP_PERMISSION_DETAIL.into(),
+                                ));
                             }
                         }
                     }
@@ -1129,6 +1139,13 @@ pub fn start_native_call_capture(
                         | "system_audio_tap_rate_mismatch"
                         | "system_audio_tap_stop_timeout"),
                     ) => {
+                        if event == "system_audio_tap_failed" {
+                            if let Ok(mut warnings) = warnings_for_thread.lock() {
+                                if !warnings.iter().any(|existing| existing == TAP_LOST_WARNING) {
+                                    warnings.push(TAP_LOST_WARNING.to_string());
+                                }
+                            }
+                        }
                         // Only typed fields, never helper free text.
                         minutes_core::logging::log_step(
                             event,
@@ -1621,8 +1638,8 @@ mod tests {
             remote_audio_silent: false,
             call_audio_source: None,
             call_audio_tap_heard: false,
-            call_audio_tap_seconds: 0,
-            call_audio_screencapturekit_seconds: 0,
+            call_audio_tap_seconds: 0.0,
+            call_audio_screencapturekit_seconds: 0.0,
         }
     }
 
@@ -1760,11 +1777,11 @@ mod tests {
     fn call_audio_source_summary_names_every_source_that_wrote() {
         let mut health = health(true, true, 10, 10);
         assert_eq!(health.call_audio_source_summary(), None);
-        health.call_audio_tap_seconds = 120;
+        health.call_audio_tap_seconds = 120.0;
         assert_eq!(health.call_audio_source_summary(), Some("core-audio-tap"));
-        health.call_audio_screencapturekit_seconds = 3;
+        health.call_audio_screencapturekit_seconds = 0.4;
         assert_eq!(health.call_audio_source_summary(), Some("mixed"));
-        health.call_audio_tap_seconds = 0;
+        health.call_audio_tap_seconds = 0.0;
         assert_eq!(health.call_audio_source_summary(), Some("screencapturekit"));
     }
 

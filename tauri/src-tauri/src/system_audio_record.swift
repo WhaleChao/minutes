@@ -392,13 +392,29 @@ private final class FixedFormatStemWriter {
     }
 
     func close() {
+        flushConverter()
         file = nil
         converter = nil
         converterInputFormat = nil
     }
 
+    /// The resampler holds back a millisecond or two of filter latency while
+    /// streaming; write it out before the converter is discarded.
+    private func flushConverter() {
+        guard let file, let converter,
+              let tail = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 4_096) else { return }
+        var error: NSError?
+        _ = converter.convert(to: tail, error: &error) { _, outStatus in
+            outStatus.pointee = .endOfStream
+            return nil
+        }
+        guard error == nil, tail.frameLength > 0 else { return }
+        if (try? file.write(from: tail)) != nil { framesWritten += UInt64(tail.frameLength) }
+    }
+
     func resume(atElapsedSeconds seconds: Double) {
         resumeOffsetSeconds = max(0, seconds)
+        flushConverter()
         converter = nil
         converterInputFormat = nil
     }
@@ -642,10 +658,9 @@ private func runStemTimelineSelfTest() -> Bool {
             guard chunk.frameLength > 0 else { break }
             samples += UnsafeBufferPointer(start: chunk.floatChannelData![0], count: Int(chunk.frameLength))
         }
-        // 0.1 s, then 1.0 s, padded to 2.1 s, then 0.5 s: 2.6 s at 48 kHz.
-        // The resampler holds back a millisecond of filter latency, which
-        // the timeline pad absorbs.
-        checks.append(file.length == 124_800 && samples.count == 124_800)
+        // 0.1 s, then 1.0 s, padded to 2.1 s, then 0.5 s: 2.6 s at 48 kHz,
+        // plus the resampler tail that close() now flushes (about 1 ms).
+        checks.append(Int(file.length) == samples.count && (124_800...124_900).contains(samples.count))
         // Converted audio continues to the end of each run, not just the
         // first buffer after the rate change (the endOfStream bug).
         checks.append((52_000..<52_700).contains { abs(samples[$0]) > 0.1 })
@@ -1012,12 +1027,14 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     // Host-time bookkeeping, all on sampleQueue.
     private var stemOriginHost: Double?
     private var lastTapSampleHost: Double?
-    private var lastScreenCaptureKitSignalHost: Double?
     private var tapHeardSignalThisSession = false
     private var tapSecondsWritten = 0.0
     private var screenCaptureKitSecondsWritten = 0.0
     private var tapRateWindowStart: Double?
     private var tapRateWindowFrames = 0.0
+    private var tapRateWindowRate = 0.0
+    // tapControlQueue.
+    private var tapStartFailures = 0
 
     // Per-source stem writers
     private var voiceStemWriter: FixedFormatStemWriter?
@@ -1419,8 +1436,17 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
                 self.systemAudioArbiter.tapStopped()
                 self.decideSystemSource()
             }
+            // A failed start or rebuild must not end tap capture for the rest
+            // of the call: try again after a rest, a bounded number of times.
+            tapStartFailures += 1
+            if tapStartFailures < 10 {
+                tapControlQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
+                    self?.buildSystemTap(reason: "cooldown_retry")
+                }
+            }
             return
         }
+        tapStartFailures = 0
         // Stop may have run while AudioDeviceStart was waiting (for example
         // on the first-run permission prompt). Nothing may outlive it.
         guard !isTapShutDown else {
@@ -1438,7 +1464,7 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
                 "channels": channels,
             ])
             self.tapRateWindowStart = nil
-            self.systemAudioArbiter.tapStarted()
+            self.systemAudioArbiter.tapStarted(rebuild: reason != "start")
             self.decideSystemSource()
         }
     }
@@ -1511,13 +1537,15 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         ])
     }
 
-    /// sampleQueue. A tap that stopped calling back while ScreenCaptureKit
-    /// still hears audio is rebuilt. Silence alone never triggers this.
+    /// sampleQueue. A running tap's IOProc calls back continuously, with
+    /// zeros when nothing plays, so three seconds without a callback means
+    /// it stopped (a route change into HFP can do that) and is rebuilt. It
+    /// must not wait for ScreenCaptureKit to hear audio: on FaceTime it never
+    /// does.
     private func checkTapLiveness() {
-        guard systemAudioArbiter.tapRunning, let lastTap = lastTapSampleHost,
-              let lastSignal = lastScreenCaptureKitSignalHost else { return }
+        guard systemAudioArbiter.tapRunning, let lastTap = lastTapSampleHost else { return }
         let now = hostSeconds()
-        guard now - lastTap > 3, now - lastSignal < 1 else { return }
+        guard now - lastTap > 3 else { return }
         lastTapSampleHost = now
         tapControlQueue.async { [weak self] in self?.scheduleTapRebuild(reason: "tap_stalled") }
     }
@@ -1532,16 +1560,58 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         return now - seconds
     }
 
-    /// sampleQueue. Pads the voice stem's first buffer onto the shared origin
-    /// if the system stem started first. Later voice buffers are unchanged.
-    private func placeFirstVoiceBuffer(_ writer: FixedFormatStemWriter, startHost: Double) {
-        guard writer.writtenSeconds == nil else { return }
+    /// Seconds since the stems' shared origin, falling back to the capture
+    /// clock before the first stem buffer. sampleQueue.
+    private var stemElapsedSeconds: Double {
+        stemOriginHost.map { max(0, hostSeconds() - $0) } ?? elapsedSeconds
+    }
+
+    /// sampleQueue. Places a voice buffer on the shared stem timeline: the
+    /// first one onto the origin (if the system stem started first), a mic
+    /// gap filled with silence, drift corrected two milliseconds at a time.
+    /// Returns the buffer to write, nil to skip it.
+    private func placeVoiceBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        writer: FixedFormatStemWriter,
+        startHost: Double
+    ) -> AVAudioPCMBuffer? {
         guard let origin = stemOriginHost else {
             stemOriginHost = startHost
-            return
+            return buffer
         }
-        do { try writer.pad(toSeconds: startHost - origin) }
-        catch { reportStemWriteFailureOnce(sourceName: "microphone", error: error) }
+        return placed(buffer, writer: writer, at: startHost - origin, tolerance: 0.04,
+            align: writer.writtenSeconds == nil, sourceName: "microphone")
+    }
+
+    /// sampleQueue. Applies a `StemPlacement` and returns what to write.
+    private func placed(
+        _ buffer: AVAudioPCMBuffer,
+        writer: FixedFormatStemWriter,
+        at position: Double,
+        tolerance: Double,
+        align: Bool,
+        sourceName: String
+    ) -> AVAudioPCMBuffer? {
+        let seconds = Double(buffer.frameLength) / buffer.format.sampleRate
+        let placement = StemPlacement.place(
+            bufferStart: position,
+            bufferSeconds: seconds,
+            written: writer.writtenSeconds ?? 0,
+            tolerance: tolerance,
+            align: align
+        )
+        do {
+            if placement.padSeconds > 0 {
+                try writer.pad(toSeconds: (writer.writtenSeconds ?? 0) + placement.padSeconds)
+            }
+        } catch {
+            reportStemWriteFailureOnce(sourceName: sourceName, error: error)
+        }
+        guard placement.dropSeconds > 0 else { return buffer }
+        let drop = AVAudioFrameCount((placement.dropSeconds * buffer.format.sampleRate).rounded())
+        guard drop > 0 else { return buffer }
+        guard drop < buffer.frameLength else { return nil }
+        return droppingLeadingFrames(buffer, count: drop)
     }
 
     /// sampleQueue. Writes one system-stem buffer at its host-time position
@@ -1556,24 +1626,12 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         guard !stemsClosed, let writer = systemStemWriter, buffer.frameLength > 0 else { return }
         let origin = stemOriginHost ?? startHost
         stemOriginHost = origin
-        let seconds = Double(buffer.frameLength) / buffer.format.sampleRate
-        let tolerance = systemStemNeedsAlignment ? 0.02 : (source == .coreAudioTap ? 0.05 : 0.1)
+        let align = systemStemNeedsAlignment || writer.writtenSeconds == nil
         systemStemNeedsAlignment = false
-        let placement = StemPlacement.place(
-            bufferStart: startHost - origin,
-            bufferSeconds: seconds,
-            written: writer.writtenSeconds ?? 0,
-            tolerance: tolerance
-        )
+        guard let output = placed(buffer, writer: writer, at: startHost - origin,
+            tolerance: source == .coreAudioTap ? 0.02 : 0.04, align: align,
+            sourceName: "system") else { return }
         do {
-            if placement.padSeconds > 0 { try writer.pad(toSeconds: startHost - origin) }
-            var output = buffer
-            if placement.dropSeconds > 0 {
-                let drop = AVAudioFrameCount((placement.dropSeconds * buffer.format.sampleRate).rounded())
-                guard drop < buffer.frameLength,
-                      let trimmed = droppingLeadingFrames(buffer, count: drop) else { return }
-                output = trimmed
-            }
             try writer.write(output)
             let written = Double(output.frameLength) / output.format.sampleRate
             switch source {
@@ -1614,9 +1672,12 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     /// delivers at; a stale rate is the #1165 failure (system stem 3x fast).
     /// Measured over ten seconds of continuous delivery.
     private func checkTapRate(frames: Int, sampleRate: Double, startHost: Double) {
-        guard let windowStart = tapRateWindowStart else {
+        // A route change into HFP relabels the rate mid-window; frames from
+        // before and after it must not be measured against the new label.
+        guard let windowStart = tapRateWindowStart, tapRateWindowRate == sampleRate else {
             tapRateWindowStart = startHost
             tapRateWindowFrames = Double(frames)
+            tapRateWindowRate = sampleRate
             return
         }
         let span = startHost - windowStart
@@ -1660,8 +1721,8 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
                 "call_audio_live": systemLive,
                 "call_audio_source": self.systemStemSource.rawValue,
                 "call_audio_tap_heard": self.tapHeardSignalThisSession,
-                "call_audio_tap_seconds": Int(self.tapSecondsWritten),
-                "call_audio_screencapturekit_seconds": Int(self.screenCaptureKitSecondsWritten),
+                "call_audio_tap_seconds": (self.tapSecondsWritten * 10).rounded() / 10,
+                "call_audio_screencapturekit_seconds": (self.screenCaptureKitSecondsWritten * 10).rounded() / 10,
                 "mic_live": micLive,
                 "call_audio_level": self.latestSystemLevel,
                 "mic_level": self.latestMicLevel,
@@ -1695,7 +1756,9 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             // While the tap owns the system stem, a ScreenCaptureKit reconnect
             // must not pad it: the tap kept writing through the interruption.
             let ownsStem = outputType == .microphone || systemStemSource == .screenCaptureKit
-            if attempt > 0, ownsStem { writer?.resume(atElapsedSeconds: elapsedSeconds) }
+            // The stems' own timeline, not the .mov segment clock, so both
+            // stems resume from the same origin.
+            if attempt > 0, ownsStem { writer?.resume(atElapsedSeconds: stemElapsedSeconds) }
         }
         let framesBefore = writer?.framesWritten ?? 0
         let silenceBefore = writer?.framesSilenced ?? 0
@@ -1886,12 +1949,19 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         switch source {
         case .microphone:
             latestMicLevel = level
-            placeFirstVoiceBuffer(stemWriter, startHost: startHost)
+            guard let voiceBuffer = placeVoiceBuffer(pcmBuffer, writer: stemWriter, startHost: startHost) else {
+                return
+            }
+            do {
+                try stemWriter.write(voiceBuffer)
+            } catch {
+                reportStemWriteFailureOnce(sourceName: sourceName, error: error)
+            }
+            return
         case .audio:
             // ScreenCaptureKit is the tap's witness, and writes the system
             // stem only while the tap cannot.
             let now = hostSeconds()
-            if level >= systemAudioSignalLevel { lastScreenCaptureKitSignalHost = now }
             systemAudioArbiter.observeScreenCaptureKit(seconds: bufferSeconds, level: level, now: now)
             reportSystemAudioSourceTransition(now: now)
             guard systemStemSource == .screenCaptureKit else { return }
@@ -2067,8 +2137,9 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             self.pendingSourceEvents.forEach(emitJSON)
             self.pendingSourceEvents.removeAll()
         }
-        // Microphone first, then the tap: the stream is already running here,
-        // and the stem origin was just set, so the tap aligns to it.
+        // Microphone first, then the tap: the stream is already running here.
+        // The tap's buffers are placed on the stems' shared host-time origin
+        // (the first stem buffer), however late they start.
         tapControlQueue.async { [weak self] in self?.buildSystemTap(reason: "start") }
     }
 

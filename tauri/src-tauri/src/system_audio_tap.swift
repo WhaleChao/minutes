@@ -64,8 +64,12 @@ struct RecentLevel {
 /// misses an app is quieter). The tap takes the stem back after half a second
 /// of being clearly louder (FaceTime, or the user just allowed access).
 struct SystemAudioSourceArbiter {
-    static let tapLiveWindow = 1.0
+    static let tapLiveWindow = 0.5
     static let demoteAfterSeconds = 2.0
+    /// A tap that has delivered nothing but exact zeros while the witness
+    /// carries audio is conclusive (a refusal), so it is demoted after this
+    /// much witnessed signal instead of two seconds, losing less speech.
+    static let demoteSilentTapAfterSeconds = 0.3
     static let promoteAfterSeconds = 0.5
     static let dominanceRatio = 4.0
     /// Dominance evidence older than this is forgotten, so a few stray
@@ -102,10 +106,11 @@ struct SystemAudioSourceArbiter {
 
     /// A start or a rebuild. Keeps an earlier demotion: a rebuilt tap that is
     /// still refused would otherwise flap. Clears the comparison windows so a
-    /// rebuild's warm-up cannot be read as a refusal.
-    mutating func tapStarted() {
+    /// rebuild's warm-up cannot be read as a refusal. A rebuild keeps the old
+    /// tap's liveness, so a quick rebuild does not announce a fallback.
+    mutating func tapStarted(rebuild: Bool = false) {
         tapRunning = true
-        lastTapBufferAt = nil
+        if !rebuild { lastTapBufferAt = nil }
         tapHeardSignal = false
         tapLevel = RecentLevel()
         witnessLouderSeconds = 0
@@ -160,7 +165,8 @@ struct SystemAudioSourceArbiter {
         if now - witnessLouderAt > Self.evidenceMemorySeconds { witnessLouderSeconds = 0 }
         witnessLouderAt = now
         witnessLouderSeconds += seconds
-        if witnessLouderSeconds >= Self.demoteAfterSeconds, transitions < Self.maxTransitions {
+        let threshold = tapHeardSignal ? Self.demoteAfterSeconds : Self.demoteSilentTapAfterSeconds
+        if witnessLouderSeconds >= threshold, transitions < Self.maxTransitions {
             demoted = true
             demotionReason = tapHeardSignal
                 ? "screencapturekit_louder_than_tap"
@@ -193,24 +199,38 @@ struct SystemAudioSourceArbiter {
 
 /// Positions a buffer on the shared stem timeline (#1266). Both stems are
 /// laid out on host time from one origin, so the system stem stays aligned
-/// with the voice stem however late its source started and however its clock
-/// drifts. Pure arithmetic; the recorder applies the result.
+/// with the voice stem however late its source started, however long it
+/// stalled, and however its clock drifts. Pure arithmetic; the recorder
+/// applies the result.
 struct StemPlacement: Equatable {
+    /// Beyond this the stem is not drifting but has a gap (a stall, a
+    /// reconnect) or a fresh start, and is moved in one step.
+    static let jumpThreshold = 0.25
+    /// Drift is corrected at most this much per buffer, so a correction is
+    /// a couple of milliseconds, never a word.
+    static let driftStep = 0.002
+
     /// Seconds of silence to insert before the buffer.
     var padSeconds = 0.0
     /// Seconds to drop from the start of the buffer (the stem is ahead).
     var dropSeconds = 0.0
 
+    /// `align` forces the whole correction (a newly active source).
+    /// `allowDrop` is false for sources whose audio must never be trimmed
+    /// except to undo a jump.
     static func place(
         bufferStart: Double,
         bufferSeconds: Double,
         written: Double,
-        tolerance: Double
+        tolerance: Double,
+        align: Bool = false
     ) -> StemPlacement {
         let delta = bufferStart - written
-        if delta > tolerance { return StemPlacement(padSeconds: delta) }
-        if delta < -tolerance { return StemPlacement(dropSeconds: min(-delta, bufferSeconds)) }
-        return StemPlacement()
+        guard abs(delta) > tolerance else { return StemPlacement() }
+        let whole = align || abs(delta) > jumpThreshold
+        let step = whole ? abs(delta) : min(abs(delta), driftStep)
+        if delta > 0 { return StemPlacement(padSeconds: step) }
+        return StemPlacement(dropSeconds: min(step, bufferSeconds))
     }
 }
 
@@ -246,7 +266,9 @@ func runSystemAudioArbiterSelfTest() -> Bool {
         if let transition = refused.takeTransition(now: now) { reasons.append(transition.reason) }
         if demotedAt == nil, refused.activeSource(now: now) == .screenCaptureKit { demotedAt = now }
     }
-    checks.append(demotedAt.map { $0 >= 2.7 && $0 <= 3.2 } ?? false)
+    // Exact zeros against live audio is conclusive: demoted after about
+    // 0.3 s of witnessed speech, not two seconds.
+    checks.append(demotedAt.map { $0 >= 0.3 && $0 <= 0.6 } ?? false)
 
     // The user clicks Allow on the first-run prompt and a FaceTime call is
     // live: the tap hears audio ScreenCaptureKit cannot and takes it back.
@@ -345,14 +367,29 @@ func runSystemAudioArbiterSelfTest() -> Bool {
     }
     checks.append(flap.transitions == SystemAudioSourceArbiter.maxTransitions)
 
-    // Timeline placement: a late source pads, an early one drops, jitter is
-    // left alone, and a drop never exceeds the buffer.
-    checks.append(StemPlacement.place(bufferStart: 1.4, bufferSeconds: 0.01, written: 0, tolerance: 0.05)
+    // Timeline placement: a late start or a stall is filled in one step,
+    // drift is corrected two milliseconds at a time, jitter is left alone,
+    // and a drop never exceeds the buffer.
+    checks.append(StemPlacement.place(bufferStart: 1.4, bufferSeconds: 0.01, written: 0, tolerance: 0.02)
         == StemPlacement(padSeconds: 1.4))
-    checks.append(StemPlacement.place(bufferStart: 9.9, bufferSeconds: 0.01, written: 10, tolerance: 0.05)
-        == StemPlacement(dropSeconds: 0.01))
-    checks.append(StemPlacement.place(bufferStart: 10.03, bufferSeconds: 0.01, written: 10, tolerance: 0.05)
+    checks.append(StemPlacement.place(bufferStart: 10.06, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
+        == StemPlacement(padSeconds: StemPlacement.driftStep))
+    checks.append(StemPlacement.place(bufferStart: 9.94, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
+        == StemPlacement(dropSeconds: StemPlacement.driftStep))
+    checks.append(StemPlacement.place(bufferStart: 9.94, bufferSeconds: 0.01, written: 10, tolerance: 0.02,
+        align: true) == StemPlacement(dropSeconds: 0.01))
+    checks.append(StemPlacement.place(bufferStart: 10.01, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
         == StemPlacement())
+    checks.append(StemPlacement.place(bufferStart: 9.5, bufferSeconds: 0.01, written: 10, tolerance: 0.02)
+        == StemPlacement(dropSeconds: 0.01))
+
+    // A rebuild keeps the old tap's liveness: no fallback is announced.
+    var rebuilt = SystemAudioSourceArbiter()
+    rebuilt.tapStarted()
+    rebuilt.observeTap(seconds: tick, allZero: false, level: 10, now: 0)
+    _ = rebuilt.takeTransition(now: 0.01)
+    rebuilt.tapStarted(rebuild: true)
+    checks.append(rebuilt.takeTransition(now: 0.2) == nil)
 
     let passed = checks.allSatisfy { $0 }
     let failed = checks.enumerated().filter { !$0.element }.map { $0.offset }
