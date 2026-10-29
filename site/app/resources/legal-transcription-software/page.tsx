@@ -8,7 +8,7 @@ import { RelatedResources } from "@/components/related-resources";
 export const metadata: Metadata = {
   title: "Legal transcription software: what confidentiality actually requires",
   description:
-    "When legal work needs certified human transcripts, when software is right, and why on-device processing keeps privileged audio out of vendor clouds.",
+    "When legal work needs a certified human transcript, when software is right, what bar opinions now require, and how to keep privileged audio off vendor servers.",
   alternates: {
     canonical: "/resources/legal-transcription-software",
   },
@@ -21,11 +21,19 @@ const faqs = [
   },
   {
     question: "Is AI transcription safe for privileged conversations?",
-    answer: "It depends on the architecture. Cloud AI transcription sends privileged audio to a third party under that vendor's terms — a disclosure your ethics counsel has to analyze. On-device transcription (software that runs entirely on your own machine) involves no third party, so there is no vendor disclosure to analyze. Device security and consent obligations remain yours either way.",
+    answer: "It depends on the architecture. Cloud AI transcription sends privileged audio to a third party under that vendor's terms — a disclosure your ethics counsel has to analyze. On-device transcription keeps the audio and transcript on your own machine, so the transcription step involves no vendor. Anything you later send to a cloud AI assistant or summarizer is a separate disclosure under that provider's terms. Device security and consent obligations remain yours either way.",
+  },
+  {
+    question: "Do lawyers need client consent to use AI transcription?",
+    answer: "The New York City Bar says yes for client calls: Formal Opinion 2025-6 (December 2025) says clients should be told in advance and consent obtained when an AI system records their calls, that lawyers should understand how the provider stores, retains, trains on, and deletes the data, and that lawyers should review the transcript or summary against what was said. Its Formal Opinion 2026-2 (August 2026) covers calls with non-clients and advises against recording them by default. Check your own jurisdiction's rules.",
+  },
+  {
+    question: "What should a firm check before buying legal transcription software?",
+    answer: "Where the audio is processed (on your machine or a vendor's servers), how long the vendor keeps audio and transcripts, whether your data trains the vendor's models and whether you can opt out, which subprocessors handle it, whether you can delete it, and whether the vendor will sign a BAA if health information is involved. Read the vendor's own terms and acceptable use policy, not just its security page.",
   },
   {
     question: "Can software-generated transcripts be used in court?",
-    answer: "Software transcripts are working documents, not certified transcripts. Court-grade transcripts of proceedings generally require a certified transcriptionist or court reporter. Use software for speed and confidentiality on internal material; hire certification when the transcript itself must be evidence.",
+    answer: "Software transcripts are working documents, not certified transcripts. Court-grade transcripts of proceedings generally require a certified transcriptionist or court reporter. Some services sell software drafts that a human later certifies, but the certification is still a person's. Use software for speed and confidentiality on internal material; hire certification when the transcript itself must be evidence.",
   },
 ] as const;
 
@@ -38,12 +46,20 @@ const sources = [
     label: "ABA Formal Opinion 512: Generative AI Tools (July 2024)",
     href: "https://www.americanbar.org/content/dam/aba/administrative/professional_responsibility/ethics-opinions/aba-formal-opinion-512.pdf",
   },
+  {
+    label: "NYC Bar Formal Opinion 2025-6: AI to record, transcribe, and summarize conversations with clients (December 2025)",
+    href: "https://www.nycbar.org/reports/formal-opinion-2025-6-ethical-issues-affecting-use-of-ai-to-record-transcribe-and-summarize-conversations-with-clients/",
+  },
+  {
+    label: "NYC Bar Formal Opinion 2026-2: AI for recording, transcribing, and summarizing non-client conversations (August 2026)",
+    href: "https://www.nycbar.org/reports/formal-opinion-2026-2-ethical-use-of-ai-for-recording-transcribing-and-summarizing-non-client-conversations/",
+  },
   { label: "Minutes security & privacy architecture", href: "/security" },
   { label: "Minutes on GitHub (MIT)", href: "https://github.com/silverstein/minutes" },
 ] as const;
 
 
-const LAST_REVIEWED = "2026-07-11";
+const LAST_REVIEWED = "2026-10-29";
 
 export default function LegalTranscriptionSoftwarePage() {
   return (
@@ -80,11 +96,12 @@ export default function LegalTranscriptionSoftwarePage() {
           Legal transcription software: what confidentiality actually requires
         </h1>
         <p className="mt-5 text-[17px] leading-8 text-[var(--text-secondary)]">
-          Most &ldquo;legal transcription software&rdquo; roundups compare turnaround times and
-          per-minute prices, and skip the only question that can end a career: where does the
-          privileged audio go? Here&rsquo;s a clear map of the category — what needs a human,
-          what needs software, and what the software&rsquo;s architecture must look like when
-          the recording is privileged.
+          Most &ldquo;legal transcription software&rdquo; pages compare accuracy, turnaround,
+          and price, and leave the question bar regulators now ask first to a security page:
+          where does the privileged audio go, and who can use it? Here&rsquo;s a map of the
+          category — what needs a human, what needs software, what recent ethics opinions
+          require, and what the software&rsquo;s architecture must look like when the recording
+          is privileged.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
@@ -106,8 +123,8 @@ export default function LegalTranscriptionSoftwarePage() {
               Certified transcripts are a human service, not a software feature.
             </span>{" "}
             When the transcript itself must be evidence — proceedings, certified deposition
-            transcripts — you hire a certified transcriptionist or court reporter. No software
-            replaces that.
+            transcripts — you hire a certified transcriptionist or court reporter. Software can
+            produce a draft, but the certification is a person&rsquo;s.
           </p>
           <p>
             <span className="font-medium text-[var(--text)]">
@@ -115,9 +132,9 @@ export default function LegalTranscriptionSoftwarePage() {
             </span>{" "}
             Client meetings, dictated memos, interview prep, internal case discussions: software
             transcribes them instantly. But cloud transcription tools put a third party inside
-            privileged conversations. On-device tools — where audio is transcribed and stored
-            entirely on your own machine — are the only architecture where no outside disclosure
-            occurs at all.
+            privileged conversations. On-device tools — where audio is transcribed and stored on
+            your own machine — are the only architecture where the transcription step involves no
+            outside party at all.
           </p>
         </div>
       </section>
@@ -141,8 +158,8 @@ export default function LegalTranscriptionSoftwarePage() {
               privilege analysis
             </a>{" "}
             applies with full force. ABA Formal Opinion 512 requires understanding a tool&rsquo;s
-            data handling before client information goes in — an analysis that gets one sentence
-            long when the tool never transmits anything.
+            data handling before client information goes in — an analysis that gets much shorter
+            when the transcription never leaves your machine.
           </p>
           <p>
             <span className="font-medium text-[var(--text)]">3. Non-privileged volume.</span>{" "}
@@ -153,16 +170,46 @@ export default function LegalTranscriptionSoftwarePage() {
       </section>
 
       <section className="mt-14 max-w-[800px]">
+        <SectionLabel label="What Bar Opinions Now Expect" />
+        <div className="space-y-4 text-[15px] leading-8 text-[var(--text-secondary)]">
+          <p>
+            ABA Formal Opinion 512 (July 2024) set the general rule for generative AI: understand
+            the tool, protect client confidences, and check the output. The New York City Bar has
+            since applied it to transcription specifically.{" "}
+            <span className="font-medium text-[var(--text)]">Formal Opinion 2025-6</span>{" "}
+            (December 2025) covers AI that records, transcribes, or summarizes client calls: tell
+            the client in advance and get consent, find out where the provider stores recordings,
+            for how long, whether it trains on them, and whether you can delete them, and review
+            the transcript or summary before relying on it.{" "}
+            <span className="font-medium text-[var(--text)]">Formal Opinion 2026-2</span>{" "}
+            (August 2026) covers calls with non-clients and advises against recording them by
+            default.
+          </p>
+          <p>
+            In practice that turns into a short checklist for any tool: where audio is processed,
+            how long audio and transcripts are retained, whether your data trains the
+            vendor&rsquo;s models and whether you can opt out, which subprocessors touch it,
+            whether you can delete it, and whether the vendor signs a BAA when health information
+            is involved. Read the terms and acceptable use policy, not only the security page;
+            the two do not always say the same thing. This is not legal advice, and other states
+            have their own opinions.
+          </p>
+        </div>
+      </section>
+
+      <section className="mt-14 max-w-[800px]">
         <SectionLabel label="Where Minutes Fits — And Doesn't" />
         <div className="space-y-4 text-[15px] leading-8 text-[var(--text-secondary)]">
           <p>
             <span className="font-medium text-[var(--text)]">Minutes</span> is built for job #2.
-            It records and transcribes on your own machine (whisper.cpp — the audio has no
-            network path), labels speakers, and stores everything as markdown files on your disk
-            with owner-only permissions — organized, greppable, and readable by your AI
+            It records and transcribes on your own machine with on-device speech models, labels
+            speakers, and stores everything as markdown files on your disk with owner-only
+            permissions — organized, greppable, and readable by your AI
             assistant straight from local files, with structured action items filled in once you
-            connect one. It&rsquo;s open source (MIT), so your security review can read the code
-            instead of a vendor questionnaire.
+            connect one. If that assistant or a summarizer is a cloud service, the meeting
+            context you authorize goes to that provider; use a local model or skip summarization
+            to keep the whole workflow on-device. It&rsquo;s open source (MIT), so your security
+            review can read the code instead of a vendor questionnaire.
           </p>
           <p>
             Where it is <em>not</em> the tool: certified transcripts (job #1 — hire a human),

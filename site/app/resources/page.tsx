@@ -147,7 +147,7 @@ const groups = [
         blurb: "Every way to dictate on a Mac without sending your voice to a cloud.",
       },
       {
-        title: "Open-source alternatives to Granola AI",
+        title: "Open-source Granola alternatives",
         href: "/resources/open-source-alternatives-to-granola-ai",
         blurb: "Local processing, inspectable output, and agent-friendly workflows.",
       },

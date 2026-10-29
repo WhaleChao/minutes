@@ -28,7 +28,7 @@ Guides to the questions people bring to a recorded conversation: how to get a bo
 
 - [The best local speech-to-text apps](/resources/best-local-speech-to-text)
 - [Local dictation on macOS](/resources/local-dictation-macos)
-- [Open-source alternatives to Granola AI](/resources/open-source-alternatives-to-granola-ai)
+- [Open-source Granola alternatives](/resources/open-source-alternatives-to-granola-ai)
 - [Best MCP meeting memory tools](/resources/best-mcp-meeting-memory-tools)
 - [Best meeting tools for Claude Code and Codex](/resources/best-meeting-tools-for-claude-code-and-codex)
 - [Meeting minutes templates](/resources/meeting-minutes-template)
