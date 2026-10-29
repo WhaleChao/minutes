@@ -148,6 +148,34 @@ pub fn alert_body(kind: RemoteSilenceAlertKind) -> &'static str {
     }
 }
 
+/// How the native call helper is capturing the other side (#1266). The
+/// right advice for a silent call depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAudioCapture {
+    /// The Core Audio tap, which hears FaceTime and phone calls answered on
+    /// the Mac. `heard_audio` is false when it has delivered only digital
+    /// silence, the signature of a refused System Audio Recording permission.
+    Tap {
+        heard_audio: bool,
+    },
+    /// ScreenCaptureKit, which cannot hear FaceTime or phone calls.
+    ScreenCaptureKit,
+    Unknown,
+}
+
+/// User-facing alert body for `kind`, given how call audio is captured.
+pub fn alert_body_for(kind: RemoteSilenceAlertKind, capture: CallAudioCapture) -> &'static str {
+    match (kind, capture) {
+        (RemoteSilenceAlertKind::NeverHeard, CallAudioCapture::Tap { heard_audio: false }) => {
+            "No call audio has reached Minutes for over a minute while you were speaking, so only your microphone is being recorded. Check that Minutes is allowed under System Settings > Privacy & Security > Screen & System Audio Recording, and that the call is playing on this Mac."
+        }
+        (RemoteSilenceAlertKind::NeverHeard, CallAudioCapture::Tap { heard_audio: true }) => {
+            "No call audio has reached Minutes for over a minute while you were speaking, so only your microphone is being recorded. Check that the call is playing on this Mac and not on your phone or another device."
+        }
+        _ => alert_body(kind),
+    }
+}
+
 /// User-facing title when remote audio comes back after an alert.
 pub const RECOVERED_TITLE: &str = "Minutes is hearing the other side again";
 
@@ -371,11 +399,19 @@ pub fn read_live_state(recording_pid: Option<u32>) -> Option<LiveRemoteAudioStat
 
 /// Build the event that mirrors a detector transition into `events.jsonl`.
 pub fn live_event(event: &RemoteSilenceEvent) -> crate::events::MinutesEvent {
+    live_event_for(event, CallAudioCapture::Unknown)
+}
+
+/// [`live_event`] with the advice matched to how call audio is captured.
+pub fn live_event_for(
+    event: &RemoteSilenceEvent,
+    capture: CallAudioCapture,
+) -> crate::events::MinutesEvent {
     match event {
         RemoteSilenceEvent::Alert(alert) => crate::events::MinutesEvent::LiveRemoteAudio {
             remote_audio: "missing".into(),
             kind: Some(alert.kind.as_str().into()),
-            message: alert_body(alert.kind).into(),
+            message: alert_body_for(alert.kind, capture).into(),
         },
         RemoteSilenceEvent::Recovered => crate::events::MinutesEvent::LiveRemoteAudio {
             remote_audio: "restored".into(),
@@ -694,11 +730,49 @@ mod tests {
             ALERT_TITLE,
             alert_body(RemoteSilenceAlertKind::NeverHeard),
             alert_body(RemoteSilenceAlertKind::Lost),
+            alert_body_for(
+                RemoteSilenceAlertKind::NeverHeard,
+                CallAudioCapture::Tap { heard_audio: false },
+            ),
+            alert_body_for(
+                RemoteSilenceAlertKind::NeverHeard,
+                CallAudioCapture::Tap { heard_audio: true },
+            ),
             RECOVERED_TITLE,
             RECOVERED_BODY,
         ] {
             assert!(!text.contains('\u{2014}'), "{text}");
             assert!(!text.contains('\u{2013}'), "{text}");
         }
+    }
+
+    #[test]
+    fn alert_advice_follows_the_capture_path() {
+        // ScreenCaptureKit cannot hear FaceTime: say so.
+        let sck = alert_body_for(
+            RemoteSilenceAlertKind::NeverHeard,
+            CallAudioCapture::ScreenCaptureKit,
+        );
+        assert!(sck.contains("FaceTime"));
+        // The tap can, so blaming FaceTime would be wrong. A tap that never
+        // heard anything points at the permission instead.
+        let refused = alert_body_for(
+            RemoteSilenceAlertKind::NeverHeard,
+            CallAudioCapture::Tap { heard_audio: false },
+        );
+        assert!(refused.contains("Screen & System Audio Recording"));
+        assert!(!refused.contains("FaceTime"));
+        let heard = alert_body_for(
+            RemoteSilenceAlertKind::NeverHeard,
+            CallAudioCapture::Tap { heard_audio: true },
+        );
+        assert!(!heard.contains("FaceTime") && !heard.contains("Privacy"));
+        assert_eq!(
+            alert_body_for(
+                RemoteSilenceAlertKind::Lost,
+                CallAudioCapture::Tap { heard_audio: true }
+            ),
+            alert_body(RemoteSilenceAlertKind::Lost)
+        );
     }
 }

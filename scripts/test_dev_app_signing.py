@@ -46,7 +46,8 @@ def main():
             'const char speech[] = "MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1=' + '0' * 40 + '";\n'
             'int main(void) { return graph[0] == speech[0] ? 0 : 1; }\n'
         )
-        for name in ("minutes-app", "minutes", "minutes-graph-worker", "minutes-apple-speech-worker"):
+        for name in ("minutes-app", "minutes", "system_audio_record", "minutes-graph-worker",
+                     "minutes-apple-speech-worker"):
             binary = binaries / name
             run("xcrun", "clang", "-o", str(binary), str(c_file))
             # ARM linkers may add a signature automatically. Start with the
@@ -74,11 +75,16 @@ find() {
         entitlement_report = run("codesign", "-d", "--entitlements", ":-", str(binaries / "minutes"),
                                  capture_output=True)
         assert plistlib.loads(entitlement_report.stdout)["com.apple.security.device.audio-input"] is True
+        # The call helper reads a Core Audio tap in-process (#1266).
+        helper_report = run("codesign", "-d", "--entitlements", ":-", str(binaries / "system_audio_record"),
+                            capture_output=True)
+        assert plistlib.loads(helper_report.stdout)["com.apple.security.device.audio-input"] is True
         for worker in ("graph", "apple-speech"):
             cdhash = (resources / f"minutes-{worker}-worker.cdhash").read_text().strip()
             run("python3", f"scripts/seal_{worker.replace('-', '_')}_worker_hash.py",
                 "--verify", str(binaries / "minutes-app"), cdhash)
-        print("PASS: nested signatures, CLI entitlement, XPC bindings and strict outer seal", flush=True)
+        print("PASS: nested signatures, CLI and call-helper entitlements, XPC bindings and strict outer seal",
+              flush=True)
 
         (resources / "canary.txt").write_text("tampered resource\n")
         marker = root / "continued-after-failed-seal"

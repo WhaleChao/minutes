@@ -1150,6 +1150,12 @@ pub struct RecordingHealth {
     /// time (for example `native-call` for ScreenCaptureKit call capture).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_backend: Option<String>,
+    /// Which source recorded the other side of a native call (#1266):
+    /// `core-audio-tap` (hears FaceTime and phone calls answered on the Mac),
+    /// `screencapturekit` (cannot), or `mixed` when capture switched between
+    /// them. Absent for other capture paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_audio_source: Option<String>,
 }
 
 /// Durable outcome of remote (call/system) audio coverage for a call.

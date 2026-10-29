@@ -222,6 +222,10 @@ chmod 755 "$BUILD_APP/Contents/MacOS/minutes-embed-worker"
 # bundle seal, so copied/downloaded apps fail Gatekeeper as "damaged".
 SIDECAR_BIN="$BUILD_APP/Contents/MacOS/minutes"
 MAIN_BIN="$BUILD_APP/Contents/MacOS/minutes-app"
+# The call helper reads a Core Audio tap in-process (#1266), which hardened
+# runtime gates on audio-input. Release bundles get the app entitlements on
+# it from the Tauri bundler; give Dev the same so Dev tests what ships.
+CALL_HELPER_BIN="$BUILD_APP/Contents/MacOS/system_audio_record"
 # Signing the main executable also seals its containing app. Leave it for
 # the final outer-bundle sign: Intel nested binaries may still be unsigned,
 # and the XPC packaging steps below must patch the parent before it is sealed.
@@ -234,6 +238,11 @@ if [[ "$SIGN_MODE" == "identity" ]]; then
     if [[ "$nested_executable" == "$SIDECAR_BIN" ]]; then
       codesign --force --options runtime --timestamp \
         --entitlements tauri/src-tauri/minutes-cli.entitlements \
+        --sign "$SIGNING_IDENTITY" \
+        "$nested_executable"
+    elif [[ "$nested_executable" == "$CALL_HELPER_BIN" ]]; then
+      codesign --force --options runtime --timestamp \
+        --entitlements tauri/src-tauri/entitlements.plist \
         --sign "$SIGNING_IDENTITY" \
         "$nested_executable"
     else
@@ -268,6 +277,10 @@ else
     if [[ "$nested_executable" == "$SIDECAR_BIN" ]]; then
       codesign --force --options runtime \
         --entitlements tauri/src-tauri/minutes-cli.entitlements \
+        --sign - "$nested_executable"
+    elif [[ "$nested_executable" == "$CALL_HELPER_BIN" ]]; then
+      codesign --force --options runtime \
+        --entitlements tauri/src-tauri/entitlements.plist \
         --sign - "$nested_executable"
     else
       codesign --force --sign - "$nested_executable"

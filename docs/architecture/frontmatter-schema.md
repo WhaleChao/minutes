@@ -295,6 +295,7 @@ recording_health:
 | `diarization_path` | enum | `stem-energy`, `ml`, `ml-bleed-degraded`, or `none`. |
 | `remote_audio` | enum | `missing` or `partial`. Set only from positive evidence that the remote side of a call did not reach the recording: the live remote-silence alert fired during capture, or a call-intent (`native-call`) capture finished with a silent or near-silent system stem. Absent means no evidence of loss, not verified coverage. When `missing`, the transcript reflects only the local microphone and no line should be attributed to a remote participant. |
 | `capture_backend` | string | Capture backend recorded at capture time when it is positively known, e.g. `native-call` (ScreenCaptureKit call capture). Absent when unknown. |
+| `call_audio_source` | string | Which source recorded the other side of a native call: `core-audio-tap` (a Core Audio process tap, which hears FaceTime and iPhone calls answered on the Mac), `screencapturekit` (cannot hear those), or `mixed` when capture switched between them. Absent for other capture paths. |
 
 When the live alert fires, `capture_warnings` also carries an entry with
 `kind: !other` / `code: live-remote-audio-silent` and `source: system`, and
