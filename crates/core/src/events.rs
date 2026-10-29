@@ -372,6 +372,19 @@ pub enum MinutesEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
     },
+    /// Live remote-silence transition during a call recording (#1266).
+    /// `remote_audio` is `missing` when the alert fires (call audio silent
+    /// while the microphone has speech, so the live transcript holds only the
+    /// local side) and `restored` when call audio comes back. Agents reading
+    /// the live feed must not attribute live lines to the remote participant
+    /// while it is `missing`.
+    #[serde(rename = "live.remote_audio")]
+    LiveRemoteAudio {
+        remote_audio: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        message: String,
+    },
     /// Append-only agent commentary. This never mutates human-authored notes.
     #[serde(rename = "agent.annotation")]
     AgentAnnotation {

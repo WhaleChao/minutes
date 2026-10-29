@@ -633,6 +633,13 @@ expression: schema
     "RecordingHealth": {
       "type": "object",
       "properties": {
+        "capture_backend": {
+          "description": "Capture backend that produced the audio, when it is known at capture\ntime (for example `native-call` for ScreenCaptureKit call capture).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "capture_warnings": {
           "type": "array",
           "items": {
@@ -643,6 +650,17 @@ expression: schema
           "anyOf": [
             {
               "$ref": "#/$defs/DiarizationPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_audio": {
+          "description": "Whether the remote side of a call reached the recording (#1266).\n\nOnly set when there is positive evidence that it did not: the live\nremote-silence detector fired, or a call-intent capture finished with a\nsilent system stem. Absent means \"no evidence of loss\", not \"verified\ncomplete\". Readers must not attribute transcript lines to remote\nparticipants when this is `missing`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteAudioStatus"
             },
             {
               "type": "null"
@@ -671,6 +689,21 @@ expression: schema
           "format": "float"
         }
       }
+    },
+    "RemoteAudioStatus": {
+      "description": "Durable outcome of remote (call/system) audio coverage for a call.",
+      "oneOf": [
+        {
+          "description": "No sustained remote audio reached the recording. The transcript\nreflects only the local microphone.",
+          "type": "string",
+          "const": "missing"
+        },
+        {
+          "description": "Remote audio was heard for part of the call but went silent for an\nextended stretch while the local microphone had speech.",
+          "type": "string",
+          "const": "partial"
+        }
+      ]
     },
     "Sensitivity": {
       "description": "Sensitivity designation for agent-facing policy layers.",

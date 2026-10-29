@@ -403,6 +403,11 @@ pub struct SessionStatus {
     /// to `diagnostic`, which describes failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<LiveTranscriptDisabled>,
+    /// `missing` while the live remote-silence alert is outstanding for the
+    /// active recording (#1266): call audio is silent while the microphone
+    /// has speech, so every live line is local. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_audio: Option<crate::markdown::RemoteAudioStatus>,
 }
 
 /// Reasons live text is off on purpose while a recording is active.
@@ -4062,6 +4067,8 @@ fn derive_session_status(
         source,
         diagnostic,
         disabled,
+        remote_audio: crate::remote_silence::read_live_state(recording_pid)
+            .map(|state| state.remote_audio),
     }
 }
 
@@ -4811,6 +4818,39 @@ mod tests {
             &pid::live_transcript_status_path(),
             &pid::live_transcript_jsonl_path(),
         )
+    }
+
+    #[test]
+    fn status_reports_remote_audio_missing_for_the_active_recording_only() {
+        with_temp_home(|| {
+            assert_eq!(session_status_for_test_recording().remote_audio, None);
+            let state = crate::remote_silence::LiveRemoteAudioState {
+                remote_audio: crate::markdown::RemoteAudioStatus::Missing,
+                kind: "never-heard".into(),
+                recording_pid: std::process::id(),
+                since: Local::now(),
+            };
+            crate::remote_silence::write_live_state(Some(&state));
+            let status = session_status_for_test_recording();
+            assert_eq!(
+                status.remote_audio,
+                Some(crate::markdown::RemoteAudioStatus::Missing)
+            );
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["remote_audio"], "missing");
+
+            // Not attributed to an idle machine or another recording.
+            let idle = derive_session_status(
+                pid::PidFileState::Inactive,
+                None,
+                &pid::live_transcript_status_path(),
+                &pid::live_transcript_jsonl_path(),
+            );
+            assert_eq!(idle.remote_audio, None);
+
+            crate::remote_silence::write_live_state(None);
+            assert_eq!(session_status_for_test_recording().remote_audio, None);
+        });
     }
 
     #[test]

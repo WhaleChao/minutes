@@ -15,7 +15,7 @@
 
 use crate::config::Config;
 use crate::diarize::{CaptureSource, DiagnosticConfidence, FailureKind};
-use crate::markdown::{CaptureWarning, DiarizationPath, RecordingHealth};
+use crate::markdown::{CaptureWarning, DiarizationPath, RecordingHealth, RemoteAudioStatus};
 use crate::system_audio_backend::{system_audio_backend_for_config, ProbeResult, RouteDescription};
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +136,7 @@ pub fn recording_health_for_skipped_system_audio_probe(reason: &str) -> Recordin
             diagnostic_confidence: DiagnosticConfidence::Inferred,
         }],
         diarization_path: Some(DiarizationPath::None),
+        ..Default::default()
     }
 }
 
@@ -166,6 +167,7 @@ pub fn recording_health_for_system_audio_probe_failure(
             diagnostic_confidence: result.diagnostic_confidence,
         }],
         diarization_path: Some(DiarizationPath::None),
+        ..Default::default()
     }
 }
 
@@ -208,6 +210,7 @@ pub fn recording_health_for_native_call_stem_recovery(
             diagnostic_confidence: DiagnosticConfidence::Inferred,
         }],
         diarization_path: Some(DiarizationPath::None),
+        ..Default::default()
     }
 }
 
@@ -220,6 +223,48 @@ pub fn append_native_call_capture_warning(
             code: NATIVE_CALL_CAPTURE_WARNING_CODE.into(),
         },
         source: CaptureSource::Both,
+        message: message.into(),
+        diagnostic_confidence: DiagnosticConfidence::Inferred,
+    });
+}
+
+/// Capture-warning code written when the live remote-silence detector fired
+/// during a call recording (#1266).
+pub const LIVE_REMOTE_SILENCE_CODE: &str = "live-remote-audio-silent";
+
+/// Capture backend label for ScreenCaptureKit native call capture. Matches the
+/// label the pipeline already logs from `infer_capture_backend`.
+pub const NATIVE_CALL_CAPTURE_BACKEND: &str = "native-call";
+
+/// Record the live remote-silence outcome on a recording's health.
+///
+/// Sets [`RecordingHealth::remote_audio`] (never downgrading an existing
+/// `missing` to `partial`) and appends one structured capture warning so the
+/// frontmatter explains why. Idempotent for the same status.
+pub fn record_live_remote_silence(health: &mut RecordingHealth, status: RemoteAudioStatus) {
+    health.remote_audio = match (health.remote_audio, status) {
+        (Some(RemoteAudioStatus::Missing), _) => Some(RemoteAudioStatus::Missing),
+        _ => Some(status),
+    };
+    let already_recorded = health.capture_warnings.iter().any(|warning| {
+        matches!(&warning.kind, FailureKind::Other { code } if code == LIVE_REMOTE_SILENCE_CODE)
+    });
+    if already_recorded {
+        return;
+    }
+    let message = match status {
+        RemoteAudioStatus::Missing => {
+            "During recording, call audio stayed silent while the microphone had speech. The other side of this call was not captured; the transcript reflects only the local microphone, so no line should be attributed to a remote participant."
+        }
+        RemoteAudioStatus::Partial => {
+            "During recording, call audio went silent for an extended stretch while the microphone had speech. Parts of the other side of this call may be missing from the transcript."
+        }
+    };
+    health.capture_warnings.push(CaptureWarning {
+        kind: FailureKind::Other {
+            code: LIVE_REMOTE_SILENCE_CODE.into(),
+        },
+        source: CaptureSource::System,
         message: message.into(),
         diagnostic_confidence: DiagnosticConfidence::Inferred,
     });
@@ -979,6 +1024,30 @@ mod tests {
         assert_eq!(item.state, "attention");
         assert!(item.detail.contains("Silent"));
         assert!(item.detail.contains("max RMS 0.0000"));
+    }
+
+    #[test]
+    fn live_remote_silence_is_idempotent_and_never_weakens_missing() {
+        let mut health = RecordingHealth::default();
+        record_live_remote_silence(&mut health, RemoteAudioStatus::Missing);
+        record_live_remote_silence(&mut health, RemoteAudioStatus::Partial);
+        record_live_remote_silence(&mut health, RemoteAudioStatus::Missing);
+
+        assert_eq!(health.remote_audio, Some(RemoteAudioStatus::Missing));
+        assert_eq!(health.capture_warnings.len(), 1);
+        let warning = &health.capture_warnings[0];
+        assert_eq!(warning.source, CaptureSource::System);
+        assert_eq!(
+            warning.kind,
+            FailureKind::Other {
+                code: LIVE_REMOTE_SILENCE_CODE.into()
+            }
+        );
+        assert!(warning.message.contains("only the local microphone"));
+
+        let mut partial = RecordingHealth::default();
+        record_live_remote_silence(&mut partial, RemoteAudioStatus::Partial);
+        assert_eq!(partial.remote_audio, Some(RemoteAudioStatus::Partial));
     }
 
     #[test]

@@ -929,6 +929,39 @@ speaker_map:`
       diarization_path: "ml-bleed-degraded",
     });
   });
+
+  it("preserves the remote_audio marker and capture backend (#1266)", () => {
+    const content = MEETING_WITH_SPEAKERS.replace(
+      "speaker_map:",
+      `recording_health:
+  system_stem_active_ratio: 0.0009
+  capture_warnings:
+    - kind: sparse
+      source: system
+      message: Call audio stayed silent.
+      diagnostic_confidence: inferred
+  remote_audio: missing
+  capture_backend: native-call
+speaker_map:`
+    );
+    const health = parseFrontmatter(content, "/t/m.md")?.frontmatter.recording_health;
+
+    expect(health?.remote_audio).toBe("missing");
+    expect(health?.capture_backend).toBe("native-call");
+  });
+
+  it("drops an unknown remote_audio value instead of failing the parse", () => {
+    const content = MEETING_WITH_SPEAKERS.replace(
+      "speaker_map:",
+      `recording_health:
+  remote_audio: someday-new-state
+speaker_map:`
+    );
+    const health = parseFrontmatter(content, "/t/m.md")?.frontmatter.recording_health;
+
+    expect(health).toBeDefined();
+    expect(health?.remote_audio).toBeUndefined();
+  });
 });
 
 // ── applySpeakerOverlays ─────────────────────────────────────

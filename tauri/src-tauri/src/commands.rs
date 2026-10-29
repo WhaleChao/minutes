@@ -3218,6 +3218,7 @@ fn empty_native_call_health() -> minutes_core::markdown::RecordingHealth {
         system_dominant_ratio: None,
         capture_warnings: Vec::new(),
         diarization_path: Some(minutes_core::markdown::DiarizationPath::None),
+        ..Default::default()
     }
 }
 
@@ -3341,6 +3342,7 @@ fn queue_native_call_capture_for_processing(
     context_session_id: Option<String>,
     calendar_event: Option<minutes_core::calendar::CalendarEvent>,
     extra_warning: Option<String>,
+    remote_audio: Option<minutes_core::markdown::RemoteAudioStatus>,
 ) -> Result<minutes_core::jobs::ProcessingJob, String> {
     let input = native_call_processing_input(output_path).map_err(|error| {
         format!("failed to prepare native call capture for processing: {error}")
@@ -3356,6 +3358,18 @@ fn queue_native_call_capture_for_processing(
         {
             minutes_core::health::append_native_call_capture_warning(health, extra_warning);
         }
+    }
+    // The backend is known here and nowhere later: once queued, the `.mov`
+    // leaves `native-captures/` and path inference reported `unknown` (#1266).
+    // It is also the persisted call-intent signal (#413): native call capture
+    // only starts for a call. A fresh health keeps `diarization_path` unset so
+    // a healthy call is not stamped as undiarized.
+    let health = recording_health.get_or_insert_with(Default::default);
+    health
+        .capture_backend
+        .get_or_insert_with(|| minutes_core::health::NATIVE_CALL_CAPTURE_BACKEND.into());
+    if let Some(status) = remote_audio {
+        minutes_core::health::record_live_remote_silence(health, status);
     }
     let (consent, consent_notice) = if mode == CaptureMode::Meeting {
         minutes_core::notes::load_consent()
@@ -3690,6 +3704,100 @@ impl Drop for AssistantLiveContextGuard {
     }
 }
 
+/// Clears the published live remote-audio state (#1266) when created and when
+/// dropped, so `minutes transcript --status` never reports a finished or
+/// crashed recording's alert.
+#[cfg(target_os = "macos")]
+struct LiveRemoteAudioStateGuard;
+
+#[cfg(target_os = "macos")]
+impl LiveRemoteAudioStateGuard {
+    fn new() -> Self {
+        minutes_core::remote_silence::write_live_state(None);
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LiveRemoteAudioStateGuard {
+    fn drop(&mut self) {
+        minutes_core::remote_silence::write_live_state(None);
+    }
+}
+
+/// Surface a live remote-silence transition (#1266) in the recording UI and,
+/// for an alert, as a non-modal desktop notification. Never changes capture.
+#[cfg(target_os = "macos")]
+fn handle_remote_silence_event(
+    app_handle: &tauri::AppHandle,
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    output_path: &Path,
+    event: minutes_core::remote_silence::RemoteSilenceEvent,
+) {
+    use minutes_core::remote_silence::{self, RemoteSilenceEvent};
+    let path = output_path.display().to_string();
+    // Mirror the transition onto the live transcript surface so agents reading
+    // the feed mid-call (`minutes transcript --status`, events.jsonl) see it.
+    minutes_core::events::append_event(remote_silence::live_event(&event));
+    let live_state = match &event {
+        RemoteSilenceEvent::Alert(alert) => Some(remote_silence::LiveRemoteAudioState {
+            remote_audio: minutes_core::markdown::RemoteAudioStatus::Missing,
+            kind: alert.kind.as_str().into(),
+            recording_pid: std::process::id(),
+            since: chrono::Local::now(),
+        }),
+        RemoteSilenceEvent::Recovered => None,
+    };
+    remote_silence::write_live_state(live_state.as_ref());
+    match event {
+        RemoteSilenceEvent::Alert(alert) => {
+            minutes_core::logging::log_step(
+                "remote_silence_alert",
+                &path,
+                0,
+                serde_json::json!({
+                    "kind": alert.kind.as_str(),
+                    "silent_secs": alert.silent_for.as_secs(),
+                    "mic_speech_secs": alert.mic_speech.as_secs(),
+                }),
+            );
+            let body = remote_silence::alert_body(alert.kind);
+            set_latest_output(
+                latest_output,
+                Some(OutputNotice {
+                    kind: "warning".into(),
+                    title: remote_silence::ALERT_TITLE.into(),
+                    path,
+                    detail: body.into(),
+                    job_id: None,
+                }),
+            );
+            // Unconditional (not gated on completion notifications): this is
+            // the only moment the other side of the call is still recoverable.
+            // Non-modal so it never steals focus mid-call.
+            show_user_notification_nonmodal(app_handle, remote_silence::ALERT_TITLE, body);
+        }
+        RemoteSilenceEvent::Recovered => {
+            minutes_core::logging::log_step(
+                "remote_silence_recovered",
+                &path,
+                0,
+                serde_json::json!({}),
+            );
+            set_latest_output(
+                latest_output,
+                Some(OutputNotice {
+                    kind: "warning".into(),
+                    title: remote_silence::RECOVERED_TITLE.into(),
+                    path,
+                    detail: remote_silence::RECOVERED_BODY.into(),
+                    job_id: None,
+                }),
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn start_native_call_recording(
@@ -3911,6 +4019,12 @@ fn start_native_call_recording(
     let mut safety_stop_warning = None;
     let mut stem_size_guard = minutes_core::capture::StemSizeGuard::new();
     let mut last_stem_size_check = std::time::Instant::now();
+    // #1266: native capture always has a system/call-audio stem, so watch it
+    // live. Independent of call detection: FaceTime is not detected, and its
+    // call audio can arrive as digital silence while the mic is fine.
+    let mut remote_silence = minutes_core::remote_silence::RemoteSilenceDetector::default();
+    // Clears any stale live state now and on every exit from this function.
+    let _remote_audio_state_guard = LiveRemoteAudioStateGuard::new();
     while !stop_flag.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
         // Stems grow ~200-400 KB/s; checking every 5 s overshoots by at most
@@ -4033,8 +4147,16 @@ fn start_native_call_recording(
                 break;
             }
         }
+        let mut source_health = session.source_health();
+        if let Some(event) = remote_silence.observe(
+            std::time::Instant::now(),
+            crate::call_capture::remote_silence_sample(&source_health),
+        ) {
+            handle_remote_silence_event(app_handle, latest_output, &output_path, event);
+        }
+        source_health.remote_audio_silent = remote_silence.is_alerting();
         if let Ok(mut health) = call_capture_health.lock() {
-            *health = Some(session.source_health());
+            *health = Some(source_health);
         }
         if minutes_core::pid::check_and_clear_sentinel() {
             break;
@@ -4061,6 +4183,7 @@ fn start_native_call_recording(
                         session.capture_warning(),
                         Some("Native call capture helper exited before normal stop.".into()),
                     ),
+                    remote_silence.outcome(),
                 ) {
                     Ok(job) => {
                         processing.store(true, Ordering::Relaxed);
@@ -4170,6 +4293,7 @@ fn start_native_call_recording(
                     "Native call capture finalization reported an error: {error}."
                 )),
             ),
+            remote_silence.outcome(),
         );
 
         match queue_result {
@@ -4307,6 +4431,7 @@ fn start_native_call_recording(
         context_session_id.clone(),
         calendar_event,
         combine_native_call_warnings(session.capture_warning(), safety_stop_warning.clone()),
+        remote_silence.outcome(),
     ) {
         Ok(job) => {
             processing.store(true, Ordering::Relaxed);
@@ -16197,6 +16322,7 @@ mod tests {
             mic_frames_silenced: 0,
             system_frames_silenced: 0,
             last_update: now.to_rfc3339(),
+            remote_audio_silent: false,
         }
     }
 
@@ -17916,6 +18042,7 @@ mod tests {
                 None,
                 None,
                 Some(warning.clone()),
+                None,
             )
             .expect("native call capture should queue");
 
@@ -17926,6 +18053,67 @@ mod tests {
                 .capture_warnings
                 .iter()
                 .any(|capture_warning| capture_warning.message == warning));
+        });
+    }
+
+    #[test]
+    fn queued_native_call_records_backend_and_live_remote_silence() {
+        with_temp_home(|home| {
+            let capture_dir = home.join("native-capture-remote-silence-test");
+            std::fs::create_dir_all(&capture_dir).unwrap();
+            let now = chrono::Local::now();
+            let queue = |name: &str, remote_audio| {
+                let mov = capture_dir.join(format!("{name}.mov"));
+                std::fs::write(&mov, vec![7_u8; 64_000]).unwrap();
+                write_test_wav(
+                    &capture_dir.join(format!("{name}.voice.wav")),
+                    48_000,
+                    4_000_000,
+                );
+                write_test_wav(
+                    &capture_dir.join(format!("{name}.system.wav")),
+                    48_000,
+                    4_000_000,
+                );
+                queue_native_call_capture_for_processing(
+                    CaptureMode::Meeting,
+                    Some(name.into()),
+                    &mov,
+                    None,
+                    None,
+                    now,
+                    now,
+                    None,
+                    None,
+                    None,
+                    remote_audio,
+                )
+                .expect("native call capture should queue")
+                .recording_health
+                .expect("native call health is always recorded")
+            };
+
+            // A healthy call records only the backend, and does not claim the
+            // call went undiarized.
+            let healthy = queue("healthy", None);
+            assert_eq!(healthy.capture_backend.as_deref(), Some("native-call"));
+            assert_eq!(healthy.remote_audio, None);
+            assert!(healthy.capture_warnings.is_empty());
+            assert_eq!(healthy.diarization_path, None);
+
+            let silent = queue(
+                "silent",
+                Some(minutes_core::markdown::RemoteAudioStatus::Missing),
+            );
+            assert_eq!(
+                silent.remote_audio,
+                Some(minutes_core::markdown::RemoteAudioStatus::Missing)
+            );
+            assert!(silent.capture_warnings.iter().any(|warning| matches!(
+                &warning.kind,
+                minutes_core::diarize::FailureKind::Other { code }
+                    if code == minutes_core::health::LIVE_REMOTE_SILENCE_CODE
+            )));
         });
     }
 

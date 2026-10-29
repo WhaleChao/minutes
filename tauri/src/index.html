@@ -8899,9 +8899,16 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           if (queueCount > 0) {
             statusBits.push(`${queueCount} background job${queueCount === 1 ? '' : 's'}`);
           }
+          // #1266: the call source can be "live" (delivering buffers) while it
+          // carries no remote audio at all, e.g. FaceTime or a phone call
+          // answered on this Mac. The recording loop flags that state.
+          const remoteAudioSilent = !!(callHealth && callHealth.remote_audio_silent);
+          const callAudioLabel = remoteAudioSilent
+            ? 'Not hearing the other side'
+            : (callHealth && callHealth.call_audio_live ? 'Call audio live' : 'Call audio missing');
           if (callHealth) {
             statusBits.push(callHealth.mic_live ? 'Mic live' : 'Mic missing');
-            statusBits.push(callHealth.call_audio_live ? 'Call audio live' : 'Call audio missing');
+            statusBits.push(callAudioLabel);
           }
           recordingLabel.textContent = stopRequested
             ? 'Finishing recording…'
@@ -8911,7 +8918,7 @@ Mat" required maxlength="8192"></textarea></label><div class="dictation-form-act
           if (callHealth) {
             recordingSourceHealth.classList.add('active');
             setCallHealthChip(recordingHealthMic, callHealth.mic_live ? 'Mic live' : 'Mic missing', callHealth.mic_live);
-            setCallHealthChip(recordingHealthAudio, callHealth.call_audio_live ? 'Call audio live' : 'Call audio missing', callHealth.call_audio_live);
+            setCallHealthChip(recordingHealthAudio, callAudioLabel, callHealth.call_audio_live && !remoteAudioSilent);
           } else {
             recordingSourceHealth.classList.remove('active');
           }

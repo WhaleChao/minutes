@@ -27,6 +27,7 @@ export {
   type DiarizationPath,
   type FailureKind,
   type RecordingHealth,
+  type RemoteAudioStatus,
   type ReadOptions,
   type OpenActionOptions,
   type PersonProfileOptions,

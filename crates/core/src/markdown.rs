@@ -1125,7 +1125,7 @@ pub struct SummarizationHealth {
     pub last_run: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordingHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_stem_active_ratio: Option<f32>,
@@ -1137,6 +1137,41 @@ pub struct RecordingHealth {
     pub capture_warnings: Vec<CaptureWarning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diarization_path: Option<DiarizationPath>,
+    /// Whether the remote side of a call reached the recording (#1266).
+    ///
+    /// Only set when there is positive evidence that it did not: the live
+    /// remote-silence detector fired, or a call-intent capture finished with a
+    /// silent system stem. Absent means "no evidence of loss", not "verified
+    /// complete". Readers must not attribute transcript lines to remote
+    /// participants when this is `missing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_audio: Option<RemoteAudioStatus>,
+    /// Capture backend that produced the audio, when it is known at capture
+    /// time (for example `native-call` for ScreenCaptureKit call capture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_backend: Option<String>,
+}
+
+/// Durable outcome of remote (call/system) audio coverage for a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteAudioStatus {
+    /// No sustained remote audio reached the recording. The transcript
+    /// reflects only the local microphone.
+    Missing,
+    /// Remote audio was heard for part of the call but went silent for an
+    /// extended stretch while the local microphone had speech.
+    Partial,
+}
+
+impl RemoteAudioStatus {
+    /// Stable frontmatter spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Partial => "partial",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1204,6 +1239,7 @@ impl RecordingHealth {
                 diagnostic_confidence: reason.diagnostic_confidence,
             }],
             diarization_path: Some(diarization_path),
+            ..Default::default()
         }
     }
 }
@@ -3418,6 +3454,33 @@ mod tests {
 
         assert_eq!(reparsed.recording_health, frontmatter.recording_health);
         assert_eq!(split_frontmatter(&output).1.as_bytes(), body.as_bytes());
+    }
+
+    #[test]
+    fn remote_audio_marker_and_backend_roundtrip() {
+        let mut health = RecordingHealth {
+            system_stem_active_ratio: Some(0.0009),
+            capture_backend: Some("native-call".into()),
+            ..Default::default()
+        };
+        crate::health::record_live_remote_silence(&mut health, RemoteAudioStatus::Missing);
+
+        let yaml = serde_yaml::to_string(&health).unwrap();
+        assert!(yaml.contains("remote_audio: missing"), "{yaml}");
+        assert!(yaml.contains("capture_backend: native-call"), "{yaml}");
+        assert!(yaml.contains("live-remote-audio-silent"), "{yaml}");
+        let reparsed: RecordingHealth = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reparsed, health);
+
+        // Older files without the new fields still parse, and new fields are
+        // omitted when unset.
+        let legacy: RecordingHealth =
+            serde_yaml::from_str("system_stem_active_ratio: 0.2\n").unwrap();
+        assert_eq!(legacy.remote_audio, None);
+        assert_eq!(legacy.capture_backend, None);
+        let yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(!yaml.contains("remote_audio"));
+        assert!(!yaml.contains("capture_backend"));
     }
 
     #[test]

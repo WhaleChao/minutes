@@ -323,6 +323,8 @@ fn detect_diarization_warning(
 
 const SILENT_REMOTE_WARNING_MESSAGE: &str =
     "Call/remote audio was not captured (system stem silent); transcript reflects only your microphone";
+const PARTIAL_REMOTE_WARNING_MESSAGE: &str =
+    "Call/remote audio went silent for an extended stretch during recording; parts of the other side of this call may be missing from the transcript";
 const SILENT_MICROPHONE_WARNING_MESSAGE: &str =
     "Microphone audio was not captured (mic stem silent or missing); transcript reflects only call/remote audio";
 const MIXED_WAV_RECOVERY_CODE: &str = "native-call-mixed-wav-recovery";
@@ -384,16 +386,141 @@ fn detect_silent_remote_stem_warning(
         });
     }
 
-    health
+    if health
         .capture_warnings
         .iter()
         .any(warning_is_native_call_system_stem_recovery)
-        .then(|| ProcessingWarning {
+    {
+        return Some(ProcessingWarning {
             step: "capture".to_string(),
             reason: "remote_audio_not_captured".to_string(),
             timeout_secs: None,
             message: Some(SILENT_REMOTE_WARNING_MESSAGE.to_string()),
-        })
+        });
+    }
+
+    // #1266: `remote_audio` is only ever set from positive evidence (the live
+    // remote-silence alert, or a call-intent capture whose system stem stayed
+    // silent), so it never fires for in-person meetings (#412/#413).
+    match health.remote_audio? {
+        markdown::RemoteAudioStatus::Missing => Some(ProcessingWarning {
+            step: "capture".to_string(),
+            reason: "remote_audio_not_captured".to_string(),
+            timeout_secs: None,
+            message: Some(SILENT_REMOTE_WARNING_MESSAGE.to_string()),
+        }),
+        markdown::RemoteAudioStatus::Partial => Some(ProcessingWarning {
+            step: "capture".to_string(),
+            reason: "remote_audio_partially_captured".to_string(),
+            timeout_secs: None,
+            message: Some(PARTIAL_REMOTE_WARNING_MESSAGE.to_string()),
+        }),
+    }
+}
+
+/// Highest system-stem active ratio still treated as "the remote side never
+/// reached the recording" for a call-intent capture. The 2026-10-28 FaceTime
+/// calls measured 0.0037 and 0.0009; real two-sided calls are far above 0.1.
+const REMOTE_AUDIO_MISSING_MAX_SYSTEM_RATIO: f32 = 0.01;
+
+/// Fill the durable remote-audio and backend markers on merged health (#1266).
+///
+/// - `capture_backend` is filled only with a positively identified backend
+///   (`native-call`), never a guess.
+/// - `remote_audio: missing` is set when the system stem was recovered as
+///   missing, or when a native-call capture (which only starts with call
+///   intent) finished with a silent or near-silent system stem. Recordings
+///   without call intent are left alone so in-person meetings never warn.
+fn classify_remote_audio(
+    health: Option<markdown::RecordingHealth>,
+    audio_path: &Path,
+    source: Option<&str>,
+) -> Option<markdown::RecordingHealth> {
+    let mut health = health?;
+    if health.capture_backend.is_none() {
+        let inferred = infer_capture_backend(audio_path, source);
+        if inferred == crate::health::NATIVE_CALL_CAPTURE_BACKEND {
+            health.capture_backend = Some(inferred);
+        }
+    }
+    if health.remote_audio.is_none() && remote_audio_missing_evidence(&health) {
+        health.remote_audio = Some(markdown::RemoteAudioStatus::Missing);
+    }
+    Some(health)
+}
+
+/// Summarizer instruction when the remote side of a call was not captured.
+/// The 2026-10-28 Continuity call summary turned local paraphrases ("so to
+/// confirm, it could be part time") into outcomes the remote person had
+/// supposedly agreed to (#1266).
+const REMOTE_AUDIO_MISSING_SUMMARY_INSTRUCTION: &str = "CAPTURE NOTE FROM MINUTES: The other side of this call was not recorded. Every transcript line is the local microphone speaker. State once, at the start of the summary, that the remote side was not captured. Do not attribute any statement, answer, agreement, commitment, or decision to the remote participant. When the local speaker restates or paraphrases the other person (for example \"so to confirm...\"), report it as the local speaker's understanding, not as something the other person said or confirmed.";
+
+const REMOTE_AUDIO_PARTIAL_SUMMARY_INSTRUCTION: &str = "CAPTURE NOTE FROM MINUTES: Parts of the other side of this call were not recorded. State once, at the start of the summary, that some remote audio is missing. Only attribute statements to the remote participant when they appear in the transcript as remote speech; treat the local speaker's restatements as the local speaker's understanding, not as something the other person confirmed.";
+
+/// Return a template carrying the capture caveat when `health` records lost
+/// remote audio, layered on the caller's template (or a synthetic one). The
+/// result is used only for the summarizer prompt; the meeting's recorded
+/// template is unchanged.
+fn summary_template_with_capture_caveat(
+    template: Option<&crate::template::Template>,
+    health: Option<&markdown::RecordingHealth>,
+) -> Option<crate::template::Template> {
+    let instruction = match health?.remote_audio? {
+        markdown::RemoteAudioStatus::Missing => REMOTE_AUDIO_MISSING_SUMMARY_INSTRUCTION,
+        markdown::RemoteAudioStatus::Partial => REMOTE_AUDIO_PARTIAL_SUMMARY_INSTRUCTION,
+    };
+    let mut template = template
+        .cloned()
+        .unwrap_or_else(|| crate::template::Template {
+            frontmatter: crate::template::TemplateFrontmatter {
+                name: "Minutes capture note".into(),
+                slug: "minutes-capture-note".into(),
+                version: "1.0.0".into(),
+                description: String::new(),
+                keywords: Vec::new(),
+                extends_base: true,
+                additional_instructions: String::new(),
+                language: None,
+            },
+            body: String::new(),
+            source: crate::template::TemplateSource::Bundled,
+            path: None,
+        });
+    let existing = template.frontmatter.additional_instructions.trim();
+    template.frontmatter.additional_instructions = if existing.is_empty() {
+        instruction.to_string()
+    } else {
+        format!("{existing}\n\n{instruction}")
+    };
+    Some(template)
+}
+
+fn remote_audio_missing_evidence(health: &markdown::RecordingHealth) -> bool {
+    if health
+        .capture_warnings
+        .iter()
+        .any(warning_is_native_call_system_stem_recovery)
+    {
+        return true;
+    }
+    if health.capture_backend.as_deref() != Some(crate::health::NATIVE_CALL_CAPTURE_BACKEND) {
+        return false;
+    }
+    let ratio_is_silent = |allow_unknown: bool| {
+        health
+            .system_stem_active_ratio
+            .map_or(allow_unknown, |ratio| {
+                ratio <= REMOTE_AUDIO_MISSING_MAX_SYSTEM_RATIO
+            })
+    };
+    health.capture_warnings.iter().any(|warning| {
+        warning.source == diarize::CaptureSource::System
+            && match warning.kind {
+                diarize::FailureKind::Silent => ratio_is_silent(true),
+                diarize::FailureKind::Sparse => ratio_is_silent(false),
+                _ => false,
+            }
+    })
 }
 
 /// Result of Level 2 voice enrollment matching.
@@ -899,6 +1026,12 @@ fn infer_capture_backend(audio_path: &Path, source: Option<&str>) -> String {
         "native-call".into()
     } else if let Some(source) = source {
         source.to_string()
+    } else if is_native_call_mov_with_stems(audio_path) {
+        // Native call captures are queued out of `native-captures/` into the
+        // jobs and meetings folders, so the directory alone stops identifying
+        // them (#1266 logged `capture_backend: unknown`). The `.mov` anchor
+        // with sibling per-source stems is unique to ScreenCaptureKit capture.
+        crate::health::NATIVE_CALL_CAPTURE_BACKEND.into()
     } else if audio_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -908,6 +1041,15 @@ fn infer_capture_backend(audio_path: &Path, source: Option<&str>) -> String {
     } else {
         "unknown".into()
     }
+}
+
+fn is_native_call_mov_with_stems(audio_path: &Path) -> bool {
+    audio_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+        && crate::capture::stem_paths_for(audio_path)
+            .is_some_and(|stems| stems.voice.exists() || stems.system.exists())
 }
 
 fn extract_effective_transcript_speaker_labels(transcript: &str) -> Vec<String> {
@@ -969,6 +1111,17 @@ fn merge_recording_health(
                 .or(existing.system_dominant_ratio);
             if primary.diarization_path.is_none() {
                 primary.diarization_path = existing.diarization_path;
+            }
+            // `missing` is the stronger claim; never let a merge weaken it.
+            primary.remote_audio = match (primary.remote_audio, existing.remote_audio) {
+                (Some(markdown::RemoteAudioStatus::Missing), _)
+                | (_, Some(markdown::RemoteAudioStatus::Missing)) => {
+                    Some(markdown::RemoteAudioStatus::Missing)
+                }
+                (primary_status, existing_status) => primary_status.or(existing_status),
+            };
+            if primary.capture_backend.is_none() {
+                primary.capture_backend = existing.capture_backend;
             }
             let mut warnings = existing.capture_warnings;
             warnings.extend(primary.capture_warnings);
@@ -2285,6 +2438,7 @@ fn recover_original_mixed_wav(audio_path: &Path) -> Option<PreparedTranscription
             diagnostic_confidence: diarize::DiagnosticConfidence::Inferred,
         }],
         diarization_path: Some(markdown::DiarizationPath::None),
+        ..Default::default()
     };
     tracing::warn!(
         "unusable source tracks; recovering original mixed WAV with a recording-health warning"
@@ -5433,6 +5587,16 @@ where
     let audio_log_target = diagnostic_audio_target.clone();
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
+    // Classified before summarization so a lost remote side reaches the
+    // summarizer prompt as well as the frontmatter (#1266).
+    let merged_recording_health = classify_remote_audio(
+        merge_recording_health(
+            recording_health,
+            artifact.frontmatter.recording_health.clone(),
+        ),
+        audio_path,
+        artifact.frontmatter.source.as_deref(),
+    );
     let mut raw_summary: Option<summarize::Summary> = None;
     let mut summary_coverage: Option<summarize::SummaryCoverage> = None;
     let summary = if config.summarization.engine != "none" {
@@ -5440,12 +5604,16 @@ where
         // Notes are passed separately so the agent path can byte-budget them
         // apart from the transcript and keep the screenshot coverage bound
         // derived from transcript text only.
+        let caveat_template = summary_template_with_capture_caveat(
+            context.template.as_ref(),
+            merged_recording_health.as_ref(),
+        );
         let report = summarize::summarize_with_template_report(
             &transcript,
             context.user_notes.as_deref(),
             &screen_files,
             config,
-            context.template.as_ref(),
+            caveat_template.as_ref().or(context.template.as_ref()),
             Some(&audio_log_target),
         );
         summary_coverage = report.coverage;
@@ -5708,11 +5876,7 @@ where
             artifact.frontmatter.r#type,
             audio_path,
             artifact.frontmatter.source.as_deref(),
-            merge_recording_health(
-                recording_health.clone(),
-                artifact.frontmatter.recording_health.clone(),
-            )
-            .as_ref(),
+            merged_recording_health.as_ref(),
         ) {
             summarization_warnings.push(warning);
         }
@@ -5734,8 +5898,7 @@ where
     frontmatter.intents = structured_intents;
     frontmatter.speaker_map = speaker_map;
     frontmatter.name_corrections = name_corrections;
-    frontmatter.recording_health =
-        merge_recording_health(recording_health, frontmatter.recording_health);
+    frontmatter.recording_health = merged_recording_health;
 
     let mut result = if descriptor_authorized {
         markdown::rewrite_without_retry_path_guarded(
@@ -6143,6 +6306,11 @@ where
     let audio_log_target = diagnostic_audio_target.clone();
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
+    let recording_health = classify_remote_audio(
+        recording_health,
+        audio_path,
+        sidecar.and_then(|s| s.source.as_deref()),
+    );
     let mut raw_summary: Option<summarize::Summary> = None;
     let mut summary_coverage: Option<summarize::SummaryCoverage> = None;
     // Skip summarization when the all-noise gate replaced the transcript body:
@@ -6158,12 +6326,14 @@ where
         // passed separately so the agent path can byte-budget them apart from
         // the transcript and keep the screenshot coverage bound derived from
         // transcript text only.
+        let caveat_template =
+            summary_template_with_capture_caveat(template, recording_health.as_ref());
         let report = summarize::summarize_with_template_report(
             &transcript,
             user_notes.as_deref(),
             &screen_files,
             config,
-            template,
+            caveat_template.as_ref().or(template),
             Some(&audio_log_target),
         );
         summary_coverage = report.coverage;
@@ -9046,6 +9216,7 @@ mod tests {
             system_dominant_ratio: None,
             capture_warnings: vec![],
             diarization_path: None,
+            ..Default::default()
         }
     }
 
@@ -9056,6 +9227,7 @@ mod tests {
             system_dominant_ratio: None,
             capture_warnings: vec![],
             diarization_path: None,
+            ..Default::default()
         }
     }
 
@@ -9071,6 +9243,7 @@ mod tests {
                 diagnostic_confidence: diarize::DiagnosticConfidence::Inferred,
             }],
             diarization_path: Some(markdown::DiarizationPath::MlBleedDegraded),
+            ..Default::default()
         }
     }
 
@@ -11062,6 +11235,277 @@ mod tests {
             outcome.debug.skipped_reason,
             Some(SelfAttributionSkippedReason::RemoteOnlyLabel)
         );
+    }
+
+    fn native_call_health_with(
+        system_ratio: Option<f32>,
+        kind: diarize::FailureKind,
+    ) -> markdown::RecordingHealth {
+        markdown::RecordingHealth {
+            voice_stem_active_ratio: Some(0.6),
+            system_stem_active_ratio: system_ratio,
+            capture_warnings: vec![markdown::CaptureWarning {
+                kind,
+                source: diarize::CaptureSource::System,
+                message: "System audio did not contain sustained transcript-aligned remote speech; transcript was left unlabeled.".into(),
+                diagnostic_confidence: diarize::DiagnosticConfidence::Inferred,
+            }],
+            diarization_path: Some(markdown::DiarizationPath::None),
+            capture_backend: Some(crate::health::NATIVE_CALL_CAPTURE_BACKEND.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_remote_silence_marker_warns_and_degrades() {
+        let mut health = markdown::RecordingHealth {
+            capture_backend: Some(crate::health::NATIVE_CALL_CAPTURE_BACKEND.into()),
+            ..Default::default()
+        };
+        crate::health::record_live_remote_silence(
+            &mut health,
+            markdown::RemoteAudioStatus::Missing,
+        );
+        let (warnings, status) = apply_silent_remote_warning_on_batch_path(
+            ContentType::Meeting,
+            Path::new("/Users/test/.minutes/jobs/job-123.mov"),
+            None,
+            Some(&health),
+            Some(OutputStatus::Complete),
+        );
+
+        assert_eq!(status, Some(OutputStatus::Degraded));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].reason, "remote_audio_not_captured");
+        assert_eq!(
+            warnings[0].message.as_deref(),
+            Some(SILENT_REMOTE_WARNING_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn partial_remote_audio_marker_warns_with_partial_reason() {
+        let mut health = markdown::RecordingHealth::default();
+        crate::health::record_live_remote_silence(
+            &mut health,
+            markdown::RemoteAudioStatus::Partial,
+        );
+        let (warnings, status) = apply_silent_remote_warning_on_batch_path(
+            ContentType::Meeting,
+            Path::new("/tmp/call.mov"),
+            None,
+            Some(&health),
+            Some(OutputStatus::Complete),
+        );
+
+        assert_eq!(status, Some(OutputStatus::Degraded));
+        assert_eq!(warnings[0].reason, "remote_audio_partially_captured");
+        assert_eq!(
+            warnings[0].message.as_deref(),
+            Some(PARTIAL_REMOTE_WARNING_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn remote_audio_marker_is_ignored_for_non_meetings() {
+        let mut health = markdown::RecordingHealth::default();
+        crate::health::record_live_remote_silence(
+            &mut health,
+            markdown::RemoteAudioStatus::Missing,
+        );
+        assert!(detect_silent_remote_stem_warning(
+            ContentType::Memo,
+            Path::new("/tmp/memo.wav"),
+            None,
+            Some(&health),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn native_call_with_silent_system_stem_is_classified_missing() {
+        // The 2026-10-28 FaceTime case: call intent (native-call), system
+        // stem at 0.0009 active, diarization reported Sparse.
+        let classified = classify_remote_audio(
+            Some(native_call_health_with(
+                Some(0.0009),
+                diarize::FailureKind::Sparse,
+            )),
+            Path::new("/Users/test/.minutes/jobs/job-123.mov"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            classified.remote_audio,
+            Some(markdown::RemoteAudioStatus::Missing)
+        );
+
+        let (warnings, status) = apply_silent_remote_warning_on_batch_path(
+            ContentType::Meeting,
+            Path::new("/Users/test/.minutes/jobs/job-123.mov"),
+            None,
+            Some(&classified),
+            Some(OutputStatus::Complete),
+        );
+        assert_eq!(status, Some(OutputStatus::Degraded));
+        assert_eq!(warnings[0].reason, "remote_audio_not_captured");
+
+        let silent_unknown_ratio = classify_remote_audio(
+            Some(native_call_health_with(None, diarize::FailureKind::Silent)),
+            Path::new("/tmp/x.mov"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            silent_unknown_ratio.remote_audio,
+            Some(markdown::RemoteAudioStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn native_call_with_some_remote_speech_is_not_classified_missing() {
+        for health in [
+            native_call_health_with(Some(0.08), diarize::FailureKind::Sparse),
+            native_call_health_with(None, diarize::FailureKind::Sparse),
+            native_call_health_with(Some(0.0), diarize::FailureKind::StreamError),
+        ] {
+            let classified =
+                classify_remote_audio(Some(health), Path::new("/tmp/x.mov"), None).unwrap();
+            assert_eq!(classified.remote_audio, None, "{classified:?}");
+        }
+    }
+
+    #[test]
+    fn in_person_silent_system_is_never_classified_missing() {
+        // No call intent recorded: #412/#413 must keep holding.
+        let classified = classify_remote_audio(
+            Some(in_person_system_silent_health()),
+            Path::new("/tmp/in-person-meeting.wav"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified.remote_audio, None);
+        assert_eq!(classified.capture_backend, None);
+        let (warnings, _) = apply_silent_remote_warning_on_batch_path(
+            ContentType::Meeting,
+            Path::new("/tmp/in-person-meeting.wav"),
+            None,
+            Some(&classified),
+            Some(OutputStatus::Complete),
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn system_stem_recovery_marker_is_classified_missing() {
+        let classified = classify_remote_audio(
+            Some(native_call_system_recovery_health()),
+            Path::new("/Users/test/.minutes/jobs/job-123.voice.wav"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            classified.remote_audio,
+            Some(markdown::RemoteAudioStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn classify_records_native_call_backend_from_mov_with_stems() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("job-20261028112347199-48978-3.mov");
+        std::fs::write(&mov, b"mov").unwrap();
+        std::fs::write(
+            dir.path().join("job-20261028112347199-48978-3.system.wav"),
+            b"x",
+        )
+        .unwrap();
+
+        let classified = classify_remote_audio(Some(sparse_health(0.5, 0.4)), &mov, None).unwrap();
+        assert_eq!(classified.capture_backend.as_deref(), Some("native-call"));
+        assert_eq!(classified.remote_audio, None);
+
+        // A plain WAV is never stamped with a guessed backend.
+        let wav = dir.path().join("memo.wav");
+        let classified = classify_remote_audio(Some(sparse_health(0.5, 0.4)), &wav, None).unwrap();
+        assert_eq!(classified.capture_backend, None);
+        assert!(classify_remote_audio(None, &mov, None).is_none());
+    }
+
+    #[test]
+    fn merge_recording_health_never_weakens_missing_and_keeps_backend() {
+        let live = markdown::RecordingHealth {
+            remote_audio: Some(markdown::RemoteAudioStatus::Missing),
+            capture_backend: Some("native-call".into()),
+            ..Default::default()
+        };
+        let diarize_health = markdown::RecordingHealth {
+            remote_audio: Some(markdown::RemoteAudioStatus::Partial),
+            system_stem_active_ratio: Some(0.001),
+            ..Default::default()
+        };
+        let merged = merge_recording_health(Some(diarize_health), Some(live)).unwrap();
+        assert_eq!(
+            merged.remote_audio,
+            Some(markdown::RemoteAudioStatus::Missing)
+        );
+        assert_eq!(merged.capture_backend.as_deref(), Some("native-call"));
+        assert_eq!(merged.system_stem_active_ratio, Some(0.001));
+    }
+
+    #[test]
+    fn summary_prompt_carries_capture_caveat_only_when_remote_audio_lost() {
+        assert!(summary_template_with_capture_caveat(None, None).is_none());
+        assert!(
+            summary_template_with_capture_caveat(None, Some(&sparse_health(0.5, 0.0))).is_none(),
+            "no marker, no caveat"
+        );
+
+        let missing = markdown::RecordingHealth {
+            remote_audio: Some(markdown::RemoteAudioStatus::Missing),
+            ..Default::default()
+        };
+        let synthetic = summary_template_with_capture_caveat(None, Some(&missing)).unwrap();
+        let prompt = crate::template::compose_additional_instructions("BASE", Some(&synthetic));
+        assert!(prompt.starts_with("BASE"));
+        assert!(prompt.contains("The other side of this call was not recorded"));
+        assert!(prompt.contains("Do not attribute any statement"));
+        assert!(synthetic.frontmatter.language.is_none());
+
+        // Layered onto a user template: its own instructions survive.
+        let user = crate::template::Template::from_str(
+            "---\nname: Sales\nslug: sales\nversion: 1.0.0\nadditional_instructions: Focus on pricing.\n---\n\nbody\n",
+            crate::template::TemplateSource::User,
+            None,
+            "<test>",
+        )
+        .unwrap();
+        let partial = markdown::RecordingHealth {
+            remote_audio: Some(markdown::RemoteAudioStatus::Partial),
+            ..Default::default()
+        };
+        let layered = summary_template_with_capture_caveat(Some(&user), Some(&partial)).unwrap();
+        assert_eq!(layered.frontmatter.slug, "sales");
+        let instructions = &layered.frontmatter.additional_instructions;
+        assert!(instructions.starts_with("Focus on pricing."));
+        assert!(instructions.contains("Parts of the other side of this call were not recorded"));
+        for text in [
+            REMOTE_AUDIO_MISSING_SUMMARY_INSTRUCTION,
+            REMOTE_AUDIO_PARTIAL_SUMMARY_INSTRUCTION,
+        ] {
+            assert!(!text.contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn infer_capture_backend_recognizes_queued_native_call_mov() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("job-123.mov");
+        std::fs::write(&mov, b"mov").unwrap();
+        assert_eq!(infer_capture_backend(&mov, None), "unknown");
+
+        std::fs::write(dir.path().join("job-123.voice.wav"), b"x").unwrap();
+        assert_eq!(infer_capture_backend(&mov, None), "native-call");
     }
 
     #[test]
