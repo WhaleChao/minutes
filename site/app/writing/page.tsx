@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { collectionPageSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Writing — minutes",
@@ -29,6 +30,10 @@ const posts = [
 export default function WritingIndex() {
   return (
     <div className="mx-auto max-w-[720px] px-6 pb-16 sm:px-8">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(collectionPageSchema({ metadata, path: "/writing", items: posts.map((post) => ({ title: post.title, href: `/writing/${post.slug}` })) })) }}
+      />
       <nav className="flex items-center justify-between border-b border-[color:var(--border)] py-4">
         <a
           href="/"

@@ -3,7 +3,7 @@ import { ComparePage } from "@/components/compare-page";
 
 export const metadata: Metadata = {
   "title": "Minutes vs Krisp",
-  "description": "Krisp combines noise cancellation with meeting notes. Minutes focuses on keeping conversations as local files your assistant can search. Krisp also has on-device processing, so this comparison is about the features and data settings you choose, rather than a blanket local-versus-cloud distinction.",
+  "description": "Krisp pairs noise cancellation with meeting notes and has on-device processing. Minutes keeps conversations as local files your AI assistant can search.",
   "alternates": {
     "canonical": "/compare/krisp-vs-minutes"
   }

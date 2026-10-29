@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { blogPostingSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Governance built in, not retrofitted — minutes",
@@ -12,6 +13,10 @@ export const metadata: Metadata = {
 export default function Post() {
   return (
     <div className="mx-auto max-w-[680px] px-6 pb-16 sm:px-8">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(blogPostingSchema({ metadata, headline: "Governance built in, not retrofitted", path: "/writing/governance-built-in-not-retrofitted", datePublished: "2026-06-10" })) }}
+      />
       <nav className="flex items-center justify-between border-b border-[color:var(--border)] py-4">
         <a
           href="/"

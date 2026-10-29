@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { collectionPageSchema } from "@/lib/schema";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 
@@ -173,6 +174,10 @@ const groups = [
 export default function ResourcesHubPage() {
   return (
     <div className="mx-auto max-w-[920px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(collectionPageSchema({ metadata, path: "/resources", items: groups.flatMap((group): ReadonlyArray<{ title: string; href: string }> => group.pages) })) }}
+      />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
           minutes

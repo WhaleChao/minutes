@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { PublicFooter } from "@/components/public-footer";
 
 export const metadata: Metadata = {
-  title: "Minutes Dojo",
+  title: "Minutes Dojo: starter workflow packs and skills",
   description:
     "Starter workflow packs and source-backed skill metadata for Minutes. Discover recommended packs by role and context.",
   alternates: { canonical: "/dojo" },

@@ -3,7 +3,7 @@ import { ComparePage } from "@/components/compare-page";
 
 export const metadata: Metadata = {
   "title": "Minutes vs Fathom",
-  "description": "Fathom offers hosted meeting recordings, summaries, and team integrations. Minutes keeps a local conversation archive for your existing assistant. Both expose MCP; the useful distinction is the workflow and storage behind that connection.",
+  "description": "Fathom hosts recordings, summaries, and team integrations. Minutes keeps a local conversation archive for your own assistant. Both offer MCP; compare the rest.",
   "alternates": {
     "canonical": "/compare/fathom-vs-minutes"
   }

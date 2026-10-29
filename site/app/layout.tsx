@@ -33,7 +33,7 @@ const instrumentSerif = Instrument_Serif({
 export const metadata: Metadata = {
   title: "Minutes: free, open-source conversation memory app",
   description:
-    "Meetings, calls, voice memos, and dictation, transcribed on your own machine and saved as markdown you own. No account, no API keys, no subscription.",
+    "Meetings, calls, voice memos, and dictation, transcribed on your own machine as markdown your AI assistant can search. No account, no API keys, no subscription.",
   metadataBase: new URL("https://useminutes.app"),
   alternates: { canonical: "/" },
   icons: {

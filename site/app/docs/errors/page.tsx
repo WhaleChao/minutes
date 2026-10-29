@@ -6,7 +6,7 @@ import { SectionLabel } from "@/components/section-label";
 export const metadata: Metadata = {
   title: "Minutes error reference",
   description:
-    "Generated reference for stable Minutes core error messages and identifiers.",
+    "Catalog of stable Minutes core error messages, grouped by error type with the source file for each, for troubleshooting the CLI, desktop app, and MCP server.",
   alternates: {
     canonical: "/docs/errors",
   },

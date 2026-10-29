@@ -3,7 +3,7 @@ import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
-  title: "Minutes proof",
+  title: "Minutes proof: run the demo and inspect the sources",
   description:
     "Run the Minutes demo, inspect the source meetings, and see what proof is real today versus still in progress.",
   alternates: {

@@ -1032,6 +1032,12 @@ jobs:
       - name: Verify site release constants match manifest
         run: node scripts/sync_site_release_version.mjs --check
 
+      # schema/meeting.schema.json declares its $id as
+      # https://useminutes.app/schema/meeting.schema.json, and published
+      # packages link there, so the site must serve a byte-identical copy.
+      - name: Verify the site serves the current meeting schema
+        run: cmp schema/meeting.schema.json site/public/schema/meeting.schema.json
+
   site_build:
     name: Site Build
     needs: changes

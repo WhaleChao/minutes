@@ -52,6 +52,12 @@ export function organizationSchema() {
  *
  * Free and MIT licensed, which is the differentiator an AI agent needs to be
  * able to parse when it compares tools on a buyer's behalf.
+ *
+ * Google's software rich result requires `aggregateRating` or `review`, so this
+ * object reports as a rich-result validation error in site audits. That is
+ * accepted, not an oversight: Minutes has no real ratings to cite, and
+ * inventing one is a structured-data spam violation. The markup is kept for
+ * the entity facts (free, MIT, platforms), not for a star snippet.
  */
 export function softwareApplicationSchema() {
   return {
@@ -82,12 +88,19 @@ export function softwareApplicationSchema() {
  * resolve a "X vs Y" query to this page. Page labels sometimes carry a
  * disambiguating parenthetical ("Hyprnote (Anarlog)") that reads as part of the
  * product name to a matcher, so it is dropped from the entity name only.
+ *
+ * Typed as CreativeWork, the schema.org parent of SoftwareApplication, on
+ * purpose. Google validates every SoftwareApplication it finds, nested or not,
+ * against its software rich-result rules, which require a rating or review. A
+ * comparison page has neither for either product, so the subtype turned all
+ * eight /compare pages into rich-result validation errors (Ahrefs site audit,
+ * 2026-10-25). The entity name still resolves; only the invalid claim is gone.
  */
-function competitorSchema(label: string) {
+function comparedProductSchema(name: string, url?: string) {
   return {
-    "@type": "SoftwareApplication",
-    name: label.replace(/\s*\([^)]*\)\s*$/, ""),
-    applicationCategory: "BusinessApplication",
+    "@type": "CreativeWork",
+    name: name.replace(/\s*\([^)]*\)\s*$/, ""),
+    ...(url ? { url } : {}),
   };
 }
 
@@ -210,13 +223,88 @@ export function comparisonArticleSchema({
     author: author(),
     publisher: organizationSchema(),
     about: [
-      { "@type": "SoftwareApplication", name: "Minutes", url: SITE_URL },
-      competitorSchema(competitorLabel),
+      comparedProductSchema("Minutes", SITE_URL),
+      comparedProductSchema(competitorLabel),
     ],
     citation: sources.map((source) => ({
       "@type": "CreativeWork",
       name: source.label,
       url: source.href,
     })),
+  };
+}
+
+type BlogPostingInput = {
+  /** The post's own `metadata` export, so headline cannot drift from `<title>`. */
+  metadata: Metadata;
+  /** Visible headline, without the " — minutes" site suffix the title carries. */
+  headline: string;
+  /** Site-relative canonical path, e.g. "/writing/whisper-cpp-vs-parakeet-cpp". */
+  path: string;
+  /** ISO date shown in the post byline as the publication date. */
+  datePublished: string;
+  /** ISO date shown in the byline as "updated", when the post has one. */
+  dateModified?: string;
+};
+
+/** Structured data for a `/writing/*` essay.
+ *
+ * Both dates must be the ones printed in the post's byline.
+ */
+export function blogPostingSchema({
+  metadata,
+  headline,
+  path,
+  datePublished,
+  dateModified,
+}: BlogPostingInput) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "BlogPosting",
+    headline,
+    description: metadata.description ?? "",
+    url: absolute(path),
+    mainEntityOfPage: { "@type": "WebPage", "@id": absolute(path) },
+    datePublished,
+    dateModified: dateModified ?? datePublished,
+    inLanguage: "en",
+    author: author(),
+    publisher: organizationSchema(),
+  };
+}
+
+type CollectionPageInput = {
+  /** The hub's own `metadata` export. */
+  metadata: Metadata;
+  /** Site-relative canonical path of the hub, e.g. "/resources". */
+  path: string;
+  /** The pages the hub visibly lists, in display order. */
+  items: ReadonlyArray<{ title: string; href: string }>;
+};
+
+/** Structured data for an index page: `/resources`, `/compare`, `/writing`.
+ *
+ * Pass the same array the hub renders. A hub is a list of links, not a set of
+ * questions and answers, so it gets ItemList rather than FAQPage even though
+ * many of the linked titles are phrased as questions.
+ */
+export function collectionPageSchema({ metadata, path, items }: CollectionPageInput) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "CollectionPage",
+    name: titleText(metadata.title),
+    description: metadata.description ?? "",
+    url: absolute(path),
+    isPartOf: { "@type": "WebSite", name: "Minutes", url: SITE_URL },
+    mainEntity: {
+      "@type": "ItemList",
+      numberOfItems: items.length,
+      itemListElement: items.map((item, index) => ({
+        "@type": "ListItem",
+        position: index + 1,
+        name: item.title,
+        url: absolute(item.href),
+      })),
+    },
   };
 }

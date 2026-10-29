@@ -4,7 +4,7 @@ import { SectionLabel } from "@/components/section-label";
 import surfaces from "@/lib/product-surfaces.json";
 
 export const metadata: Metadata = {
-  title: "Minutes docs",
+  title: "Minutes docs: setup, MCP tools, and agent guides",
   description:
     "Docs index for Minutes: start here for agent setup, MCP tools, error reference, and category guides.",
   alternates: {

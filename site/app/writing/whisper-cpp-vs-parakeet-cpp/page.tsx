@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
+import { blogPostingSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Whisper vs Parakeet v3 for local transcription | minutes",
   description:
-    "How NVIDIA's Parakeet v3 compares with Whisper for local transcription: published benchmarks, our own measurements on a Mac, where Whisper still wins, and what Minutes picks by default.",
+    "Parakeet v3 vs Whisper for local transcription: published benchmarks, our Mac measurements, where Whisper still wins, and what Minutes uses by default.",
   alternates: {
     canonical: "/writing/whisper-cpp-vs-parakeet-cpp",
   },
@@ -72,6 +73,10 @@ function Table({ headers, rows }: { headers: string[]; rows: string[][] }) {
 export default function Post() {
   return (
     <div className="mx-auto max-w-[680px] px-6 pb-16 sm:px-8">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(blogPostingSchema({ metadata, headline: "Whisper vs Parakeet v3 for local transcription", path: "/writing/whisper-cpp-vs-parakeet-cpp", datePublished: "2026-07-11", dateModified: "2026-10-27" })) }}
+      />
       <nav className="flex items-center justify-between border-b border-[color:var(--border)] py-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
           minutes

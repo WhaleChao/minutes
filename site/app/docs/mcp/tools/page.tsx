@@ -6,7 +6,7 @@ import { SectionLabel } from "@/components/section-label";
 export const metadata: Metadata = {
   title: "Minutes MCP tools",
   description:
-    "Generated reference for Minutes MCP tools, resources, and prompt templates.",
+    "Reference for the Minutes MCP server: every tool, resource, and prompt template it ships, generated from the product surface, plus the npx install config.",
   alternates: {
     canonical: "/docs/mcp/tools",
   },

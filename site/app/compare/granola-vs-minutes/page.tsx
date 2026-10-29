@@ -3,7 +3,7 @@ import { ComparePage } from "@/components/compare-page";
 
 export const metadata: Metadata = {
   "title": "Minutes vs Granola AI",
-  "description": "Granola combines bot-free capture with a hosted AI notepad and shared notes. Minutes writes conversation records to local Markdown files that your existing assistant can search. The choice depends on where you want the record to live and how you want to use it.",
+  "description": "Granola is a hosted AI notepad with shared notes. Minutes keeps conversations as local Markdown your AI assistant can search. Compare where each record lives.",
   "alternates": {
     "canonical": "/compare/granola-vs-minutes"
   }
