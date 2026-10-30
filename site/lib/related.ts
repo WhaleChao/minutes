@@ -41,6 +41,7 @@ const PRIVILEGE = "AI notetakers and attorney-client privilege";
 const LOCAL_STT = "The best local speech-to-text apps";
 const DICTATION = "Local dictation on macOS";
 const OSS_GRANOLA = "Open-source alternatives to Granola AI";
+const OSS_WISPR = "Open-source Wispr Flow alternatives";
 const MCP_TOOLS = "Best MCP meeting memory tools";
 const AGENT_TOOLS = "Best meeting tools for Claude Code and Codex";
 const TEMPLATE = "Meeting minutes templates";
@@ -162,10 +163,17 @@ export const RELATED: Record<string, RelatedLink[]> = {
     R("best-mcp-meeting-memory-tools", MCP_TOOLS, "Making the transcripts readable by an assistant afterwards."),
   ],
   "local-dictation-macos": [
+    R("open-source-wispr-flow-alternatives", OSS_WISPR, "Seven open-source dictation apps compared side by side."),
     R("best-local-speech-to-text", LOCAL_STT, "The broader comparison, including non-dictation use."),
     R("open-source-alternatives-to-granola-ai", OSS_GRANOLA, "On-device options for meetings rather than dictation."),
     R("best-meeting-tools-for-claude-code-and-codex", AGENT_TOOLS, "Getting dictated notes in front of a coding agent."),
     R("meeting-minutes-template", TEMPLATE, "A structure to dictate into."),
+  ],
+  "open-source-wispr-flow-alternatives": [
+    R("local-dictation-macos", DICTATION, "Setting up dictation on a Mac without a cloud."),
+    R("best-local-speech-to-text", LOCAL_STT, "Local transcription beyond dictation, including files."),
+    R("open-source-alternatives-to-granola-ai", OSS_GRANOLA, "The same question for meeting notes."),
+    R("best-meeting-tools-for-claude-code-and-codex", AGENT_TOOLS, "Getting what you say in front of a coding agent."),
   ],
   "open-source-alternatives-to-granola-ai": [
     R("is-granola-hipaa-compliant", GRANOLA_HIPAA, "The compliance answer that sends people looking."),

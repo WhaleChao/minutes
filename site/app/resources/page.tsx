@@ -147,6 +147,11 @@ const groups = [
         blurb: "Every way to dictate on a Mac without sending your voice to a cloud.",
       },
       {
+        title: "Open-source Wispr Flow alternatives",
+        href: "/resources/open-source-wispr-flow-alternatives",
+        blurb: "Seven open-source dictation apps, and which ones keep your voice on your machine.",
+      },
+      {
         title: "Open-source Granola alternatives",
         href: "/resources/open-source-alternatives-to-granola-ai",
         blurb: "Local processing, inspectable output, and agent-friendly workflows.",

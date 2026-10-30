@@ -5,7 +5,7 @@ import { PublicFooter } from "@/components/public-footer";
 export const metadata: Metadata = {
   title: "Compare Minutes",
   description:
-    "Honest comparisons of Minutes with Granola, Otter, Fireflies, Anarlog, superwhisper, Fathom, MacWhisper, and Krisp, including where each alternative wins.",
+    "Honest comparisons of Minutes with Granola, Otter, Fireflies, Anarlog, superwhisper, Wispr Flow, Fathom, MacWhisper, and Krisp, including where each one wins.",
   alternates: {
     canonical: "/compare",
   },
@@ -41,6 +41,12 @@ const pages = [
     href: "/compare/superwhisper-vs-minutes",
     blurb:
       "Best if you are choosing between a polished dictation tool and an open-source conversation memory layer where dictation is one of four capture modes.",
+  },
+  {
+    title: "Minutes vs Wispr Flow",
+    href: "/compare/wispr-flow-vs-minutes",
+    blurb:
+      "Best if you are weighing polished cloud AI dictation against open-source dictation that stays on your machine and becomes notes your assistant can search.",
   },
   {
     title: "Minutes vs Fathom",
