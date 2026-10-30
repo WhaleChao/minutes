@@ -10,7 +10,7 @@ import {
 import { MINUTES_MCP_TOOL_COUNT } from "@/lib/release";
 
 const primaryNav = [
-  { label: "Product", href: "#product" },
+  { label: "How it works", href: "#product" },
   { label: "For agents", href: "/for-agents" },
   { label: "Compare", href: "/compare" },
   {
