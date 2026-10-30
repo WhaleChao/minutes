@@ -33,6 +33,41 @@ function compactCount(value: string): string {
 
 const GITHUB_STARS_COMPACT = compactCount(GITHUB_STARS);
 
+/** GitHub's mark (Primer Octicons `mark-github`, MIT). The one icon the site
+ * uses, approved as a DESIGN.md exception: the mark is what readers scan for
+ * next to a star count. Inherits text color, so it follows the theme and hover.
+ */
+function GitHubMark() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="h-4 w-4 shrink-0" fill="currentColor">
+      <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z" />
+    </svg>
+  );
+}
+
+/** GitHub link with the star count. On desktop it sits beside Download rather
+ * than among the page links, the way repo links usually sit in a nav's action
+ * area; in the mobile menu it stays in the list, labelled.
+ */
+function GitHubStarsLink({ mobile = false }: { mobile?: boolean }) {
+  return (
+    <a
+      href="https://github.com/silverstein/minutes"
+      onClick={mobile ? closeMobileMenu : undefined}
+      aria-label={`GitHub, ${GITHUB_STARS} stars`}
+      className={
+        mobile
+          ? "flex items-center gap-2 border-b border-[color:var(--border)] py-3 font-mono text-[12px] uppercase tracking-[0.1em] text-[var(--text)]"
+          : "inline-flex items-center gap-2 text-[14px] text-[var(--text-secondary)] hover:text-[var(--accent)]"
+      }
+    >
+      <GitHubMark />
+      {mobile ? <span>GitHub</span> : null}
+      <span>{GITHUB_STARS_COMPACT}</span>
+    </a>
+  );
+}
+
 function closeMobileMenu(event: MouseEvent<HTMLAnchorElement>) {
   const menu = event.currentTarget.closest("details");
   if (menu) menu.open = false;
@@ -55,21 +90,7 @@ function NavigationLinks({ mobile = false }: { mobile?: boolean }) {
           {item.label}
         </a>
       ))}
-      <a
-        href="https://github.com/silverstein/minutes"
-        onClick={mobile ? closeMobileMenu : undefined}
-        aria-label={`GitHub, ${GITHUB_STARS} stars`}
-        className={
-          mobile
-            ? "border-b border-[color:var(--border)] py-3 font-mono text-[12px] uppercase tracking-[0.1em] text-[var(--text)]"
-            : "hover:text-[var(--accent)]"
-        }
-      >
-        GitHub{" "}
-        <span className="font-mono text-[var(--text-secondary)]">
-          ★ {GITHUB_STARS_COMPACT}
-        </span>
-      </a>
+      {mobile ? <GitHubStarsLink mobile /> : null}
     </>
   );
 }
@@ -179,12 +200,15 @@ export function MemoryCompoundsHero() {
             <NavigationLinks />
           </div>
 
-          <a
-            href="#install"
-            className="hidden rounded-[4px] bg-[var(--accent)] px-5 py-2.5 font-mono text-[11px] font-semibold uppercase tracking-[0.1em] text-[var(--marketing-button-text)] hover:bg-[var(--accent-hover)] lg:inline-flex"
-          >
-            Download
-          </a>
+          <div className="hidden items-center gap-6 lg:flex">
+            <GitHubStarsLink />
+            <a
+              href="#install"
+              className="inline-flex rounded-[4px] bg-[var(--accent)] px-5 py-2.5 font-mono text-[11px] font-semibold uppercase tracking-[0.1em] text-[var(--marketing-button-text)] hover:bg-[var(--accent-hover)]"
+            >
+              Download
+            </a>
+          </div>
 
           <details className="marketing-mobile-menu lg:hidden">
             <summary>Menu</summary>

@@ -243,6 +243,9 @@ Every state must be visible in every surface (tray, app, CLI output).
 ## Iconography
 
 - No custom icon set. System emoji for status indicators.
+- One approved exception (2026-10-29): the GitHub mark beside the star count next to
+  the landing-site Download button (`site/components/memory-compounds-hero.tsx`). It inherits the
+  text color; do not add other brand or UI icons on the strength of it.
 - Active capture: `●` (--capture)
 - Success: `✓` (--green)
 - Error: `✗` (--red)
