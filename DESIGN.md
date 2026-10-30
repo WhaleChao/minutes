@@ -242,10 +242,16 @@ Every state must be visible in every surface (tray, app, CLI output).
 
 ## Iconography
 
-- No custom icon set. System emoji for status indicators.
-- One approved exception (2026-10-29): the GitHub mark beside the star count next to
-  the landing-site Download button (`site/components/memory-compounds-hero.tsx`). It inherits the
-  text color; do not add other brand or UI icons on the strength of it.
+- App surfaces (tray, desktop window, CLI): no custom icon set. System emoji and the
+  text glyphs below for status indicators, so every state reads the same in a terminal.
+- Landing site: no decorative icons and no icon set for UI chrome (buttons, menus,
+  arrows, feature grids). Third-party brand marks are allowed where they help a reader
+  recognize something they already know: the GitHub mark beside the star count and
+  the agent marks in the hero's "One folder, every surface" row
+  (`site/components/memory-compounds-hero.tsx`). Draw them single-color in the
+  surrounding text color, sized to the text, with the name as visible text beside
+  them. Never use brand colors, and never redraw a mark that is not available as an
+  official or CC0 asset (approved 2026-10-29).
 - Active capture: `●` (--capture)
 - Success: `✓` (--green)
 - Error: `✗` (--red)

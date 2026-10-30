@@ -499,6 +499,19 @@ export default function Home() {
           as your meetings and memos.
         </p>
         <p className="mt-4 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
+          On Apple Silicon Macs, Minutes can run NVIDIA&rsquo;s Parakeet v3, a
+          one-click install. On 39 of our own dictation clips it decoded a
+          typical clip in 51&nbsp;ms, against 168&nbsp;ms for Whisper small, the
+          engine Minutes uses otherwise.{" "}
+          <a
+            href="/writing/whisper-cpp-vs-parakeet-cpp"
+            className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
+          >
+            How we measured
+          </a>
+          .
+        </p>
+        <p className="mt-4 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
           Minutes saves your dictation locally so it can become part of the
           history your AI searches later. You choose which context to share
           with a connected assistant.
