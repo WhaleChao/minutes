@@ -20,6 +20,19 @@ const primaryNav = [
   { label: "Docs", href: "/docs" },
 ] as const;
 
+/** "1,572" -> "1.6k", the compact form a nav link has room for.
+ *
+ * Reads the same hand-refreshed constant as the proof line below, so the nav
+ * never shows a different number from the rest of the page.
+ */
+function compactCount(value: string): string {
+  const count = Number(value.replace(/,/g, ""));
+  if (!Number.isFinite(count) || count < 1000) return value;
+  return `${(count / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+}
+
+const GITHUB_STARS_COMPACT = compactCount(GITHUB_STARS);
+
 function closeMobileMenu(event: MouseEvent<HTMLAnchorElement>) {
   const menu = event.currentTarget.closest("details");
   if (menu) menu.open = false;
@@ -45,13 +58,17 @@ function NavigationLinks({ mobile = false }: { mobile?: boolean }) {
       <a
         href="https://github.com/silverstein/minutes"
         onClick={mobile ? closeMobileMenu : undefined}
+        aria-label={`GitHub, ${GITHUB_STARS} stars`}
         className={
           mobile
             ? "border-b border-[color:var(--border)] py-3 font-mono text-[12px] uppercase tracking-[0.1em] text-[var(--text)]"
             : "hover:text-[var(--accent)]"
         }
       >
-        GitHub
+        GitHub{" "}
+        <span className="font-mono text-[var(--text-secondary)]">
+          ★ {GITHUB_STARS_COMPACT}
+        </span>
       </a>
     </>
   );
