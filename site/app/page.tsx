@@ -494,9 +494,10 @@ export default function Home() {
           The fastest way in is your voice.
         </h2>
         <p className="mt-5 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
-          Hold the hotkey, speak, release. The text lands at your cursor and in
-          your daily note. Dictation uses the same local transcription pipeline
-          as your meetings and memos.
+          Hold the hotkey, speak, release. The text lands at your cursor on a
+          Mac (on the clipboard on Windows and Linux) and is saved as a Markdown
+          file, plus your daily note if you turn that on. Dictation uses the same
+          local transcription pipeline as your meetings and memos.
         </p>
         <p className="mt-4 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
           On Apple Silicon Macs, Minutes can run NVIDIA&rsquo;s Parakeet v3, a

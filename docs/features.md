@@ -116,9 +116,12 @@ minutes dictate                                  # Speak → text appears as you
 minutes dictate --stdout                         # Output to stdout instead of clipboard
 ```
 Text streams every two seconds and accumulates across pauses. When dictation
-ends, Minutes writes the combined text to the clipboard and daily note.
-Set `[dictation] accumulate = false` for per-pause output. Dictation uses sealed
-local Whisper. Retained `[dictation] backend = "apple-speech"` and `"parakeet"`
+ends, Minutes writes the combined text to the clipboard, saves it as a Markdown
+file under `dictations/`, and appends it to the daily note when daily notes are
+enabled. Set `[dictation] accumulate = false` for per-pause output. The default
+`backend = "auto"` uses Parakeet v3 on Apple Silicon when it is installed and the
+language fits, and local Whisper otherwise; live partials always come from
+Whisper. Retained `[dictation] backend = "apple-speech"` and `"parakeet"`
 settings currently resolve to Whisper. Linux uses `wl-clipboard` on Wayland or
 `xclip` / `xsel` on X11. X11 auto-paste requires `xdotool`.
 

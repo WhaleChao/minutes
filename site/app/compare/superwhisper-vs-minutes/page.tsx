@@ -29,7 +29,7 @@ const comparisonRows = [
   {
     label: "AI formatting / summarization",
     competitor: "Predefined and custom modes, using local or cloud AI models",
-    minutes: "Optional and explicit: Claude via MCP or a local LLM you configure; nothing calls a cloud unless you set it up",
+    minutes: "Dictation: rule-based cleanup on your device (filler words, snippets), no AI rewriting. Meeting summaries: optional, via Claude over MCP or a local LLM you configure",
   },
   {
     label: "Durable output",
