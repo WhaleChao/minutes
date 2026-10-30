@@ -818,8 +818,9 @@ export default function ForAgentsPage() {
             files after the fact.
           </p>
           <p>
-            Transcription quality depends on the whisper model size and audio
-            clarity. The{" "}
+            On Apple Silicon, Minutes transcribes with Parakeet v3 once it is
+            installed and keeps Whisper as the backup. Elsewhere, transcription
+            quality depends on the whisper model size and audio clarity. The{" "}
             <code className="font-mono text-[13px] text-[var(--text)]">small</code>{" "}
             model (466 MB) is recommended. The{" "}
             <code className="font-mono text-[13px] text-[var(--text)]">tiny</code>{" "}

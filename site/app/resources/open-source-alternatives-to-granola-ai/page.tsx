@@ -6,9 +6,9 @@ import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
-  title: "Open-source Granola alternatives: 7 tools compared",
+  title: "Open-source Granola alternatives: 9 tools compared",
   description:
-    "Granola isn't open source. Seven open-source alternatives compared on license, platforms, local transcription, storage, and MCP, with each one's limits.",
+    "Granola isn't open source. Nine open-source alternatives compared on license, platforms, local transcription, storage, and MCP, with each one's limits.",
   alternates: {
     canonical: "/resources/open-source-alternatives-to-granola-ai",
   },
@@ -22,7 +22,7 @@ const alternatives = [
     name: "Minutes",
     bestFor: "Markdown conversation memory for your own AI",
     summary:
-      "Meetings, voice memos, and dictation transcribed on your machine and saved as Markdown that Claude, Codex, or another MCP client can search. Written by the Minutes maintainer, so weigh it accordingly.",
+      "Meetings, voice memos, and dictation transcribed on your machine (Parakeet v3 on Apple Silicon, Whisper elsewhere) and saved as Markdown that Claude, Codex, or another MCP client can search. Written by the Minutes maintainer, so weigh it accordingly.",
     license: "MIT",
     platforms: "macOS (Apple Silicon), Windows; Linux CLI",
     local: "Yes, by default",
@@ -53,6 +53,30 @@ const alternatives = [
     storage: "Local SQLite",
     mcp: "Not found",
     capture: "Device audio, no bot",
+  },
+  {
+    name: "OpenWhispr",
+    bestFor: "Dictation and meeting notes in one app",
+    summary:
+      "Started as a dictation app and now also transcribes meetings, with on-device speaker labels and calendar integration. Local or cloud models for every feature, plus optional cloud sync and team sharing through OpenWhispr Cloud.",
+    license: "MIT",
+    platforms: "macOS, Windows, Linux",
+    local: "Your choice of local or cloud",
+    storage: "Local SQLite; optional cloud sync",
+    mcp: "Yes",
+    capture: "Device audio; detects Zoom, Teams, FaceTime calls",
+  },
+  {
+    name: "StenographAI (StenoAI)",
+    bestFor: "A local AI notepad for confidential calls",
+    summary:
+      "Records, summarizes, and answers questions about meetings with local AI by default; cloud providers are opt-in. Parakeet v3 on Apple Silicon for live text, Whisper for other languages, and notes saved as Markdown.",
+    license: "MIT",
+    platforms: "macOS; Windows and Linux alpha",
+    local: "Yes, by default",
+    storage: "Markdown",
+    mcp: "Agent skill; no server found",
+    capture: "Mic and system audio, no bot",
   },
   {
     name: "OpenOats",
@@ -127,17 +151,17 @@ const faqs = [
   {
     question: "Which open-source Granola alternative runs fully offline?",
     answer:
-      "Minutes, Meetily, OpenOats, and LokalBot transcribe on your own machine by default, and Anarlog can on a Mac. Summaries are a separate step: they stay offline only if you use a local model such as Ollama or skip summarization. Omi and Vexa depend on a backend service.",
+      "Minutes, Meetily, StenographAI, OpenOats, and LokalBot transcribe on your own machine by default, OpenWhispr can if you pick its local models, and Anarlog can on a Mac. Summaries are a separate step: they stay offline only if you use a local model such as Ollama or skip summarization. Omi and Vexa depend on a backend service.",
   },
   {
     question: "Is there an open-source Granola alternative for Windows?",
     answer:
-      "Minutes, Anarlog, and Meetily ship Windows builds. LokalBot's Windows build is in alpha, and Omi's Windows app is built from source. OpenOats is Mac-only.",
+      "Minutes, Anarlog, Meetily, and OpenWhispr ship Windows builds. StenographAI and LokalBot have Windows builds in alpha, and Omi's Windows app is built from source. OpenOats is Mac-only.",
   },
   {
     question: "Do any of them have an MCP server like Granola's?",
     answer:
-      "Minutes, Anarlog, and Vexa ship MCP servers, LokalBot has an optional read-only one, and Omi offers a hosted MCP endpoint. That lets Claude, Codex, or another MCP client read your meetings, the same job Granola's hosted MCP does for Granola notes.",
+      "Minutes, Anarlog, OpenWhispr, and Vexa ship MCP servers, LokalBot has an optional read-only one, and Omi offers a hosted MCP endpoint. StenographAI ships an agent skill instead. That lets Claude, Codex, or another MCP client read your meetings, the same job Granola's hosted MCP does for Granola notes.",
   },
 ] as const;
 
@@ -151,6 +175,9 @@ const sources = [
   { label: "Anarlog models and providers", href: "https://docs.anarlog.so/models-and-providers" },
   { label: "Meetily GitHub", href: "https://github.com/Zackriya-Solutions/meetily" },
   { label: "Meetily PRO", href: "https://meetily.ai/pro/" },
+  { label: "OpenWhispr GitHub", href: "https://github.com/OpenWhispr/openwhispr" },
+  { label: "OpenWhispr MCP", href: "https://docs.openwhispr.com/integrations/mcp" },
+  { label: "StenographAI (StenoAI) GitHub", href: "https://github.com/stenolabs/stenoai" },
   { label: "OpenOats GitHub", href: "https://github.com/yazinsai/OpenOats" },
   { label: "LokalBot GitHub", href: "https://github.com/stevyhacker/lokalbot" },
   { label: "Omi GitHub", href: "https://github.com/BasedHardware/omi" },
@@ -200,7 +227,7 @@ export default function OpenSourceAlternativesToGranolaPage() {
         <p className="mt-5 text-[17px] leading-8 text-[var(--text-secondary)]">
           Granola is not open source, and it transcribes in the cloud. If you want an
           open-source tool instead, the best pick depends on what you liked about Granola: the
-          notepad, the bot-free capture, or the meeting memory your AI can read. Here are seven
+          notepad, the bot-free capture, or the meeting memory your AI can read. Here are nine
           open-source projects, what each is actually for, and where each falls short.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
@@ -314,6 +341,12 @@ export default function OpenSourceAlternativesToGranolaPage() {
           <p>
             Pick <span className="font-medium text-[var(--text)]">Anarlog</span> if you want to
             write and edit notes during the meeting, the way Granola works.
+          </p>
+          <p>
+            Pick <span className="font-medium text-[var(--text)]">OpenWhispr</span> if you want
+            dictation and meeting notes in one app with local or cloud models, or{" "}
+            <span className="font-medium text-[var(--text)]">StenographAI</span> for a local-first
+            notepad aimed at confidential conversations.
           </p>
           <p>
             Pick <span className="font-medium text-[var(--text)]">Meetily</span>,{" "}
