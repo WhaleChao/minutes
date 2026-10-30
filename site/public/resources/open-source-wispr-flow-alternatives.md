@@ -16,7 +16,7 @@ macOS, Windows, iOS, Android. Cloud transcription, then AI edits (fillers, self-
 
 | Project | License | Platforms | Local transcription by default | Engines | AI cleanup | Types into any app |
 |---|---|---|---|---|---|---|
-| Minutes | MIT | macOS, Windows; Linux CLI | Yes | Parakeet v3 (Apple Silicon), Whisper | Rules on your device; no AI rewriting | At the cursor on Mac; clipboard on Windows and Linux |
+| Minutes | MIT | macOS, Windows; Linux CLI | Yes | Parakeet v3 (Apple Silicon), Whisper | None; rule-based self-corrections and voice commands on your device | At the cursor on Mac; clipboard on Windows and Linux |
 | Handy | MIT (brand excluded) | macOS, Windows, Linux | Yes | Whisper, Parakeet v3 | Optional, off by default; cloud or Apple Intelligence | Yes |
 | OpenWhispr | MIT | macOS, Windows, Linux | Your choice of local or cloud | Whisper, Parakeet, cloud providers | Local llama.cpp or cloud models | Yes |
 | FluidVoice | GPL-3.0 | macOS | Yes | Parakeet, Whisper, Apple Speech, others | Optional; cloud or a closed local model | Yes |

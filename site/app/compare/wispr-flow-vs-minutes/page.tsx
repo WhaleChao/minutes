@@ -24,7 +24,7 @@ const comparisonRows = [
   {
     label: "Text cleanup",
     competitor: "AI auto-edits: filler removal, self-corrections, lists, punctuation, per-app styles",
-    minutes: "Rule-based cleanup on your device (filler words, snippets, voice commands); no AI rewriting",
+    minutes: "Rule-based editing on your device: fillers, self-corrections (\"actually\", \"scratch that\"), voice commands for new lines and bullets, snippets, and on a Mac, formatting suited to terminals and AI chat apps. No AI rephrasing",
   },
   {
     label: "Where the text goes",
@@ -34,7 +34,7 @@ const comparisonRows = [
   {
     label: "Custom words",
     competitor: "Self-learning personal dictionary and voice snippets",
-    minutes: "Dictation dictionary (up to 128 entries) and voice snippets",
+    minutes: "Dictation dictionary (up to 128 entries) and voice snippets; when you fix a spelling in Minutes, it offers to save it",
   },
   {
     label: "AI assistant access",
@@ -84,10 +84,10 @@ export default function WisprFlowVsMinutesPage() {
       lastReviewed="2026-10-29"
       heroSummary="Wispr Flow is a polished AI dictation app: speak anywhere and get edited text, on your computer or phone. It is closed source, and its own data-controls page says transcription always happens in the cloud. Minutes is an open-source (MIT) alternative that transcribes on your machine and saves every dictation as a Markdown file, next to your meetings and voice memos, where Claude, Codex, or another assistant can find it later."
       quickVerdictCompetitor="you want the most polished dictation with AI editing, on your phone as well as your computer, and cloud transcription is fine for what you say."
-      quickVerdictMinutes="you want dictation that never leaves your machine, costs nothing, and builds a searchable record your AI assistant can work from, and you can do without AI rewriting."
+      quickVerdictMinutes="you want dictation that never leaves your machine, costs nothing, and builds a searchable record your AI assistant can work from, and you can do without AI rephrasing."
       comparisonRows={comparisonRows as any}
       competitorWins={[
-        "The text you get is better finished. Wispr Flow's AI edits remove fillers, apply your self-corrections, format lists, and adapt tone per app. Minutes applies rules on your device and does not rewrite what you said.",
+        "Its editing goes further. Wispr Flow uses AI to remove fillers, apply self-corrections, format lists, and adapt tone per app, so it can also rephrase what you said. Minutes removes fillers and applies self-corrections with rules on your device, adds bullets when you say \"bullet\", and on a Mac formats differently for terminals and AI chat apps. It does not rephrase sentences or change tone.",
         "It runs on iOS and Android as well as Mac and Windows. Minutes has no mobile app, and on Windows and Linux the text goes to the clipboard rather than being typed at the cursor.",
         "Command Mode lets you rewrite or search selected text by voice. Minutes has no equivalent.",
       ]}
@@ -106,7 +106,7 @@ export default function WisprFlowVsMinutesPage() {
         "Using both works too: Wispr Flow for polished text on your phone, Minutes for private dictation and meeting capture on your computer.",
       ]}
       notRightFitSection={[
-        "Minutes is not the right choice if you want AI to clean up and restyle your dictation. It removes filler words and expands snippets, but it does not rewrite sentences.",
+        "Minutes is not the right choice if you want AI to rephrase and restyle your dictation. It removes filler words, applies self-corrections like \"actually\" and \"scratch that\", and follows voice commands, but it does not rewrite sentences.",
         "It is also not the fit if you mainly dictate on a phone, or if you want text typed at the cursor on Windows today.",
       ]}
       evaluatedSection={[

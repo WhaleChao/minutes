@@ -7,14 +7,14 @@ Wispr Flow is a polished AI dictation app: speak anywhere and get edited text, o
 ## Quick verdict
 
 - Choose **Wispr Flow** if you want the most polished dictation with AI editing, on your phone as well as your computer, and cloud transcription is fine for what you say.
-- Choose **Minutes** if you want dictation that never leaves your machine, costs nothing, and builds a searchable record your AI assistant can work from, and you can do without AI rewriting.
+- Choose **Minutes** if you want dictation that never leaves your machine, costs nothing, and builds a searchable record your AI assistant can work from, and you can do without AI rephrasing.
 
 ## At a glance
 
 - Where speech is transcribed — Wispr Flow: always in the cloud; Minutes: on your machine (Parakeet v3 on Apple Silicon once installed, Whisper otherwise)
-- Text cleanup — Wispr Flow: AI auto-edits, per-app styles; Minutes: rule-based cleanup on your device, no AI rewriting
+- Text cleanup — Wispr Flow: AI auto-edits, per-app styles; Minutes: rule-based editing on your device (fillers, self-corrections, voice commands for new lines and bullets, snippets, and on a Mac, formatting for terminals and AI chat apps), no AI rephrasing
 - Where the text goes — Wispr Flow: the active text field, history optionally stored on Wispr's servers; Minutes: at the cursor on a Mac, clipboard on Windows and Linux, plus a Markdown file on your disk
-- Custom words — Wispr Flow: self-learning dictionary and snippets; Minutes: dictation dictionary (up to 128 entries) and voice snippets
+- Custom words — Wispr Flow: self-learning dictionary and snippets; Minutes: dictation dictionary (up to 128 entries) and voice snippets, and it offers to save spellings you fix in Minutes
 - AI assistant access — Wispr Flow: Command Mode edits selected text by voice; Minutes: Claude, Codex, or any MCP client can list and search your dictations with your meetings and memos
 - Open source — Wispr Flow: no; Minutes: yes, MIT
 - Platforms — Wispr Flow: macOS, Windows, iOS, Android; Minutes: macOS and Windows desktop apps, Linux CLI
@@ -22,7 +22,7 @@ Wispr Flow is a polished AI dictation app: speak anywhere and get edited text, o
 
 ## Where Wispr Flow wins
 
-- Better-finished text: AI edits remove fillers, apply self-corrections, format lists, and adapt tone per app
+- Further-reaching edits: AI removes fillers, applies self-corrections, formats lists, and adapts tone per app, and can rephrase. Minutes handles fillers, self-corrections, and spoken bullets with rules, but does not rephrase or change tone
 - Phone apps on iOS and Android; Minutes has none, and types at the cursor only on a Mac
 - Command Mode for rewriting or searching selected text by voice
 

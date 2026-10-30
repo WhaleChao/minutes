@@ -22,12 +22,12 @@ const alternatives = [
     name: "Minutes",
     bestFor: "Dictation that becomes notes your AI can search",
     summary:
-      "Transcribes on your machine and saves every dictation as Markdown next to your meetings and voice memos, where Claude, Codex, or any MCP client can find it. Cleanup is rule-based, with no AI rewriting. Written by the Minutes maintainer, so weigh it accordingly.",
+      "Transcribes on your machine and saves every dictation as Markdown next to your meetings and voice memos, where Claude, Codex, or any MCP client can find it. Cleanup is rule-based: it removes fillers, applies self-corrections such as \"scratch that\", and follows voice commands on your device, with no AI rephrasing. Written by the Minutes maintainer, so weigh it accordingly.",
     license: "MIT",
     platforms: "macOS, Windows; Linux CLI",
     local: "Yes",
     engines: "Parakeet v3 (Apple Silicon), Whisper",
-    cleanup: "Rules on your device; no AI rewriting",
+    cleanup: "None; rule-based self-corrections and voice commands on your device",
     insert: "At the cursor on Mac; clipboard on Windows and Linux",
   },
   {
