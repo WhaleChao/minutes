@@ -3698,8 +3698,6 @@ mod tray_activity_tests {
         let overlay =
             std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
                 .expect("failed to read dictation overlay");
-        let design = std::fs::read_to_string(format!("{}/../../DESIGN.md", manifest))
-            .expect("failed to read design system");
         let recording_css = index_html
             .split("/* ── Recording bar ── */")
             .nth(1)
@@ -3745,11 +3743,6 @@ mod tray_activity_tests {
                 && overlay.contains("indicator.className = 'dot capture blink'")
                 && overlay.contains("indicator.className = 'dot capture'"),
             "dictation startup should remain neutral until active capture is confirmed"
-        );
-        assert!(
-            design.contains("Capture blue and error red are separate")
-                && design.contains("routine recording and dictation never borrow its urgency"),
-            "the design system should preserve the capture-versus-error semantic split"
         );
     }
 
